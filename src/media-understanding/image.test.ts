@@ -17,6 +17,7 @@ const hoisted = vi.hoisted(() => ({
   setRuntimeApiKeyMock: vi.fn(),
   discoverModelsMock: vi.fn(),
   fetchMock: vi.fn(),
+  prepareProviderDynamicModelMock: vi.fn(async () => {}),
 }));
 const {
   completeMock,
@@ -27,6 +28,7 @@ const {
   setRuntimeApiKeyMock,
   discoverModelsMock,
   fetchMock,
+  prepareProviderDynamicModelMock,
 } = hoisted;
 
 vi.mock("@mariozechner/pi-ai", async () => {
@@ -55,6 +57,10 @@ vi.mock("../agents/pi-model-discovery-runtime.js", () => ({
     setRuntimeApiKey: setRuntimeApiKeyMock,
   }),
   discoverModels: discoverModelsMock,
+}));
+
+vi.mock("../plugins/provider-runtime.js", () => ({
+  prepareProviderDynamicModel: prepareProviderDynamicModelMock,
 }));
 
 const { describeImageWithModel } = await import("./image.js");
@@ -323,5 +329,74 @@ describe("describeImageWithModel", () => {
       }),
     );
     expect(setRuntimeApiKeyMock).toHaveBeenCalledWith("google", "oauth-test");
+  });
+
+  it("calls prepareProviderDynamicModel before model registry lookup", async () => {
+    const findMock = vi.fn(() => ({
+      provider: "lmstudio",
+      id: "google/gemma-4-e2b",
+      input: ["text", "image"],
+      baseUrl: "http://127.0.0.1:1234",
+    }));
+    discoverModelsMock.mockReturnValue({ find: findMock });
+    completeMock.mockResolvedValue({
+      role: "assistant",
+      api: "anthropic-messages",
+      provider: "lmstudio",
+      model: "google/gemma-4-e2b",
+      stopReason: "stop",
+      timestamp: Date.now(),
+      content: [{ type: "text", text: "vision ok" }],
+    });
+
+    const result = await describeImageWithModel({
+      cfg: {
+        models: {
+          providers: {
+            lmstudio: {
+              baseUrl: "http://127.0.0.1:1234",
+              api: "anthropic-messages",
+            },
+          },
+        },
+      },
+      agentDir: "/tmp/openclaw-agent",
+      provider: "lmstudio",
+      model: "google/gemma-4-e2b",
+      buffer: Buffer.from("png-bytes"),
+      fileName: "image.png",
+      mime: "image/png",
+      prompt: "Describe the image.",
+      timeoutMs: 1000,
+    });
+
+    expect(result).toEqual({
+      text: "vision ok",
+      model: "google/gemma-4-e2b",
+    });
+    expect(prepareProviderDynamicModelMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "lmstudio",
+        config: expect.objectContaining({
+          models: {
+            providers: {
+              lmstudio: {
+                baseUrl: "http://127.0.0.1:1234",
+                api: "anthropic-messages",
+              },
+            },
+          },
+        }),
+        context: expect.objectContaining({
+          provider: "lmstudio",
+          modelId: "google/gemma-4-e2b",
+          providerConfig: {
+            baseUrl: "http://127.0.0.1:1234",
+            api: "anthropic-messages",
+          },
+        }),
+      }),
+    );
+    expect(findMock).toHaveBeenCalledAfter(prepareProviderDynamicModelMock);
   });
 });
