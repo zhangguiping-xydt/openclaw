@@ -58,6 +58,8 @@ const PERMANENT_ERROR_PATTERNS: readonly RegExp[] = [
   /outbound not configured for channel/i,
   /ambiguous .* recipient/i,
   /User .* not in room/i,
+  /Local media path is not under an allowed directory/i,
+  /message is too long/i,
 ];
 
 const drainInProgress = new Map<string, boolean>();

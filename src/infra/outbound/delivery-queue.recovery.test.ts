@@ -138,6 +138,46 @@ describe("delivery-queue recovery", () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("permanent error"));
   });
 
+  it("treats relative local media path as a permanent error", async () => {
+    const id = await enqueueDelivery(
+      {
+        channel: "telegram",
+        to: "telegram:123456",
+        payloads: [{ text: "hi", mediaUrls: ["./some-local-file.png"] }],
+      },
+      tmpDir(),
+    );
+    const deliver = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("Local media path is not under an allowed directory: ./some-local-file.png"),
+      );
+    const log = createRecoveryLog();
+    const { result } = await runRecovery({ deliver, log });
+
+    expect(result.failed).toBe(1);
+    expect(result.recovered).toBe(0);
+    expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
+    expect(fs.existsSync(path.join(tmpDir(), "delivery-queue", "failed", `${id}.json`))).toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("permanent error"));
+  });
+
+  it("treats 'message is too long' as a permanent error", async () => {
+    const id = await enqueueDelivery(
+      { channel: "telegram", to: "telegram:123456", payloads: [{ text: "hi" }] },
+      tmpDir(),
+    );
+    const deliver = vi.fn().mockRejectedValue(new Error("message is too long"));
+    const log = createRecoveryLog();
+    const { result } = await runRecovery({ deliver, log });
+
+    expect(result.failed).toBe(1);
+    expect(result.recovered).toBe(0);
+    expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
+    expect(fs.existsSync(path.join(tmpDir(), "delivery-queue", "failed", `${id}.json`))).toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("permanent error"));
+  });
+
   it("passes skipQueue: true to prevent re-enqueueing during recovery", async () => {
     await enqueueDelivery(
       { channel: "demo-channel-a", to: "+1", payloads: [{ text: "a" }] },
