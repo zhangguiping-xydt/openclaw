@@ -6,9 +6,11 @@ import {
   requireApiKey,
   resolveApiKeyForProvider,
 } from "../agents/model-auth.js";
-import { normalizeModelRef } from "../agents/model-selection.js";
+import { findNormalizedProviderValue, normalizeModelRef } from "../agents/model-selection.js";
 import { ensureOpenClawModelsJson } from "../agents/models-config.js";
+import { resolveModelWithRegistry } from "../agents/pi-embedded-runner/model.js";
 import { coerceImageAssistantText } from "../agents/tools/image-tool.helpers.js";
+import { prepareProviderDynamicModel } from "../plugins/provider-runtime.js";
 import type {
   ImageDescriptionRequest,
   ImageDescriptionResult,
@@ -49,7 +51,29 @@ async function resolveImageRuntime(params: {
   const authStorage = discoverAuthStorage(params.agentDir);
   const modelRegistry = discoverModels(authStorage, params.agentDir);
   const resolvedRef = normalizeModelRef(params.provider, params.model);
-  const model = modelRegistry.find(resolvedRef.provider, resolvedRef.model) as Model<Api> | null;
+  const configuredProviders = params.cfg.models?.providers;
+  const providerConfig =
+    configuredProviders?.[resolvedRef.provider] ??
+    findNormalizedProviderValue(configuredProviders, resolvedRef.provider);
+  await prepareProviderDynamicModel({
+    provider: resolvedRef.provider,
+    config: params.cfg,
+    context: {
+      config: params.cfg,
+      agentDir: params.agentDir,
+      provider: resolvedRef.provider,
+      modelId: resolvedRef.model,
+      modelRegistry,
+      providerConfig,
+    },
+  });
+  const model = resolveModelWithRegistry({
+    provider: resolvedRef.provider,
+    modelId: resolvedRef.model,
+    modelRegistry,
+    cfg: params.cfg,
+    agentDir: params.agentDir,
+  }) as Model<Api> | null;
   if (!model) {
     throw new Error(`Unknown model: ${resolvedRef.provider}/${resolvedRef.model}`);
   }
