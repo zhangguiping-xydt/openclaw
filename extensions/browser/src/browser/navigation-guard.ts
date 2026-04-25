@@ -109,13 +109,16 @@ export async function assertBrowserNavigationAllowed(
     );
   }
 
-  // Browser network stacks may apply env proxy routing at connect-time, which
-  // can bypass strict destination-binding intent from pre-navigation DNS checks.
-  // When env proxy is configured, skip the blanket block and defer to the
-  // per-hostname DNS resolution check below. Public URLs resolving to public
-  // IPs are allowed; only private/internal destinations remain blocked.
-  // Previously this blocked ALL navigation when proxy env vars were set,
-  // which prevented legitimate public-internet browsing (see #71358).
+  // When env proxy is configured, the browser routes connections through the
+  // proxy, which performs its own DNS resolution. The Node-side check below
+  // (resolvePinnedHostnameWithPolicy) is a best-effort heuristic: it blocks
+  // hostnames that resolve to RFC 1918/loopback addresses from Node's resolver,
+  // but cannot guarantee the proxy resolves the same IP (e.g. split-horizon DNS
+  // in corporate environments). This is a deliberate trade-off: the previous
+  // code blocked ALL navigation when proxy env vars were set, preventing
+  // legitimate public-internet browsing (see #71358). The DNS check remains
+  // valuable as a defense-in-depth layer for the common case where Node and the
+  // proxy share the same resolver.
 
   // Browser navigations happen in Chromium's network stack, not Node's. In
   // strict mode, a hostname-based URL would be resolved twice by different
