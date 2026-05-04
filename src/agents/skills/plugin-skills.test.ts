@@ -281,31 +281,6 @@ describe("resolvePluginSkillDirs", () => {
     expect(dirs).toEqual([]);
   });
 
-  it("cleans up generated plugin skill links when the plugin registry is empty", async () => {
-    const workspaceDir = await tempDirs.make("openclaw-");
-    const pluginSkillsDir = await tempDirs.make("managed-plugin-skills-");
-    const staleRoot = await tempDirs.make("stale-plugin-skills-");
-    const staleSkill = path.join(staleRoot, "stale-skill");
-    await fs.mkdir(staleSkill, { recursive: true });
-    fsSync.symlinkSync(staleSkill, path.join(pluginSkillsDir, "stale-skill"), "dir");
-
-    hoisted.loadPluginManifestRegistryForInstalledIndex.mockReturnValue({
-      diagnostics: [],
-      plugins: [],
-    });
-
-    const dirs = resolvePluginSkillDirs({
-      workspaceDir,
-      config: {} as OpenClawConfig,
-      pluginSkillsDir,
-    });
-
-    expect(dirs).toEqual([]);
-    await expect(fs.lstat(path.join(pluginSkillsDir, "stale-skill"))).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-  });
-
   it("resolves Claude bundle command roots through the normal plugin skill path", async () => {
     const workspaceDir = await tempDirs.make("openclaw-");
     const pluginRoot = await tempDirs.make("openclaw-claude-bundle-");
@@ -365,8 +340,8 @@ describe("resolvePluginSkillDirs", () => {
   });
 });
 
-describe("publishPluginSkills", () => {
-  const { publishPluginSkills } = __testing;
+describe("publishPluginSkillsToManagedSkillsDir", () => {
+  const { publishPluginSkillsToManagedSkillsDir } = __testing;
 
   async function writeSkillDir(
     parentDir: string,
@@ -389,8 +364,8 @@ describe("publishPluginSkills", () => {
     const dirA = await writeSkillDir(skillParent, "skill-a");
     const dirB = await writeSkillDir(skillParent, "skill-b");
 
-    publishPluginSkills([dirA, dirB], {
-      pluginSkillsDir: managedDir,
+    publishPluginSkillsToManagedSkillsDir([dirA, dirB], {
+      managedSkillsDir: managedDir,
     });
 
     const linkA = path.join(managedDir, "skill-a");
@@ -405,44 +380,50 @@ describe("publishPluginSkills", () => {
 
     const dir = await writeSkillDir(skillParent, "my-skill");
 
-    publishPluginSkills([dir], { pluginSkillsDir: managedDir });
+    publishPluginSkillsToManagedSkillsDir([dir], { managedSkillsDir: managedDir });
     const mtimeAfterFirst = (await fs.lstat(path.join(managedDir, "my-skill"))).mtimeMs;
 
     // Second call with same input should preserve the existing symlink.
-    publishPluginSkills([dir], { pluginSkillsDir: managedDir });
+    publishPluginSkillsToManagedSkillsDir([dir], { managedSkillsDir: managedDir });
     const mtimeAfterSecond = (await fs.lstat(path.join(managedDir, "my-skill"))).mtimeMs;
 
     expect(mtimeAfterSecond).toBe(mtimeAfterFirst);
     expect(fsSync.readlinkSync(path.join(managedDir, "my-skill"))).toBe(dir);
   });
 
-  it("replaces owned generated symlinks when a plugin skill target moves", async () => {
-    const skillParent1 = await tempDirs.make("plugin-skills-1-");
-    const skillParent2 = await tempDirs.make("plugin-skills-2-");
+  it("replaces a symlink that points to a different target", async () => {
+    const skillParent = await tempDirs.make("plugin-skills-");
     const managedDir = await tempDirs.make("managed-skills-");
 
-    const dir1 = await writeSkillDir(skillParent1, "my-skill", "old");
-    const dir2 = await writeSkillDir(skillParent2, "my-skill", "new");
+    const dir1 = await writeSkillDir(skillParent, "skill-v1", "old");
+    const dir2 = await writeSkillDir(skillParent, "my-skill", "new");
 
+    // Manually create a symlink to dir1 under the same name as dir2's basename.
     fsSync.symlinkSync(dir1, path.join(managedDir, "my-skill"), "dir");
 
-    publishPluginSkills([dir2], { pluginSkillsDir: managedDir });
+    // Now publish dir2 (basename "my-skill"); should replace the symlink.
+    publishPluginSkillsToManagedSkillsDir([dir2], { managedSkillsDir: managedDir });
 
     expect(fsSync.readlinkSync(path.join(managedDir, "my-skill"))).toBe(dir2);
   });
 
-  it("cleans up stale symlinks whose targets still exist", async () => {
+  it("cleans up stale symlinks whose targets no longer exist", async () => {
     const skillParent = await tempDirs.make("plugin-skills-");
     const managedDir = await tempDirs.make("managed-skills-");
 
     const dir = await writeSkillDir(skillParent, "current-skill");
-    const staleDir = await writeSkillDir(skillParent, "stale-skill");
+    const staleDir = path.join(skillParent, "stale-skill");
+    await fs.mkdir(staleDir, { recursive: true });
 
+    // Create a stale symlink pointing to a directory we'll delete.
     fsSync.symlinkSync(staleDir, path.join(managedDir, "stale-skill"), "dir");
+    await fs.rm(staleDir, { recursive: true, force: true });
 
-    publishPluginSkills([dir], { pluginSkillsDir: managedDir });
+    // Publish only the current skill; stale should be cleaned up.
+    publishPluginSkillsToManagedSkillsDir([dir], { managedSkillsDir: managedDir });
 
     expect(fsSync.existsSync(path.join(managedDir, "current-skill"))).toBe(true);
+    // Stale symlink pointing to nonexistent target should be removed.
     expect(fsSync.existsSync(path.join(managedDir, "stale-skill"))).toBe(false);
   });
 
@@ -456,44 +437,21 @@ describe("publishPluginSkills", () => {
     // Create a symlink to a nonexistent directory.
     fsSync.symlinkSync(nonexistentDir, path.join(managedDir, "broken-skill"), "dir");
 
-    publishPluginSkills([dir], { pluginSkillsDir: managedDir });
+    publishPluginSkillsToManagedSkillsDir([dir], { managedSkillsDir: managedDir });
 
     expect(fsSync.existsSync(path.join(managedDir, "current-skill"))).toBe(true);
     // Broken symlink pointing to nonexistent target should be removed.
     expect(fsSync.existsSync(path.join(managedDir, "broken-skill"))).toBe(false);
   });
 
-  it.runIf(process.platform !== "win32")(
-    "skips child skill directories whose SKILL.md symlinks outside the declared root",
-    async () => {
-      const skillParent = await tempDirs.make("plugin-skills-");
-      const managedDir = await tempDirs.make("managed-skills-");
-      const outsideDir = await tempDirs.make("outside-skill-file-");
-      const parentDir = path.join(skillParent, "skills");
-      const leakDir = path.join(parentDir, "leak");
-      await fs.mkdir(leakDir, { recursive: true });
-      await fs.writeFile(
-        path.join(outsideDir, "SKILL.md"),
-        "---\nname: leak\ndescription: Outside\n---\n",
-      );
-      await fs.symlink(path.join(outsideDir, "SKILL.md"), path.join(leakDir, "SKILL.md"));
-      const validDir = await writeSkillDir(parentDir, "valid");
-
-      publishPluginSkills([parentDir], { pluginSkillsDir: managedDir });
-
-      expect(fsSync.existsSync(path.join(managedDir, "leak"))).toBe(false);
-      expect(fsSync.readlinkSync(path.join(managedDir, "valid"))).toBe(validDir);
-    },
-  );
-
   it("does not create managed skills dir when skill dirs list is empty", async () => {
     const parent = await tempDirs.make("parent-");
     const managedDir = path.join(parent, "does-not-exist");
-    publishPluginSkills([], { pluginSkillsDir: managedDir });
+    publishPluginSkillsToManagedSkillsDir([], { managedSkillsDir: managedDir });
     expect(fsSync.existsSync(managedDir)).toBe(false);
   });
 
-  it("skips directories that do not contain a SKILL.md and have no skill children", async () => {
+  it("skips directories that do not contain a SKILL.md", async () => {
     const skillParent = await tempDirs.make("plugin-skills-");
     const managedDir = await tempDirs.make("managed-skills-");
 
@@ -501,38 +459,16 @@ describe("publishPluginSkills", () => {
     const emptyDir = path.join(skillParent, "empty-dir");
     await fs.mkdir(emptyDir, { recursive: true });
 
-    publishPluginSkills([emptyDir], {
-      pluginSkillsDir: managedDir,
+    publishPluginSkillsToManagedSkillsDir([emptyDir], {
+      managedSkillsDir: managedDir,
     });
 
     expect(fsSync.existsSync(path.join(managedDir, "empty-dir"))).toBe(false);
   });
 
-  it("expands parent skill containers to child directories that contain SKILL.md", async () => {
-    const skillParent = await tempDirs.make("plugin-skills-");
-    const managedDir = await tempDirs.make("managed-skills-");
-
-    // Create a parent skills dir with child skill dirs (the layout used by
-    // bundled plugins like browser and memory-wiki).
-    const parentDir = path.join(skillParent, "skills");
-    const childA = await writeSkillDir(parentDir, "browser");
-    const childB = await writeSkillDir(parentDir, "memory");
-
-    publishPluginSkills([parentDir], {
-      pluginSkillsDir: managedDir,
-    });
-
-    // Child skill dirs should be published under their basenames.
-    expect(fsSync.readlinkSync(path.join(managedDir, "browser"))).toBe(childA);
-    expect(fsSync.readlinkSync(path.join(managedDir, "memory"))).toBe(childB);
-
-    // The parent dir itself should NOT be published (no SKILL.md there).
-    expect(fsSync.existsSync(path.join(managedDir, "skills"))).toBe(false);
-  });
-
   it("handles empty skill dirs list without error", async () => {
     const managedDir = await tempDirs.make("managed-skills-");
-    publishPluginSkills([], { pluginSkillsDir: managedDir });
+    publishPluginSkillsToManagedSkillsDir([], { managedSkillsDir: managedDir });
     // No error expected. The managed dir may or may not be created.
   });
 
@@ -544,8 +480,8 @@ describe("publishPluginSkills", () => {
     const dir1 = await writeSkillDir(skillParent1, "shared-name", "first");
     const dir2 = await writeSkillDir(skillParent2, "shared-name", "second");
 
-    publishPluginSkills([dir1, dir2], {
-      pluginSkillsDir: managedDir,
+    publishPluginSkillsToManagedSkillsDir([dir1, dir2], {
+      managedSkillsDir: managedDir,
     });
 
     // First one wins.
