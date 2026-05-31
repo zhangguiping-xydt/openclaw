@@ -1334,7 +1334,7 @@ describe("embedded attempt session lock lifecycle", () => {
       releaseForPrompt: () => controller.releaseForPrompt(),
       reacquireAfterPrompt: () => controller.reacquireAfterPrompt(),
       sessionFile,
-      withSessionWriteLock: (run) => controller.withSessionWriteLock(run),
+      withSessionWriteLock: (run, options) => controller.withSessionWriteLock(run, options),
     });
 
     await session.agent.streamFn("model", "context");

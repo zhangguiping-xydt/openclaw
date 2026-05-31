@@ -4,6 +4,7 @@ import path from "node:path";
 import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { HEARTBEAT_TRANSCRIPT_PROMPT } from "../../../auto-reply/heartbeat.js";
+import { runWithOwnedSessionTranscriptWritePublication } from "../../../config/sessions/transcript-write-context.js";
 import type { OpenClawConfig } from "../../../config/types.js";
 import { buildMemorySystemPromptAddition } from "../../../context-engine/delegate.js";
 import {
@@ -20,7 +21,10 @@ import {
   resolvePromptCacheTouchTimestamp,
   runAttemptContextEngineBootstrap,
 } from "./attempt.context-engine-helpers.js";
-import { EmbeddedAttemptSessionTakeoverError } from "./attempt.session-lock.js";
+import {
+  createEmbeddedAttemptSessionLockController,
+  EmbeddedAttemptSessionTakeoverError,
+} from "./attempt.session-lock.js";
 import {
   cleanupTempPaths,
   createDefaultEmbeddedSession,
@@ -1679,6 +1683,54 @@ describe("runEmbeddedAttempt context engine sessionKey forwarding", () => {
     expect(((error as Error).cause as Error).message).toContain(cleanupReacquireSessionFile);
     expect((error as { promptError?: unknown }).promptError).toBe(providerError);
     expect(hoisted.flushPendingToolResultsAfterIdleMock).not.toHaveBeenCalled();
+  });
+
+  it("publishes prompt-stream transcript writes for another released attempt", async () => {
+    const sharedDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-prompt-owned-write-"));
+    tempPaths.push(sharedDir);
+    const sharedSessionFile = path.join(sharedDir, "session.jsonl");
+    await fs.writeFile(sharedSessionFile, '{"type":"session"}\n', "utf8");
+    const firstController = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: hoisted.acquireSessionWriteLockMock,
+      lockOptions: {
+        sessionFile: sharedSessionFile,
+        timeoutMs: 60_000,
+        staleMs: 1_800_000,
+        maxHoldMs: 300_000,
+      },
+    });
+
+    try {
+      await firstController.releaseForPrompt();
+      await createContextEngineAttemptRunner({
+        contextEngine: createContextEngineBootstrapAndAssemble(),
+        sessionKey,
+        tempPaths,
+        attemptOverrides: {
+          sessionFile: sharedSessionFile,
+        },
+        sessionPrompt: async (session) => {
+          await runWithOwnedSessionTranscriptWritePublication(
+            { sessionFile: sharedSessionFile, sessionKey },
+            async () => {
+              await fs.appendFile(
+                sharedSessionFile,
+                '{"type":"announce","id":"completion"}\n',
+                "utf8",
+              );
+            },
+          );
+          session.messages = [...session.messages, doneMessage];
+        },
+      });
+
+      await expect(firstController.withSessionWriteLock(() => "finalize")).resolves.toBe(
+        "finalize",
+      );
+      expect(firstController.hasSessionTakeover()).toBe(false);
+    } finally {
+      await firstController.dispose();
+    }
   });
 
   it("keeps cleanup session takeover fatal when no provider prompt error exists", async () => {
