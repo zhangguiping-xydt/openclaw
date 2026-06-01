@@ -48,7 +48,6 @@ import {
   type ExecProcessOutcome,
   applyPathPrepend,
   applyShellPath,
-  normalizeExecAsk,
   normalizePathPrepend,
   resolveExecTarget,
   resolveApprovalRunningNoticeMs,
@@ -1473,9 +1472,8 @@ export function createExecTool(
         security = "full";
       }
       // Keep local exec defaults in sync with exec-approvals.json when tools.exec.* is unset.
-      const requestedAsk = normalizeExecAsk(params.ask);
       const hostAsk = maxAsk(modePolicy.ask, approvalPolicy?.ask ?? modePolicy.ask);
-      let ask = maxAsk(hostAsk, requestedAsk ?? hostAsk);
+      let ask = hostAsk;
       const bypassApprovals =
         elevatedRequested &&
         elevatedMode === "full" &&
