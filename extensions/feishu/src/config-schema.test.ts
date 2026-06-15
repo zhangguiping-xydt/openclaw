@@ -61,7 +61,7 @@ describe("FeishuConfigSchema webhook validation", () => {
   it("rejects top-level webhook mode without encryptKey", () => {
     const result = FeishuConfigSchema.safeParse({
       connectionMode: "webhook",
-      verificationToken: "token_top",
+      verificationToken: "token_top", // nosemgrep: ghsa-g353-mgv3-8pcj.feishu-webhook-mode-missing-encrypt-key — intentional negative test asserting encryptKey is required
       appId: "cli_top",
       appSecret: "secret_top", // pragma: allowlist secret
     });
@@ -100,7 +100,7 @@ describe("FeishuConfigSchema webhook validation", () => {
       accounts: {
         main: {
           connectionMode: "webhook",
-          verificationToken: "token_main",
+          verificationToken: "token_main", // nosemgrep: ghsa-g353-mgv3-8pcj.feishu-webhook-mode-missing-encrypt-key — intentional negative test asserting encryptKey is required
           appId: "cli_main",
           appSecret: "secret_main", // pragma: allowlist secret
         },
