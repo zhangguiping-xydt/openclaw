@@ -3000,9 +3000,9 @@ async function processOpenAICompletionsStream(
         const timeout = Symbol("terminal-usage-timeout");
         const result = await Promise.race([
           iterator.next(),
-          new Promise<typeof timeout>((resolve) =>
-            setTimeout(() => resolve(timeout), terminalUsageGraceMs),
-          ),
+          new Promise<typeof timeout>((resolve) => {
+            setTimeout(() => resolve(timeout), terminalUsageGraceMs);
+          }),
         ]);
         if (result === timeout) {
           void abortAndCloseIterator();
@@ -3595,9 +3595,7 @@ function getCompat(model: OpenAIModeModel): {
     reasoningEffortMap: resolveOpenAIReasoningEffortMap(model, detected.reasoningEffortMap),
     supportsUsageInStreaming: compat.supportsUsageInStreaming ?? detected.supportsUsageInStreaming,
     finishReasonTerminatesStream,
-    terminalUsageGraceMs: finishReasonTerminatesStream
-      ? (compat.terminalUsageGraceMs as number | undefined)
-      : undefined,
+    terminalUsageGraceMs: finishReasonTerminatesStream ? compat.terminalUsageGraceMs : undefined,
     maxTokensField: (compat.maxTokensField as string | undefined) ?? detected.maxTokensField,
     requiresToolResultName: compat.requiresToolResultName ?? detected.requiresToolResultName,
     requiresAssistantAfterToolResult:

@@ -367,9 +367,9 @@ export const streamOpenAICompletions: StreamFunction<
             const timeout = Symbol("terminal-usage-timeout");
             const result = await Promise.race([
               iterator.next(),
-              new Promise<typeof timeout>((resolve) =>
-                setTimeout(() => resolve(timeout), terminalUsageGraceMs),
-              ),
+              new Promise<typeof timeout>((resolve) => {
+                setTimeout(() => resolve(timeout), terminalUsageGraceMs);
+              }),
             ]);
             if (result === timeout) {
               void abortAndCloseIterator();

@@ -571,9 +571,9 @@ describe("openai-completions stop-reason tool-call guard", () => {
     try {
       const result = await Promise.race([
         stream.result(),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("stream did not finalize")), 25),
-        ),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error("stream did not finalize")), 25);
+        }),
       ]);
 
       expect(result.content).toContainEqual({ type: "text", text: "done" });
@@ -608,9 +608,9 @@ describe("openai-completions stop-reason tool-call guard", () => {
     try {
       const result = await Promise.race([
         stream.result(),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("stream did not finalize")), 100),
-        ),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error("stream did not finalize")), 100);
+        }),
       ]);
 
       expect(result.content).toContainEqual({ type: "text", text: "done" });
@@ -643,9 +643,9 @@ describe("openai-completions stop-reason tool-call guard", () => {
     try {
       const result = await Promise.race([
         stream.result(),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("stream did not finalize")), 100),
-        ),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error("stream did not finalize")), 100);
+        }),
       ]);
 
       expect(result.content).toContainEqual({ type: "text", text: "done" });

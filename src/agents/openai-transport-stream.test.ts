@@ -1,6 +1,7 @@
 // Verifies OpenAI-compatible streaming payloads, failures, and transport wrapping.
 import { createServer } from "node:http";
 import OpenAI from "openai";
+import type { ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import type { Api, Model } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -127,16 +128,16 @@ async function* streamChunks(chunks: readonly unknown[]): AsyncGenerator<never> 
   }
 }
 
-function streamChunksThenHang(chunks: readonly unknown[]): AsyncIterable<unknown> {
+function streamChunksThenHang(chunks: readonly unknown[]): AsyncIterable<ChatCompletionChunk> {
   return {
     [Symbol.asyncIterator]() {
       let index = 0;
       return {
         next: async () => {
           if (index < chunks.length) {
-            return { done: false, value: chunks[index++] };
+            return { done: false, value: chunks[index++] as ChatCompletionChunk };
           }
-          return await new Promise<IteratorResult<unknown>>(() => {});
+          return await new Promise<IteratorResult<ChatCompletionChunk>>(() => {});
         },
         return: async () => ({ done: true, value: undefined }),
       };
@@ -1191,9 +1192,9 @@ describe("openai transport stream", () => {
     await expect(
       Promise.race([
         testing.processOpenAICompletionsStream(streamChunksThenHang(chunks), output, model, stream),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("stream did not finalize")), 100),
-        ),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("stream did not finalize")), 100);
+        }),
       ]),
     ).resolves.toBeUndefined();
     expect(output.content).toEqual([{ type: "text", text: "done" }]);
@@ -1237,9 +1238,9 @@ describe("openai transport stream", () => {
     await expect(
       Promise.race([
         testing.processOpenAICompletionsStream(streamChunksThenHang(chunks), output, model, stream),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("stream did not finalize")), 100),
-        ),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("stream did not finalize")), 100);
+        }),
       ]),
     ).resolves.toBeUndefined();
     expect(output.content).toEqual([{ type: "text", text: "done" }]);
@@ -1286,9 +1287,9 @@ describe("openai transport stream", () => {
             abortRequest,
           },
         ),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("stream did not finalize")), 100),
-        ),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("stream did not finalize")), 100);
+        }),
       ]),
     ).resolves.toBeUndefined();
     expect(abortRequest).toHaveBeenCalledTimes(1);
@@ -1346,9 +1347,9 @@ describe("openai transport stream", () => {
     await expect(
       Promise.race([
         testing.processOpenAICompletionsStream(streamChunksThenHang(chunks), output, model, stream),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("stream did not finalize")), 100),
-        ),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("stream did not finalize")), 100);
+        }),
       ]),
     ).resolves.toBeUndefined();
     expect(output.stopReason).toBe("toolUse");
