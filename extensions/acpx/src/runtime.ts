@@ -94,8 +94,11 @@ type AcpxLaunchLeaseContext = {
   stableCommand?: string;
 };
 
+type AcpxLaunchEnv = Record<string, string>;
+
 const CODEX_WRAPPER_STDERR_LOG_PREFIX = "codex-acp-wrapper.stderr";
 const CODEX_WRAPPER_ERROR_TAIL_MAX_CHARS = 6_000;
+const PORTABLE_ENV_VAR_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function safeDiagnosticFilePart(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "unknown";
@@ -577,11 +580,13 @@ function normalizeClaudeAcpModelOverride(rawModel: string | undefined): string |
 }
 
 function withAcpxSessionOptions(input: OpenClawRuntimeEnsureInput): AcpxDelegateEnsureInput {
+  const delegateInput = { ...input } as Record<string, unknown>;
+  delete delegateInput.env;
   const existingOptions = (input as { sessionOptions?: SessionAgentOptions }).sessionOptions;
   const model = input.model?.trim() || existingOptions?.model;
   const sessionOptions = model ? { ...existingOptions, model } : existingOptions;
   return {
-    ...input,
+    ...delegateInput,
     ...(sessionOptions ? { sessionOptions } : {}),
   } as AcpxDelegateEnsureInput;
 }
@@ -591,6 +596,26 @@ function quoteShellArg(value: string): string {
     return value;
   }
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function normalizeLaunchEnv(env: Record<string, string> | undefined): AcpxLaunchEnv | undefined {
+  const entries = Object.entries(env ?? {}).filter((entry): entry is [string, string] => {
+    const [key, value] = entry;
+    return PORTABLE_ENV_VAR_KEY.test(key) && typeof value === "string";
+  });
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function withLaunchEnv(command: string, env: AcpxLaunchEnv | undefined): string {
+  const entries = Object.entries(env ?? {});
+  if (entries.length === 0) {
+    return command;
+  }
+  return [
+    "/usr/bin/env",
+    ...entries.map(([key, value]) => `${key}=${quoteShellArg(value)}`),
+    command,
+  ].join(" ");
 }
 
 function appendCodexAcpConfigOverrides(command: string, override: CodexAcpModelOverride): string {
@@ -606,21 +631,21 @@ function appendCodexAcpConfigOverrides(command: string, override: CodexAcpModelO
 
 function createModelScopedAgentRegistry(params: {
   agentRegistry: AcpAgentRegistry;
-  scope: AsyncLocalStorage<CodexAcpModelOverride | undefined>;
+  modelScope: AsyncLocalStorage<CodexAcpModelOverride | undefined>;
+  envScope: AsyncLocalStorage<AcpxLaunchEnv | undefined>;
   leaseCommand: (command: string) => string;
 }): AcpAgentRegistry {
   return {
     resolve(agentName: string): string {
       const command = params.agentRegistry.resolve(agentName);
-      const override = params.scope.getStore();
-      if (
-        !override ||
-        normalizeAgentName(agentName) !== CODEX_ACP_AGENT_ID ||
-        !isCodexAcpCommand(command)
-      ) {
-        return params.leaseCommand(command);
-      }
-      return params.leaseCommand(appendCodexAcpConfigOverrides(command, override));
+      const override = params.modelScope.getStore();
+      const modelCommand =
+        override &&
+        normalizeAgentName(agentName) === CODEX_ACP_AGENT_ID &&
+        isCodexAcpCommand(command)
+          ? appendCodexAcpConfigOverrides(command, override)
+          : command;
+      return params.leaseCommand(withLaunchEnv(modelCommand, params.envScope.getStore()));
     },
     list(): string[] {
       return params.agentRegistry.list();
@@ -669,6 +694,7 @@ export class AcpxRuntime implements AcpRuntime {
   private readonly codexAcpModelOverrideScope = new AsyncLocalStorage<
     CodexAcpModelOverride | undefined
   >();
+  private readonly acpxLaunchEnvScope = new AsyncLocalStorage<AcpxLaunchEnv | undefined>();
   private readonly delegate: BaseAcpxRuntime;
   private readonly bridgeSafeDelegate: BaseAcpxRuntime;
   private readonly probeDelegate: BaseAcpxRuntime;
@@ -694,7 +720,8 @@ export class AcpxRuntime implements AcpRuntime {
     this.agentRegistry = options.agentRegistry;
     this.scopedAgentRegistry = createModelScopedAgentRegistry({
       agentRegistry: this.agentRegistry,
-      scope: this.codexAcpModelOverrideScope,
+      modelScope: this.codexAcpModelOverrideScope,
+      envScope: this.acpxLaunchEnvScope,
       leaseCommand: (command) => this.commandWithLaunchLease(command),
     });
     const sharedOptions = {
@@ -968,10 +995,13 @@ export class AcpxRuntime implements AcpRuntime {
         ? normalizeCodexAcpModelOverride(input.model, input.thinking)
         : undefined;
     const ensureInput = claudeModelOverride ? { ...input, model: claudeModelOverride } : input;
-    const stableLaunchCommand =
-      codexModelOverride && command
-        ? appendCodexAcpConfigOverrides(command, codexModelOverride)
-        : command;
+    const launchEnv = normalizeLaunchEnv(input.env);
+    const stableLaunchCommand = command
+      ? withLaunchEnv(
+          codexModelOverride ? appendCodexAcpConfigOverrides(command, codexModelOverride) : command,
+          launchEnv,
+        )
+      : undefined;
     const shouldStartWithLease = !(await this.canReuseStablePersistentSession({
       sessionKey: input.sessionKey,
       mode: input.mode,
@@ -986,11 +1016,13 @@ export class AcpxRuntime implements AcpRuntime {
         command: stableLaunchCommand,
         enabled: shouldStartWithLease,
         run: () =>
-          this.withCodexWrapperDiagnostics({
-            command: stableLaunchCommand,
-            fallbackCode: "ACP_SESSION_INIT_FAILED",
-            run: () => delegate.ensureSession(withAcpxSessionOptions(ensureInput)),
-          }),
+          this.acpxLaunchEnvScope.run(launchEnv, () =>
+            this.withCodexWrapperDiagnostics({
+              command: stableLaunchCommand,
+              fallbackCode: "ACP_SESSION_INIT_FAILED",
+              run: () => delegate.ensureSession(withAcpxSessionOptions(ensureInput)),
+            }),
+          ),
       });
     }
 
@@ -1006,11 +1038,13 @@ export class AcpxRuntime implements AcpRuntime {
       enabled: shouldStartWithLease,
       run: () =>
         this.codexAcpModelOverrideScope.run(codexModelOverride, () =>
-          this.withCodexWrapperDiagnostics({
-            command: stableLaunchCommand,
-            fallbackCode: "ACP_SESSION_INIT_FAILED",
-            run: () => delegate.ensureSession(withAcpxSessionOptions(normalizedInput)),
-          }),
+          this.acpxLaunchEnvScope.run(launchEnv, () =>
+            this.withCodexWrapperDiagnostics({
+              command: stableLaunchCommand,
+              fallbackCode: "ACP_SESSION_INIT_FAILED",
+              run: () => delegate.ensureSession(withAcpxSessionOptions(normalizedInput)),
+            }),
+          ),
         ),
     });
   }

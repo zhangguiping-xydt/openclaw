@@ -467,7 +467,7 @@ describe("AcpxRuntime fresh reset wrapper", () => {
       {
         type: "error",
         code: "ACP_TURN_FAILED",
-        message: expect.stringContaining("profile missing OPENAI_API_KEY"),
+        message: expect.stringContaining("profile missing OPENAI_***"),
         retryable: false,
       },
     ]);
@@ -673,6 +673,41 @@ describe("AcpxRuntime fresh reset wrapper", () => {
         timeoutMs: 0,
       }),
     );
+  });
+
+  it("applies ensureSession env to the ACpx delegate launch command", async () => {
+    const baseStore: TestSessionStore = {
+      load: vi.fn(async () => undefined),
+      save: vi.fn(async (record) => {
+        expect(record.agentCommand).toBe(
+          "/usr/bin/env GIT_AUTHOR_EMAIL=blueprint-platform-pm@blueprint.local OPENCLAW_TRACE_LABEL='blueprint platform' npx @agentclientprotocol/claude-agent-acp",
+        );
+      }),
+    };
+    const { runtime, delegate } = makeRuntime(baseStore, {
+      agentRegistry: {
+        resolve: (agentName: string) =>
+          agentName === "claude" ? "npx @agentclientprotocol/claude-agent-acp" : agentName,
+        list: () => ["claude"],
+      },
+    });
+    const ensure = vi.spyOn(delegate, "ensureSession");
+
+    await runtime.ensureSession({
+      sessionKey: "agent:claude:acp:test",
+      agent: "claude",
+      mode: "oneshot",
+      env: {
+        GIT_AUTHOR_EMAIL: "blueprint-platform-pm@blueprint.local",
+        OPENCLAW_TRACE_LABEL: "blueprint platform",
+      },
+    });
+
+    expect(readFirstEnsureSessionInput(ensure)).toEqual({
+      sessionKey: "agent:claude:acp:test",
+      agent: "claude",
+      mode: "oneshot",
+    });
   });
 
   it("passes model startup through sessionOptions for non-Codex ACP agents", async () => {
