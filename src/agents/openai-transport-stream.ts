@@ -3010,7 +3010,6 @@ async function processOpenAICompletionsStream(
         }
         nextChunk = result;
       }
-      waitForTerminalUsage = false;
     } else {
       nextChunk = await iterator.next();
     }

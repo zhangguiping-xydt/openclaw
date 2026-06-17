@@ -1295,6 +1295,61 @@ describe("openai transport stream", () => {
     expect(abortRequest).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps terminal usage grace active through usage-less chunks", async () => {
+    const model: Model<"openai-completions"> = {
+      ...createDeepSeekCompletionsModel(),
+      id: "deepseek-v4-flash",
+      name: "DeepSeek V4 Flash",
+      provider: "opencode-go",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+      compat: {
+        supportsUsageInStreaming: true,
+        finishReasonTerminatesStream: true,
+        terminalUsageGraceMs: 1,
+      },
+    };
+    const output = createAssistantOutput(model);
+    const stream: { push(event: unknown): void } = { push() {} };
+    const abortRequest = vi.fn();
+    const chunks = [
+      {
+        id: "chatcmpl-opencode-go-terminal-drain",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { content: "done" }, finish_reason: null }],
+      },
+      {
+        id: "chatcmpl-opencode-go-terminal-drain",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      },
+      {
+        id: "chatcmpl-opencode-go-terminal-drain",
+        object: "chat.completion.chunk",
+        choices: [],
+      },
+    ] as const;
+
+    await expect(
+      Promise.race([
+        testing.processOpenAICompletionsStream(
+          streamChunksThenHang(chunks),
+          output,
+          model,
+          stream,
+          {
+            abortRequest,
+          },
+        ),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("stream did not finalize")), 100);
+        }),
+      ]),
+    ).resolves.toBeUndefined();
+    expect(output.content).toEqual([{ type: "text", text: "done" }]);
+    expect(output.stopReason).toBe("stop");
+    expect(abortRequest).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps reading opencode-go Chat Completions streams through usage-only chunks after tool-call finish", async () => {
     const model: Model<"openai-completions"> = {
       ...createDeepSeekCompletionsModel(),

@@ -377,7 +377,6 @@ export const streamOpenAICompletions: StreamFunction<
             }
             nextChunk = result;
           }
-          waitForTerminalUsage = false;
         } else {
           nextChunk = await iterator.next();
         }

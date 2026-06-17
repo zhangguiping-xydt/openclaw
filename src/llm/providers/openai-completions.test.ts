@@ -658,6 +658,51 @@ describe("openai-completions stop-reason tool-call guard", () => {
     }
   });
 
+  it("keeps legacy terminal usage grace active through usage-less chunks", async () => {
+    mockChunksRef.chunks = [
+      makeTextChunk("done"),
+      makeFinishChunk("stop"),
+      {
+        id: "chatcmpl-test",
+        choices: [],
+      },
+    ];
+    mockChunksRef.hangAfterChunks = true;
+    mockRequestSignalsRef.signals = [];
+
+    const stream = streamOpenAICompletions(
+      {
+        ...model,
+        provider: "opencode-go",
+        baseUrl: "https://opencode.ai/zen/go/v1",
+        compat: {
+          supportsUsageInStreaming: true,
+          finishReasonTerminatesStream: true,
+          terminalUsageGraceMs: 1,
+        },
+      },
+      context,
+      { apiKey: "sk-test" },
+    );
+
+    try {
+      const result = await Promise.race([
+        stream.result(),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error("stream did not finalize")), 100);
+        }),
+      ]);
+
+      expect(result.content).toContainEqual({ type: "text", text: "done" });
+      expect(result.stopReason).toBe("stop");
+      expect(mockRequestSignalsRef.signals).toHaveLength(1);
+      expect(mockRequestSignalsRef.signals[0].aborted).toBe(true);
+    } finally {
+      mockChunksRef.hangAfterChunks = false;
+      mockRequestSignalsRef.signals = [];
+    }
+  });
+
   it("keeps literal reasoning tag examples visible when no reasoning field is mirrored", async () => {
     mockChunksRef.chunks = [
       makeTextChunk("Use `<think>private</think>` only as an example."),
