@@ -145,6 +145,29 @@ function streamChunksThenHang(chunks: readonly unknown[]): AsyncIterable<ChatCom
   };
 }
 
+function streamChunksWithReturnSpy(
+  chunks: readonly unknown[],
+  onReturn: () => void,
+): AsyncIterable<ChatCompletionChunk> {
+  return {
+    [Symbol.asyncIterator]() {
+      let index = 0;
+      return {
+        next: async () => {
+          if (index < chunks.length) {
+            return { done: false, value: chunks[index++] as ChatCompletionChunk };
+          }
+          return await new Promise<IteratorResult<ChatCompletionChunk>>(() => {});
+        },
+        return: async () => {
+          onReturn();
+          return { done: true, value: undefined };
+        },
+      };
+    },
+  };
+}
+
 function expectRecordFields(record: unknown, expected: Record<string, unknown>) {
   // Shared assertion helper for parsed transport payload/event records.
   if (!record || typeof record !== "object") {
@@ -1413,6 +1436,46 @@ describe("openai transport stream", () => {
       output: 2,
       totalTokens: 7,
     });
+  });
+
+  it("closes OpenAI-compatible iterators when stream processing throws", async () => {
+    const model: Model<"openai-completions"> = {
+      ...createDeepSeekCompletionsModel(),
+      id: "deepseek-v4-flash",
+      name: "DeepSeek V4 Flash",
+      provider: "opencode-go",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+    };
+    const output = createAssistantOutput(model);
+    const stream: { push(event: unknown): void } = { push() {} };
+    const returnSpy = vi.fn();
+    const chunks = [
+      {
+        id: "chatcmpl-opencode-go-error-cleanup",
+        object: "chat.completion.chunk",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              get tool_calls(): never {
+                throw new Error("tool calls exploded");
+              },
+            },
+            finish_reason: null,
+          },
+        ],
+      },
+    ] as const;
+
+    await expect(
+      testing.processOpenAICompletionsStream(
+        streamChunksWithReturnSpy(chunks, returnSpy),
+        output,
+        model,
+        stream,
+      ),
+    ).rejects.toThrow();
+    expect(returnSpy).toHaveBeenCalledTimes(1);
   });
 
   it("keeps reading opencode-go Chat Completions streams through usage-only chunks after stop", async () => {

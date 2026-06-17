@@ -15,10 +15,13 @@ type OpenAICompatibleChatCompletionChunk = Omit<DeepPartial<ChatCompletionChunk>
   choices?: OpenAICompatibleChoice[];
 };
 
-const mockChunksRef: { chunks: OpenAICompatibleChatCompletionChunk[]; hangAfterChunks?: boolean } =
-  {
-    chunks: [],
-  };
+const mockChunksRef: {
+  chunks: OpenAICompatibleChatCompletionChunk[];
+  hangAfterChunks?: boolean;
+  onReturn?: () => void;
+} = {
+  chunks: [],
+};
 const mockRequestSignalsRef: { signals: AbortSignal[] } = {
   signals: [],
 };
@@ -33,18 +36,30 @@ vi.mock("openai", () => {
           }
           return {
             withResponse: async () => {
-              async function* generate() {
-                for (const chunk of mockChunksRef.chunks) {
-                  yield chunk;
-                }
-                if (mockChunksRef.hangAfterChunks) {
-                  await new Promise<void>((resolve) => {
-                    requestOptions?.signal?.addEventListener("abort", () => resolve(), {
-                      once: true,
-                    });
-                  });
-                }
-              }
+              const generate = (): AsyncIterable<OpenAICompatibleChatCompletionChunk> => ({
+                [Symbol.asyncIterator]() {
+                  let index = 0;
+                  return {
+                    next: async () => {
+                      if (index < mockChunksRef.chunks.length) {
+                        return { done: false, value: mockChunksRef.chunks[index++] };
+                      }
+                      if (mockChunksRef.hangAfterChunks) {
+                        await new Promise<void>((resolve) => {
+                          requestOptions?.signal?.addEventListener("abort", () => resolve(), {
+                            once: true,
+                          });
+                        });
+                      }
+                      return { done: true, value: undefined };
+                    },
+                    return: async () => {
+                      mockChunksRef.onReturn?.();
+                      return { done: true, value: undefined };
+                    },
+                  };
+                },
+              });
               return {
                 data: generate(),
                 response: { status: 200, headers: new Headers() },
@@ -700,6 +715,37 @@ describe("openai-completions stop-reason tool-call guard", () => {
     } finally {
       mockChunksRef.hangAfterChunks = false;
       mockRequestSignalsRef.signals = [];
+    }
+  });
+
+  it("closes legacy OpenAI-compatible iterators when stream processing throws", async () => {
+    const returnSpy = vi.fn();
+    mockChunksRef.chunks = [
+      {
+        id: "chatcmpl-test",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              get tool_calls(): never {
+                throw new Error("tool calls exploded");
+              },
+            },
+          },
+        ],
+      },
+    ];
+    mockChunksRef.onReturn = returnSpy;
+
+    try {
+      const stream = streamOpenAICompletions(model, context, { apiKey: "sk-test" });
+      const result = await stream.result();
+
+      expect(result.stopReason).toBe("error");
+      expect(result.errorMessage).toContain("tool calls exploded");
+      expect(returnSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      mockChunksRef.onReturn = undefined;
     }
   });
 

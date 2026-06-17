@@ -347,182 +347,200 @@ export const streamOpenAICompletions: StreamFunction<
 
       const iterator = (openaiStream as AsyncIterable<ChatCompletionChunk>)[Symbol.asyncIterator]();
       const terminalUsageGraceMs = compat.terminalUsageGraceMs;
+      let iteratorReturned = false;
+      let iteratorCompleted = false;
+      const closeIterator = async () => {
+        if (iteratorReturned) {
+          return;
+        }
+        iteratorReturned = true;
+        await iterator.return?.();
+      };
       const abortAndCloseIterator = async () => {
         abortRequest();
-        await iterator.return?.();
-      };
-      const closeIterator = async () => {
-        await iterator.return?.();
+        await closeIterator();
       };
       let waitForTerminalUsage = false;
-      while (true) {
-        let nextChunk: IteratorResult<ChatCompletionChunk>;
-        if (waitForTerminalUsage) {
-          if (terminalUsageGraceMs === undefined) {
-            nextChunk = await iterator.next();
-          } else if (terminalUsageGraceMs === 0) {
-            void abortAndCloseIterator();
-            break;
-          } else {
-            const timeout = Symbol("terminal-usage-timeout");
-            const result = await Promise.race([
-              iterator.next(),
-              new Promise<typeof timeout>((resolve) => {
-                setTimeout(() => resolve(timeout), terminalUsageGraceMs);
-              }),
-            ]);
-            if (result === timeout) {
+      try {
+        while (true) {
+          let nextChunk: IteratorResult<ChatCompletionChunk>;
+          if (waitForTerminalUsage) {
+            if (terminalUsageGraceMs === undefined) {
+              nextChunk = await iterator.next();
+            } else if (terminalUsageGraceMs === 0) {
               void abortAndCloseIterator();
               break;
+            } else {
+              const timeout = Symbol("terminal-usage-timeout");
+              const result = await Promise.race([
+                iterator.next(),
+                new Promise<typeof timeout>((resolve) => {
+                  setTimeout(() => resolve(timeout), terminalUsageGraceMs);
+                }),
+              ]);
+              if (result === timeout) {
+                void abortAndCloseIterator();
+                break;
+              }
+              nextChunk = result;
             }
-            nextChunk = result;
+          } else {
+            nextChunk = await iterator.next();
           }
-        } else {
-          nextChunk = await iterator.next();
-        }
-        if (nextChunk.done) {
-          break;
-        }
-        const chunk = nextChunk.value;
-        if (!chunk || typeof chunk !== "object") {
-          continue;
-        }
-
-        // OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
-        // and each chunk in a streamed completion carries the same id.
-        output.responseId ||= chunk.id;
-        if (typeof chunk.model === "string" && chunk.model.length > 0 && chunk.model !== model.id) {
-          output.responseModel ||= chunk.model;
-        }
-        if (chunk.usage) {
-          output.usage = parseChunkUsage(chunk.usage, model);
-        }
-
-        const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
-        if (!choice) {
-          if (hasFinishReason && chunk.usage) {
-            await closeIterator();
+          if (nextChunk.done) {
+            iteratorCompleted = true;
             break;
           }
-          continue;
-        }
-
-        // Fallback: some providers (e.g., Moonshot) return usage
-        // in choice.usage instead of the standard chunk.usage
-        const choiceUsage = (
-          choice as typeof choice & { usage?: Parameters<typeof parseChunkUsage>[0] }
-        ).usage;
-        if (!chunk.usage && choiceUsage) {
-          output.usage = parseChunkUsage(choiceUsage, model);
-        }
-
-        const shouldFinishAfterChunk =
-          compat.finishReasonTerminatesStream &&
-          choice.finish_reason != null &&
-          (chunk.usage !== undefined ||
-            choiceUsage !== undefined ||
-            !compat.supportsUsageInStreaming);
-        const shouldWaitForTerminalUsage =
-          compat.finishReasonTerminatesStream &&
-          choice.finish_reason != null &&
-          compat.supportsUsageInStreaming &&
-          chunk.usage === undefined &&
-          choiceUsage === undefined;
-        if (choice.finish_reason) {
-          const finishReasonResult = mapStopReason(choice.finish_reason);
-          output.stopReason = finishReasonResult.stopReason;
-          if (finishReasonResult.errorMessage) {
-            output.errorMessage = finishReasonResult.errorMessage;
+          const chunk = nextChunk.value;
+          if (!chunk || typeof chunk !== "object") {
+            continue;
           }
-          hasFinishReason = true;
-        }
 
-        if (choice.delta) {
-          // Some endpoints return reasoning in reasoning_content (llama.cpp),
-          // or reasoning (other openai compatible endpoints)
-          // Use the first non-empty reasoning field to avoid duplication
-          // (e.g., chutes.ai returns both reasoning_content and reasoning with same content)
-          const reasoningFields = ["reasoning_content", "reasoning", "reasoning_text"];
-          const deltaFields = choice.delta as Record<string, unknown>;
-          const shouldEmitReasoning = Boolean(model.reasoning && options?.reasoningEffort);
-          let foundReasoningField: string | null = null;
-          for (const field of reasoningFields) {
-            const value = deltaFields[field];
-            if (typeof value === "string" && value.length > 0) {
-              foundReasoningField = field;
+          // OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
+          // and each chunk in a streamed completion carries the same id.
+          output.responseId ||= chunk.id;
+          if (
+            typeof chunk.model === "string" &&
+            chunk.model.length > 0 &&
+            chunk.model !== model.id
+          ) {
+            output.responseModel ||= chunk.model;
+          }
+          if (chunk.usage) {
+            output.usage = parseChunkUsage(chunk.usage, model);
+          }
+
+          const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+          if (!choice) {
+            if (hasFinishReason && chunk.usage) {
+              await closeIterator();
               break;
             }
-          }
-          if (foundReasoningField) {
-            reasoningTagTextPartitioner.markStrict();
-          }
-          if (
-            choice.delta.content !== null &&
-            choice.delta.content !== undefined &&
-            choice.delta.content.length > 0
-          ) {
-            appendPartitionedContent(choice.delta.content, Boolean(foundReasoningField));
+            continue;
           }
 
-          if (shouldEmitReasoning && foundReasoningField) {
-            const delta = deltaFields[foundReasoningField];
-            if (typeof delta === "string" && delta.length > 0) {
-              const thinkingSignature =
-                model.provider === "opencode-go" && foundReasoningField === "reasoning"
-                  ? "reasoning_content"
-                  : foundReasoningField;
-              appendThinkingDelta(thinkingSignature, delta);
+          // Fallback: some providers (e.g., Moonshot) return usage
+          // in choice.usage instead of the standard chunk.usage
+          const choiceUsage = (
+            choice as typeof choice & { usage?: Parameters<typeof parseChunkUsage>[0] }
+          ).usage;
+          if (!chunk.usage && choiceUsage) {
+            output.usage = parseChunkUsage(choiceUsage, model);
+          }
+
+          const shouldFinishAfterChunk =
+            compat.finishReasonTerminatesStream &&
+            choice.finish_reason != null &&
+            (chunk.usage !== undefined ||
+              choiceUsage !== undefined ||
+              !compat.supportsUsageInStreaming);
+          const shouldWaitForTerminalUsage =
+            compat.finishReasonTerminatesStream &&
+            choice.finish_reason != null &&
+            compat.supportsUsageInStreaming &&
+            chunk.usage === undefined &&
+            choiceUsage === undefined;
+          if (choice.finish_reason) {
+            const finishReasonResult = mapStopReason(choice.finish_reason);
+            output.stopReason = finishReasonResult.stopReason;
+            if (finishReasonResult.errorMessage) {
+              output.errorMessage = finishReasonResult.errorMessage;
             }
+            hasFinishReason = true;
           }
 
-          if (choice?.delta?.tool_calls) {
-            flushPartitionedContent();
-            for (const toolCall of choice.delta.tool_calls) {
-              const block = ensureToolCallBlock(toolCall);
-              if (!block.id && toolCall.id) {
-                block.id = toolCall.id;
-                toolCallBlocksById.set(toolCall.id, block);
+          if (choice.delta) {
+            // Some endpoints return reasoning in reasoning_content (llama.cpp),
+            // or reasoning (other openai compatible endpoints)
+            // Use the first non-empty reasoning field to avoid duplication
+            // (e.g., chutes.ai returns both reasoning_content and reasoning with same content)
+            const reasoningFields = ["reasoning_content", "reasoning", "reasoning_text"];
+            const deltaFields = choice.delta as Record<string, unknown>;
+            const shouldEmitReasoning = Boolean(model.reasoning && options?.reasoningEffort);
+            let foundReasoningField: string | null = null;
+            for (const field of reasoningFields) {
+              const value = deltaFields[field];
+              if (typeof value === "string" && value.length > 0) {
+                foundReasoningField = field;
+                break;
               }
-              if (!block.name && toolCall.function?.name) {
-                block.name = toolCall.function.name;
-              }
-
-              let delta = "";
-              if (toolCall.function?.arguments) {
-                delta = toolCall.function.arguments;
-                block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
-                block.arguments = parseStreamingJson(block.partialArgs);
-              }
-              stream.push({
-                type: "toolcall_delta",
-                contentIndex: getContentIndex(block),
-                delta,
-                partial: output,
-              });
             }
-          }
+            if (foundReasoningField) {
+              reasoningTagTextPartitioner.markStrict();
+            }
+            if (
+              choice.delta.content !== null &&
+              choice.delta.content !== undefined &&
+              choice.delta.content.length > 0
+            ) {
+              appendPartitionedContent(choice.delta.content, Boolean(foundReasoningField));
+            }
 
-          const reasoningDetails = (choice.delta as { reasoning_details?: unknown })
-            .reasoning_details;
-          if (reasoningDetails && Array.isArray(reasoningDetails)) {
-            for (const detail of reasoningDetails) {
-              if (detail.type === "reasoning.encrypted" && detail.id && detail.data) {
-                const matchingToolCall = output.content.find(
-                  (b) => b.type === "toolCall" && b.id === detail.id,
-                ) as ToolCall | undefined;
-                if (matchingToolCall) {
-                  matchingToolCall.thoughtSignature = JSON.stringify(detail);
+            if (shouldEmitReasoning && foundReasoningField) {
+              const delta = deltaFields[foundReasoningField];
+              if (typeof delta === "string" && delta.length > 0) {
+                const thinkingSignature =
+                  model.provider === "opencode-go" && foundReasoningField === "reasoning"
+                    ? "reasoning_content"
+                    : foundReasoningField;
+                appendThinkingDelta(thinkingSignature, delta);
+              }
+            }
+
+            if (choice?.delta?.tool_calls) {
+              flushPartitionedContent();
+              for (const toolCall of choice.delta.tool_calls) {
+                const block = ensureToolCallBlock(toolCall);
+                if (!block.id && toolCall.id) {
+                  block.id = toolCall.id;
+                  toolCallBlocksById.set(toolCall.id, block);
+                }
+                if (!block.name && toolCall.function?.name) {
+                  block.name = toolCall.function.name;
+                }
+
+                let delta = "";
+                if (toolCall.function?.arguments) {
+                  delta = toolCall.function.arguments;
+                  block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
+                  block.arguments = parseStreamingJson(block.partialArgs);
+                }
+                stream.push({
+                  type: "toolcall_delta",
+                  contentIndex: getContentIndex(block),
+                  delta,
+                  partial: output,
+                });
+              }
+            }
+
+            const reasoningDetails = (choice.delta as { reasoning_details?: unknown })
+              .reasoning_details;
+            if (reasoningDetails && Array.isArray(reasoningDetails)) {
+              for (const detail of reasoningDetails) {
+                if (detail.type === "reasoning.encrypted" && detail.id && detail.data) {
+                  const matchingToolCall = output.content.find(
+                    (b) => b.type === "toolCall" && b.id === detail.id,
+                  ) as ToolCall | undefined;
+                  if (matchingToolCall) {
+                    matchingToolCall.thoughtSignature = JSON.stringify(detail);
+                  }
                 }
               }
             }
           }
+          if (shouldFinishAfterChunk) {
+            await closeIterator();
+            break;
+          }
+          if (shouldWaitForTerminalUsage) {
+            waitForTerminalUsage = true;
+          }
         }
-        if (shouldFinishAfterChunk) {
+        iteratorCompleted = true;
+      } finally {
+        if (!iteratorCompleted) {
           await closeIterator();
-          break;
-        }
-        if (shouldWaitForTerminalUsage) {
-          waitForTerminalUsage = true;
         }
       }
 

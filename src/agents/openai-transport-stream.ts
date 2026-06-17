@@ -2979,98 +2979,226 @@ async function processOpenAICompletionsStream(
   const cooperativeScheduler = createModelStreamCooperativeScheduler(options?.signal);
   const iterator = (responseStream as AsyncIterable<unknown>)[Symbol.asyncIterator]();
   const terminalUsageGraceMs = compat.terminalUsageGraceMs;
+  let iteratorReturned = false;
+  let iteratorCompleted = false;
+  const closeIterator = async () => {
+    if (iteratorReturned) {
+      return;
+    }
+    iteratorReturned = true;
+    await iterator.return?.();
+  };
   const abortAndCloseIterator = async () => {
     options?.abortRequest?.();
-    await iterator.return?.();
-  };
-  const closeIterator = async () => {
-    await iterator.return?.();
+    await closeIterator();
   };
   let waitForTerminalUsage = false;
-  while (true) {
-    throwIfModelStreamAborted(options?.signal);
-    let nextChunk: IteratorResult<unknown>;
-    if (waitForTerminalUsage) {
-      if (terminalUsageGraceMs === undefined) {
-        nextChunk = await iterator.next();
-      } else if (terminalUsageGraceMs === 0) {
-        void abortAndCloseIterator();
-        break;
-      } else {
-        const timeout = Symbol("terminal-usage-timeout");
-        const result = await Promise.race([
-          iterator.next(),
-          new Promise<typeof timeout>((resolve) => {
-            setTimeout(() => resolve(timeout), terminalUsageGraceMs);
-          }),
-        ]);
-        if (result === timeout) {
+  try {
+    while (true) {
+      throwIfModelStreamAborted(options?.signal);
+      let nextChunk: IteratorResult<unknown>;
+      if (waitForTerminalUsage) {
+        if (terminalUsageGraceMs === undefined) {
+          nextChunk = await iterator.next();
+        } else if (terminalUsageGraceMs === 0) {
           void abortAndCloseIterator();
           break;
+        } else {
+          const timeout = Symbol("terminal-usage-timeout");
+          const result = await Promise.race([
+            iterator.next(),
+            new Promise<typeof timeout>((resolve) => {
+              setTimeout(() => resolve(timeout), terminalUsageGraceMs);
+            }),
+          ]);
+          if (result === timeout) {
+            void abortAndCloseIterator();
+            break;
+          }
+          nextChunk = result;
         }
-        nextChunk = result;
+      } else {
+        nextChunk = await iterator.next();
       }
-    } else {
-      nextChunk = await iterator.next();
-    }
-    if (nextChunk.done) {
-      break;
-    }
-    const rawChunk = nextChunk.value;
-    throwIfModelStreamAborted(options?.signal);
-    chunkPushedEvent = false;
-    if (!rawChunk || typeof rawChunk !== "object") {
-      await cooperativeScheduler.afterEvent();
-      continue;
-    }
-    const chunk = rawChunk as ChatCompletionChunk;
-    output.responseId ||= chunk.id;
-    let hasReasoningUsageActivity = false;
-    if (chunk.usage) {
-      output.usage = parseTransportChunkUsage(chunk.usage, model);
-      hasReasoningUsageActivity = hasOpenAICompletionsReasoningUsageActivity(chunk.usage);
-    }
-    const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
-    if (!choice) {
-      emitReasoningUsageActivity(hasReasoningUsageActivity);
-      await cooperativeScheduler.afterEvent();
-      if (sawFinishReason && chunk.usage) {
-        await closeIterator();
+      if (nextChunk.done) {
+        iteratorCompleted = true;
         break;
       }
-      continue;
-    }
-    const choiceUsage = (choice as unknown as { usage?: ChatCompletionChunk["usage"] }).usage;
-    if (!chunk.usage && choiceUsage) {
-      output.usage = parseTransportChunkUsage(choiceUsage, model);
-      hasReasoningUsageActivity = hasOpenAICompletionsReasoningUsageActivity(choiceUsage);
-    }
-    const hasFinishReason = choice.finish_reason != null;
-    const shouldFinishAfterChunk =
-      compat.finishReasonTerminatesStream &&
-      hasFinishReason &&
-      (chunk.usage !== undefined || choiceUsage !== undefined || !compat.supportsUsageInStreaming);
-    const shouldWaitForTerminalUsage =
-      compat.finishReasonTerminatesStream &&
-      hasFinishReason &&
-      compat.supportsUsageInStreaming &&
-      chunk.usage === undefined &&
-      choiceUsage === undefined;
-    if (hasFinishReason) {
-      sawFinishReason = true;
-      const finishReasonResult = mapStopReason(choice.finish_reason);
-      output.stopReason = finishReasonResult.stopReason;
-      if (finishReasonResult.stopReason === "stop") {
-        sawStopFinishReason = true;
+      const rawChunk = nextChunk.value;
+      throwIfModelStreamAborted(options?.signal);
+      chunkPushedEvent = false;
+      if (!rawChunk || typeof rawChunk !== "object") {
+        await cooperativeScheduler.afterEvent();
+        continue;
       }
-      if (finishReasonResult.errorMessage) {
-        output.errorMessage = finishReasonResult.errorMessage;
+      const chunk = rawChunk as ChatCompletionChunk;
+      output.responseId ||= chunk.id;
+      let hasReasoningUsageActivity = false;
+      if (chunk.usage) {
+        output.usage = parseTransportChunkUsage(chunk.usage, model);
+        hasReasoningUsageActivity = hasOpenAICompletionsReasoningUsageActivity(chunk.usage);
       }
-    }
-    const choiceDelta =
-      choice.delta ??
-      (choice as unknown as { message?: ChatCompletionChunk["choices"][number]["delta"] }).message;
-    if (!choiceDelta) {
+      const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+      if (!choice) {
+        emitReasoningUsageActivity(hasReasoningUsageActivity);
+        await cooperativeScheduler.afterEvent();
+        if (sawFinishReason && chunk.usage) {
+          await closeIterator();
+          break;
+        }
+        continue;
+      }
+      const choiceUsage = (choice as unknown as { usage?: ChatCompletionChunk["usage"] }).usage;
+      if (!chunk.usage && choiceUsage) {
+        output.usage = parseTransportChunkUsage(choiceUsage, model);
+        hasReasoningUsageActivity = hasOpenAICompletionsReasoningUsageActivity(choiceUsage);
+      }
+      const hasFinishReason = choice.finish_reason != null;
+      const shouldFinishAfterChunk =
+        compat.finishReasonTerminatesStream &&
+        hasFinishReason &&
+        (chunk.usage !== undefined ||
+          choiceUsage !== undefined ||
+          !compat.supportsUsageInStreaming);
+      const shouldWaitForTerminalUsage =
+        compat.finishReasonTerminatesStream &&
+        hasFinishReason &&
+        compat.supportsUsageInStreaming &&
+        chunk.usage === undefined &&
+        choiceUsage === undefined;
+      if (hasFinishReason) {
+        sawFinishReason = true;
+        const finishReasonResult = mapStopReason(choice.finish_reason);
+        output.stopReason = finishReasonResult.stopReason;
+        if (finishReasonResult.stopReason === "stop") {
+          sawStopFinishReason = true;
+        }
+        if (finishReasonResult.errorMessage) {
+          output.errorMessage = finishReasonResult.errorMessage;
+        }
+      }
+      const choiceDelta =
+        choice.delta ??
+        (choice as unknown as { message?: ChatCompletionChunk["choices"][number]["delta"] })
+          .message;
+      if (!choiceDelta) {
+        emitReasoningUsageActivity(hasReasoningUsageActivity);
+        await cooperativeScheduler.afterEvent();
+        if (shouldFinishAfterChunk) {
+          await closeIterator();
+          break;
+        }
+        if (shouldWaitForTerminalUsage) {
+          waitForTerminalUsage = true;
+        }
+        continue;
+      }
+      const reasoningDeltas = getCompletionsReasoningDeltas(
+        choiceDelta as Record<string, unknown>,
+        compat.visibleReasoningDetailTypes,
+      );
+      const hasMirroredReasoning = reasoningDeltas.some((delta) => delta.kind === "thinking");
+      if (hasMirroredReasoning) {
+        reasoningTagTextPartitioner.markStrict();
+      }
+      if (choiceDelta.content) {
+        // Structured content can contain visible text and thinking blocks in the
+        // same delta, so route each extracted block through the normal stream path.
+        const contentDeltas = getCompletionsContentDeltas(choiceDelta.content);
+        for (const contentDelta of contentDeltas) {
+          if (contentDelta.kind === "text") {
+            const routedDeltas = hasMirroredReasoning
+              ? reasoningTagTextPartitioner.push(contentDelta.text)
+              : reasoningTagTextPartitioner.pushVisible(contentDelta.text);
+            for (const routedDelta of routedDeltas) {
+              appendPartitionedVisibleDelta(routedDelta);
+            }
+          } else {
+            reasoningTagTextPartitioner.markStrict();
+            appendRoutedContentDelta(contentDelta);
+          }
+        }
+      }
+      for (const reasoningDelta of reasoningDeltas) {
+        if (reasoningDelta.kind === "thinking" && !emitReasoning) {
+          continue;
+        }
+        if (currentBlock?.type === "toolCall") {
+          queuePostToolCallDelta({ ...reasoningDelta });
+          continue;
+        }
+        if (reasoningDelta.kind === "text") {
+          appendTextDelta(reasoningDelta.text);
+        } else if (emitReasoning) {
+          appendThinkingDelta(reasoningDelta);
+        }
+      }
+      if (choiceDelta.tool_calls && choiceDelta.tool_calls.length > 0) {
+        flushReasoningTagTextPartitionerAtEnd();
+        for (const toolCall of choiceDelta.tool_calls) {
+          const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
+          let block =
+            streamIndex !== undefined ? toolCallBlocksByIndex.get(streamIndex) : undefined;
+          if (!block && toolCall.id) {
+            block = toolCallBlocksById.get(toolCall.id);
+          }
+          if (!block) {
+            const switchingToolCall = currentBlock?.type === "toolCall";
+            finishCurrentBlock();
+            if (switchingToolCall) {
+              currentBlock = null;
+              flushPendingPostToolCallDeltas();
+            }
+            const initialSig = extractGoogleThoughtSignature(toolCall);
+            block = {
+              type: "toolCall",
+              id: toolCall.id || "",
+              name: toolCall.function?.name || "",
+              arguments: {},
+              partialArgs: "",
+              ...(initialSig ? { thoughtSignature: initialSig } : {}),
+            };
+            output.content.push(block);
+            pushStreamEvent({
+              type: "toolcall_start",
+              contentIndex: output.content.indexOf(block),
+              partial: output,
+            });
+          }
+          if (streamIndex !== undefined && !toolCallBlocksByIndex.has(streamIndex)) {
+            toolCallBlocksByIndex.set(streamIndex, block);
+          }
+          if (toolCall.id) {
+            block.id = toolCall.id;
+            toolCallBlocksById.set(toolCall.id, block);
+          }
+          currentBlock = block;
+          if (toolCall.function?.name) {
+            block.name = toolCall.function.name;
+          }
+          const deltaSig = extractGoogleThoughtSignature(toolCall);
+          if (deltaSig) {
+            block.thoughtSignature = deltaSig;
+          }
+          if (toolCall.function?.arguments) {
+            const nextArgumentBytes = measureUtf8Bytes(toolCall.function.arguments);
+            const currentBlockArgBytes = toolCallBlockBytes.get(block) ?? 0;
+            if (currentBlockArgBytes + nextArgumentBytes > MAX_TOOL_CALL_ARGUMENT_BUFFER_BYTES) {
+              throw new Error("Exceeded tool-call argument buffer limit");
+            }
+            toolCallBlockBytes.set(block, currentBlockArgBytes + nextArgumentBytes);
+            block.partialArgs += toolCall.function.arguments;
+            block.arguments = parseStreamingJson(block.partialArgs);
+            pushStreamEvent({
+              type: "toolcall_delta",
+              contentIndex: output.content.indexOf(block),
+              delta: toolCall.function.arguments,
+              partial: output,
+            });
+          }
+        }
+      }
+      flushPendingPostToolCallDeltas();
       emitReasoningUsageActivity(hasReasoningUsageActivity);
       await cooperativeScheduler.afterEvent();
       if (shouldFinishAfterChunk) {
@@ -3080,121 +3208,11 @@ async function processOpenAICompletionsStream(
       if (shouldWaitForTerminalUsage) {
         waitForTerminalUsage = true;
       }
-      continue;
     }
-    const reasoningDeltas = getCompletionsReasoningDeltas(
-      choiceDelta as Record<string, unknown>,
-      compat.visibleReasoningDetailTypes,
-    );
-    const hasMirroredReasoning = reasoningDeltas.some((delta) => delta.kind === "thinking");
-    if (hasMirroredReasoning) {
-      reasoningTagTextPartitioner.markStrict();
-    }
-    if (choiceDelta.content) {
-      // Structured content can contain visible text and thinking blocks in the
-      // same delta, so route each extracted block through the normal stream path.
-      const contentDeltas = getCompletionsContentDeltas(choiceDelta.content);
-      for (const contentDelta of contentDeltas) {
-        if (contentDelta.kind === "text") {
-          const routedDeltas = hasMirroredReasoning
-            ? reasoningTagTextPartitioner.push(contentDelta.text)
-            : reasoningTagTextPartitioner.pushVisible(contentDelta.text);
-          for (const routedDelta of routedDeltas) {
-            appendPartitionedVisibleDelta(routedDelta);
-          }
-        } else {
-          reasoningTagTextPartitioner.markStrict();
-          appendRoutedContentDelta(contentDelta);
-        }
-      }
-    }
-    for (const reasoningDelta of reasoningDeltas) {
-      if (reasoningDelta.kind === "thinking" && !emitReasoning) {
-        continue;
-      }
-      if (currentBlock?.type === "toolCall") {
-        queuePostToolCallDelta({ ...reasoningDelta });
-        continue;
-      }
-      if (reasoningDelta.kind === "text") {
-        appendTextDelta(reasoningDelta.text);
-      } else if (emitReasoning) {
-        appendThinkingDelta(reasoningDelta);
-      }
-    }
-    if (choiceDelta.tool_calls && choiceDelta.tool_calls.length > 0) {
-      flushReasoningTagTextPartitionerAtEnd();
-      for (const toolCall of choiceDelta.tool_calls) {
-        const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
-        let block = streamIndex !== undefined ? toolCallBlocksByIndex.get(streamIndex) : undefined;
-        if (!block && toolCall.id) {
-          block = toolCallBlocksById.get(toolCall.id);
-        }
-        if (!block) {
-          const switchingToolCall = currentBlock?.type === "toolCall";
-          finishCurrentBlock();
-          if (switchingToolCall) {
-            currentBlock = null;
-            flushPendingPostToolCallDeltas();
-          }
-          const initialSig = extractGoogleThoughtSignature(toolCall);
-          block = {
-            type: "toolCall",
-            id: toolCall.id || "",
-            name: toolCall.function?.name || "",
-            arguments: {},
-            partialArgs: "",
-            ...(initialSig ? { thoughtSignature: initialSig } : {}),
-          };
-          output.content.push(block);
-          pushStreamEvent({
-            type: "toolcall_start",
-            contentIndex: output.content.indexOf(block),
-            partial: output,
-          });
-        }
-        if (streamIndex !== undefined && !toolCallBlocksByIndex.has(streamIndex)) {
-          toolCallBlocksByIndex.set(streamIndex, block);
-        }
-        if (toolCall.id) {
-          block.id = toolCall.id;
-          toolCallBlocksById.set(toolCall.id, block);
-        }
-        currentBlock = block;
-        if (toolCall.function?.name) {
-          block.name = toolCall.function.name;
-        }
-        const deltaSig = extractGoogleThoughtSignature(toolCall);
-        if (deltaSig) {
-          block.thoughtSignature = deltaSig;
-        }
-        if (toolCall.function?.arguments) {
-          const nextArgumentBytes = measureUtf8Bytes(toolCall.function.arguments);
-          const currentBlockArgBytes = toolCallBlockBytes.get(block) ?? 0;
-          if (currentBlockArgBytes + nextArgumentBytes > MAX_TOOL_CALL_ARGUMENT_BUFFER_BYTES) {
-            throw new Error("Exceeded tool-call argument buffer limit");
-          }
-          toolCallBlockBytes.set(block, currentBlockArgBytes + nextArgumentBytes);
-          block.partialArgs += toolCall.function.arguments;
-          block.arguments = parseStreamingJson(block.partialArgs);
-          pushStreamEvent({
-            type: "toolcall_delta",
-            contentIndex: output.content.indexOf(block),
-            delta: toolCall.function.arguments,
-            partial: output,
-          });
-        }
-      }
-    }
-    flushPendingPostToolCallDeltas();
-    emitReasoningUsageActivity(hasReasoningUsageActivity);
-    await cooperativeScheduler.afterEvent();
-    if (shouldFinishAfterChunk) {
+    iteratorCompleted = true;
+  } finally {
+    if (!iteratorCompleted) {
       await closeIterator();
-      break;
-    }
-    if (shouldWaitForTerminalUsage) {
-      waitForTerminalUsage = true;
     }
   }
   flushReasoningTagTextPartitionerAtEnd();
