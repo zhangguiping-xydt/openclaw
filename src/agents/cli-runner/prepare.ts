@@ -437,9 +437,9 @@ export async function prepareCliRunContext(
       })
     : undefined;
   const mergedPreparedBackendEnv = {
-    ...(preparedBackend.env ?? {}),
-    ...(sanitizedAgentEnv ?? {}),
-    ...(preparedExecution?.env ?? {}),
+    ...preparedBackend.env,
+    ...sanitizedAgentEnv,
+    ...preparedExecution?.env,
   };
   const preparedBackendEnv =
     Object.keys(mergedPreparedBackendEnv).length > 0 ? mergedPreparedBackendEnv : undefined;

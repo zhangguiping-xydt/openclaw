@@ -1591,9 +1591,9 @@ export function createExecTool(
       const resolvedExecEnvState = getResolvedExecEnvPreparedState(params);
       const configuredAgentEnv = resolveConfiguredAgentExecEnv(defaults, agentId);
       const mergedRequestedEnv = {
-        ...(configuredAgentEnv ?? {}),
-        ...(params.env ?? {}),
-        ...(resolvedExecEnvState?.pluginEnv ?? {}),
+        ...configuredAgentEnv,
+        ...params.env,
+        ...resolvedExecEnvState?.pluginEnv,
       };
       const requestedEnv =
         Object.keys(mergedRequestedEnv).length > 0 ? mergedRequestedEnv : undefined;
