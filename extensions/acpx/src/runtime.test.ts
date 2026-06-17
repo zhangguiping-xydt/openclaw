@@ -9,6 +9,7 @@ import {
   type AcpRuntimeEvent,
   type AcpRuntimeTurn,
 } from "../runtime-api.js";
+import { splitCommandParts } from "./command-line.js";
 import { OPENCLAW_ACPX_LEASE_ID_ARG, OPENCLAW_GATEWAY_INSTANCE_ID_ARG } from "./process-lease.js";
 import { AcpxRuntime, testing, type AcpSessionStore } from "./runtime.js";
 
@@ -675,23 +676,59 @@ describe("AcpxRuntime fresh reset wrapper", () => {
     );
   });
 
+  it("builds ACPX launch env commands without POSIX env on Windows", () => {
+    const command = testing.withLaunchEnv(
+      "npx @agentclientprotocol/claude-agent-acp",
+      {
+        GIT_AUTHOR_EMAIL: "blueprint-platform-pm@blueprint.local",
+        OPENCLAW_TRACE_LABEL: "blueprint platform",
+      },
+      "win32",
+    );
+    const parts = splitCommandParts(command);
+    const payload = JSON.parse(parts[3] ?? "{}");
+
+    expect(command).not.toMatch(/^\/usr\/bin\/env\b/);
+    expect(parts.slice(0, 2)).toEqual(["node", "-e"]);
+    expect(payload).toEqual({
+      command: "npx",
+      args: ["@agentclientprotocol/claude-agent-acp"],
+      env: {
+        GIT_AUTHOR_EMAIL: "blueprint-platform-pm@blueprint.local",
+        OPENCLAW_TRACE_LABEL: "blueprint platform",
+      },
+    });
+  });
+
   it("applies ensureSession env to the ACpx delegate launch command", async () => {
+    const savedCommands: string[] = [];
     const baseStore: TestSessionStore = {
       load: vi.fn(async () => undefined),
       save: vi.fn(async (record) => {
-        expect(record.agentCommand).toBe(
-          "/usr/bin/env GIT_AUTHOR_EMAIL=blueprint-platform-pm@blueprint.local OPENCLAW_TRACE_LABEL='blueprint platform' npx @agentclientprotocol/claude-agent-acp",
-        );
+        savedCommands.push(String(record.agentCommand));
       }),
     };
-    const { runtime, delegate } = makeRuntime(baseStore, {
+    const { runtime, delegate, wrappedStore } = makeRuntime(baseStore, {
       agentRegistry: {
         resolve: (agentName: string) =>
           agentName === "claude" ? "npx @agentclientprotocol/claude-agent-acp" : agentName,
         list: () => ["claude"],
       },
     });
-    const ensure = vi.spyOn(delegate, "ensureSession");
+    const ensure = vi.spyOn(delegate, "ensureSession").mockImplementation(async (input) => {
+      const command = (
+        runtime as unknown as { scopedAgentRegistry: { resolve(agent: string): string } }
+      ).scopedAgentRegistry.resolve("claude");
+      await wrappedStore.save({
+        name: input.sessionKey,
+        agentCommand: command,
+      });
+      return {
+        sessionKey: input.sessionKey,
+        backend: "acpx",
+        runtimeSessionName: input.sessionKey,
+      };
+    });
 
     await runtime.ensureSession({
       sessionKey: "agent:claude:acp:test",
@@ -707,6 +744,17 @@ describe("AcpxRuntime fresh reset wrapper", () => {
       sessionKey: "agent:claude:acp:test",
       agent: "claude",
       mode: "oneshot",
+    });
+    const parts = splitCommandParts(savedCommands[0] ?? "");
+    const payload = JSON.parse(parts[3] ?? "{}");
+    expect(parts.slice(0, 2)).toEqual(["node", "-e"]);
+    expect(payload).toEqual({
+      command: "npx",
+      args: ["@agentclientprotocol/claude-agent-acp"],
+      env: {
+        GIT_AUTHOR_EMAIL: "blueprint-platform-pm@blueprint.local",
+        OPENCLAW_TRACE_LABEL: "blueprint platform",
+      },
     });
   });
 
@@ -746,6 +794,15 @@ describe("AcpxRuntime fresh reset wrapper", () => {
   it("injects Codex ACP startup config into the scoped registry", () => {
     expect(testing.isCodexAcpCommand(CODEX_ACP_COMMAND)).toBe(true);
     expect(testing.isCodexAcpCommand(CODEX_ACP_WRAPPER_COMMAND)).toBe(true);
+    expect(
+      testing.isCodexAcpCommand(
+        testing.withLaunchEnv(
+          CODEX_ACP_COMMAND,
+          { OPENCLAW_TRACE_LABEL: "blueprint platform" },
+          "win32",
+        ),
+      ),
+    ).toBe(true);
     expect(
       testing.appendCodexAcpConfigOverrides(CODEX_ACP_COMMAND, {
         model: "gpt-5.4",

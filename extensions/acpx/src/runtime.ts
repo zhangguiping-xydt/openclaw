@@ -27,7 +27,7 @@ import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
 import { redactSensitiveText } from "openclaw/plugin-sdk/security-runtime";
 import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { AcpRuntimeError, type AcpRuntime, type AcpRuntimeErrorCode } from "../runtime-api.js";
-import { splitCommandParts } from "./command-line.js";
+import { quoteCommandPart, splitCommandParts } from "./command-line.js";
 import {
   createAcpxProcessLeaseId,
   hashAcpxProcessCommand,
@@ -99,6 +99,13 @@ type AcpxLaunchEnv = Record<string, string>;
 const CODEX_WRAPPER_STDERR_LOG_PREFIX = "codex-acp-wrapper.stderr";
 const CODEX_WRAPPER_ERROR_TAIL_MAX_CHARS = 6_000;
 const PORTABLE_ENV_VAR_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const LAUNCH_ENV_SHIM = [
+  "const cp=require('node:child_process');",
+  "const p=JSON.parse(process.argv[1]);",
+  "const c=cp.spawn(p.command,p.args.concat(process.argv.slice(2)),{stdio:'inherit',env:{...process.env,...p.env}});",
+  "c.on('error',(error)=>{console.error(error?.stack||String(error));process.exit(1);});",
+  "c.on('exit',(code,signal)=>{if(signal){process.kill(process.pid,signal);}else{process.exit(code??0);}});",
+].join("");
 
 function safeDiagnosticFilePart(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "unknown";
@@ -110,6 +117,13 @@ function codexWrapperStderrLogFileName(leaseId: string): string {
 
 function compactDiagnosticText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function redactDiagnosticEnvNames(value: string): string {
+  return value.replace(
+    /\b([A-Z][A-Z0-9]*_)(?:API_)?(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)\b/g,
+    "$1***",
+  );
 }
 
 function isGenericInternalAcpErrorMessage(message: string): boolean {
@@ -136,7 +150,9 @@ async function readCodexWrapperStderrTail(params: {
       "utf8",
     );
     return compactDiagnosticText(
-      redactSensitiveText(text.slice(-CODEX_WRAPPER_ERROR_TAIL_MAX_CHARS)),
+      redactDiagnosticEnvNames(
+        redactSensitiveText(text.slice(-CODEX_WRAPPER_ERROR_TAIL_MAX_CHARS), { mode: "tools" }),
+      ),
     );
   } catch {
     return "";
@@ -419,6 +435,23 @@ function stripModuleExtension(value: string): string {
   return value.replace(/\.[cm]?js$/i, "").toLowerCase();
 }
 
+function unwrapLaunchEnvCommand(command: string): string {
+  const parts = splitCommandParts(command.trim());
+  if (parts[0] !== "node" || parts[1] !== "-e" || parts[2] !== LAUNCH_ENV_SHIM || !parts[3]) {
+    return command;
+  }
+  try {
+    const payload = JSON.parse(parts[3]) as { command?: unknown; args?: unknown };
+    if (typeof payload.command !== "string" || !Array.isArray(payload.args)) {
+      return command;
+    }
+    const args = payload.args.filter((arg): arg is string => typeof arg === "string");
+    return [payload.command, ...args].map(quoteCommandPart).join(" ");
+  } catch {
+    return command;
+  }
+}
+
 function isAcpCommand(
   command: string | undefined,
   params: { packageName: string; executableName: string },
@@ -426,7 +459,7 @@ function isAcpCommand(
   if (!command) {
     return false;
   }
-  const parts = unwrapEnvCommand(splitCommandParts(command.trim()));
+  const parts = unwrapEnvCommand(splitCommandParts(unwrapLaunchEnvCommand(command).trim()));
   if (!parts.length) {
     return false;
   }
@@ -448,7 +481,7 @@ function isOpenClawBridgeCommand(command: string | undefined): boolean {
   if (!command) {
     return false;
   }
-  const parts = unwrapEnvCommand(splitCommandParts(command.trim()));
+  const parts = unwrapEnvCommand(splitCommandParts(unwrapLaunchEnvCommand(command).trim()));
   if (basename(parts[0] ?? "") === OPENCLAW_BRIDGE_EXECUTABLE) {
     return parts[1] === OPENCLAW_BRIDGE_SUBCOMMAND;
   }
@@ -606,16 +639,26 @@ function normalizeLaunchEnv(env: Record<string, string> | undefined): AcpxLaunch
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
-function withLaunchEnv(command: string, env: AcpxLaunchEnv | undefined): string {
+function withLaunchEnv(
+  command: string,
+  env: AcpxLaunchEnv | undefined,
+  _platform: NodeJS.Platform = process.platform,
+): string {
   const entries = Object.entries(env ?? {});
   if (entries.length === 0) {
     return command;
   }
-  return [
-    "/usr/bin/env",
-    ...entries.map(([key, value]) => `${key}=${quoteShellArg(value)}`),
-    command,
-  ].join(" ");
+  const parts = splitCommandParts(command);
+  const executable = parts[0];
+  if (!executable) {
+    return command;
+  }
+  const payload = JSON.stringify({
+    command: executable,
+    args: parts.slice(1),
+    env: Object.fromEntries(entries),
+  });
+  return ["node", "-e", LAUNCH_ENV_SHIM, payload].map(quoteCommandPart).join(" ");
 }
 
 function appendCodexAcpConfigOverrides(command: string, override: CodexAcpModelOverride): string {
@@ -1318,6 +1361,7 @@ export const testing = {
   isClaudeAcpCommand,
   isCodexAcpCommand,
   normalizeClaudeAcpModelOverride,
+  withLaunchEnv,
   normalizeCodexAcpModelOverride,
 };
 
