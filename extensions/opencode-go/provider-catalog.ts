@@ -27,6 +27,12 @@ type OpencodeGoModelDefinition = ModelDefinitionConfig & {
   input: Array<"text" | "image">;
 };
 
+const OPENCODE_GO_OPENAI_COMPAT = {
+  supportsUsageInStreaming: true,
+  finishReasonTerminatesStream: true,
+  terminalUsageGraceMs: 50,
+} as const;
+
 const OPENCODE_GO_MODELS = (
   [
     {
@@ -46,9 +52,6 @@ const OPENCODE_GO_MODELS = (
       contextWindow: 1_000_000,
       maxTokens: 384_000,
       compat: {
-        supportsUsageInStreaming: true,
-        finishReasonTerminatesStream: true,
-        terminalUsageGraceMs: 50,
         supportsReasoningEffort: true,
         maxTokensField: "max_tokens",
       },
@@ -70,9 +73,6 @@ const OPENCODE_GO_MODELS = (
       contextWindow: 1_000_000,
       maxTokens: 384_000,
       compat: {
-        supportsUsageInStreaming: true,
-        finishReasonTerminatesStream: true,
-        terminalUsageGraceMs: 50,
         supportsReasoningEffort: true,
         maxTokensField: "max_tokens",
       },
@@ -354,7 +354,19 @@ const OPENCODE_GO_MODELS = (
       maxTokens: 65_536,
     },
   ] satisfies OpencodeGoModelDefinition[]
-).map((model) => normalizeModelCompat(model) as OpencodeGoModelDefinition);
+).map(
+  (model) =>
+    normalizeModelCompat({
+      ...model,
+      compat:
+        model.api === "openai-completions" && model.baseUrl === OPENCODE_GO_OPENAI_BASE_URL
+          ? {
+              ...OPENCODE_GO_OPENAI_COMPAT,
+              ...model.compat,
+            }
+          : model.compat,
+    }) as OpencodeGoModelDefinition,
+);
 
 export type FetchOpencodeGoLiveModelIdsParams = {
   apiKey?: string;

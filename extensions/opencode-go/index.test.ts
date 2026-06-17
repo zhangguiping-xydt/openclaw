@@ -111,6 +111,15 @@ describe("opencode-go provider plugin", () => {
       models.set(model.id, model);
     }
     expect([...models.keys()]).toEqual(expectedModelIds);
+    for (const model of models.values()) {
+      if (model.api === "openai-completions" && model.baseUrl === "https://opencode.ai/zen/go/v1") {
+        expect(requireRecord(model.compat, `${model.id} compat`)).toMatchObject({
+          supportsUsageInStreaming: true,
+          finishReasonTerminatesStream: true,
+          terminalUsageGraceMs: 50,
+        });
+      }
+    }
     const supplemental = await provider.augmentModelCatalog?.({
       entries: [...models.values()].map((model) => ({
         provider: model.provider,
