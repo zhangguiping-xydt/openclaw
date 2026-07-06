@@ -267,7 +267,7 @@ describe("gateway talk runtime", () => {
     });
   });
 
-  it("returns synthesis_failed details when the provider rejects synthesis", async () => {
+  it("returns fallback-eligible synthesis_failed details when the provider rejects synthesis", async () => {
     await setAcmeTalkConfig();
 
     await withAcmeSpeechProvider(
@@ -281,7 +281,7 @@ describe("gateway talk runtime", () => {
         expect(res?.ok).toBe(false);
         expect(res?.error?.details).toEqual({
           reason: "synthesis_failed",
-          fallbackEligible: false,
+          fallbackEligible: true,
         });
       },
     );

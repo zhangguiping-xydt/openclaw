@@ -393,7 +393,8 @@ function isFallbackEligibleTalkReason(reason: TalkSpeakReason): boolean {
   return (
     reason === "talk_unconfigured" ||
     reason === "talk_provider_unsupported" ||
-    reason === "method_unavailable"
+    reason === "method_unavailable" ||
+    reason === "synthesis_failed"
   );
 }
 
