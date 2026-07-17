@@ -10,6 +10,7 @@ import {
   getDiagnosticSessionActivitySnapshot,
   markDiagnosticRunProgress,
   resolveRunStaleThresholdMs,
+  setDiagnosticReplyOperationActive,
 } from "../../logging/diagnostic-run-activity.js";
 import { diagnosticLogger as diag } from "../../logging/diagnostic-runtime.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.types.js";
@@ -595,6 +596,11 @@ export function createReplyOperation(params: {
       sessionId: currentSessionId,
       reason: "reply_operation:ended",
     });
+    setDiagnosticReplyOperationActive({
+      sessionKey: currentSessionKey,
+      sessionId: currentSessionId,
+      active: false,
+    });
     clearReplyRunState({
       sessionKey: currentSessionKey,
       sessionId: currentSessionId,
@@ -736,6 +742,11 @@ export function createReplyOperation(params: {
       replyRunState.activeSessionIdsByKey.set(currentSessionKey, currentSessionId);
       replyRunState.activeKeysBySessionId.set(currentSessionId, currentSessionKey);
       registerWaitSessionId(currentSessionKey, currentSessionId);
+      setDiagnosticReplyOperationActive({
+        sessionKey: currentSessionKey,
+        sessionId: currentSessionId,
+        active: true,
+      });
       markReplyRunDiagnosticProgress({
         sessionKey: currentSessionKey,
         sessionId: currentSessionId,
@@ -766,6 +777,16 @@ export function createReplyOperation(params: {
       replyRunState.activeRunsByKey.set(currentSessionKey, operation);
       replyRunState.activeSessionIdsByKey.set(currentSessionKey, currentSessionId);
       replyRunState.activeKeysBySessionId.set(currentSessionId, currentSessionKey);
+      setDiagnosticReplyOperationActive({
+        sessionKey: previousKey,
+        sessionId: currentSessionId,
+        active: false,
+      });
+      setDiagnosticReplyOperationActive({
+        sessionKey: currentSessionKey,
+        sessionId: currentSessionId,
+        active: true,
+      });
       // Wait/abort lookups resolve keys via owned session IDs; move them so
       // waitForReplyRunEndBySessionId keeps finding this operation.
       for (const ownedSessionId of ownedSessionIds) {
@@ -943,6 +964,7 @@ export function createReplyOperation(params: {
   replyRunState.activeSessionIdsByKey.set(sessionKey, currentSessionId);
   replyRunState.activeKeysBySessionId.set(currentSessionId, sessionKey);
   registerWaitSessionId(sessionKey, currentSessionId);
+  setDiagnosticReplyOperationActive({ sessionKey, sessionId: currentSessionId, active: true });
   markReplyRunDiagnosticProgress({
     sessionKey,
     sessionId: currentSessionId,
@@ -1303,6 +1325,7 @@ const replyRunRegistryTestApi = {
         sessionId,
         reason: "reply_operation:registry_reset",
       });
+      setDiagnosticReplyOperationActive({ sessionKey, sessionId, active: false });
     }
     replyRunState.activeRunsByKey.clear();
     replyRunState.activeSessionIdsByKey.clear();
