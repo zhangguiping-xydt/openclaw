@@ -1,0 +1,145 @@
+name: PR 111455 macOS Teams deadline proof
+
+on:
+  push:
+    branches:
+      - proof/pr-111455-macos-deadline
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-111455-macos-deadline-proof
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  BASE_SHA: 6dc6d5efeeb78dd475351090cec6ed76cab81f9b
+  HEAD_SHA: 8d3a3541d1722f20a5c688ce9e7a857ee7df7b47
+
+jobs:
+  real-node-host-proof:
+    name: Real macOS node-host setup deadline
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout isolated proof branch
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: false
+          persist-credentials: false
+          submodules: false
+
+      - name: Verify immutable source revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          git diff --quiet "${HEAD_SHA}" -- extensions/teams-meetings/src/node-host.ts
+          echo "base_sha=${BASE_SHA}"
+          echo "head_sha=${HEAD_SHA}"
+
+      - name: Report real runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner_name=${RUNNER_NAME}"
+          echo "runner_os=${RUNNER_OS}"
+          echo "runner_arch=${RUNNER_ARCH}"
+          sw_vers
+          uname -a
+
+      - name: Setup Node 24
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+
+      - name: Install repository dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.2.2 --activate
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Install and detect BlackHole 2ch
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install --cask blackhole-2ch
+          sudo killall coreaudiod 2>/dev/null || true
+          sudo launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null || true
+          found=false
+          for attempt in {1..20}; do
+            if /usr/sbin/system_profiler SPAudioDataType | grep -Fq "BlackHole 2ch"; then
+              found=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$found" != "true" ]]; then
+            echo "BlackHole 2ch was not visible to system_profiler" >&2
+            /usr/sbin/system_profiler SPAudioDataType
+            exit 1
+          fi
+          /usr/sbin/system_profiler SPAudioDataType | sed -n '/BlackHole 2ch/,+8p'
+
+      - name: Compare base and PR head through the production setup handler
+        shell: bash
+        run: |
+          set -euo pipefail
+          original_profile="${RUNNER_TEMP}/etc-profile.original"
+          sudo cp /etc/profile "$original_profile"
+          cleanup() {
+            sudo cp "$original_profile" /etc/profile
+            rm -f extensions/teams-meetings/src/.pr111455-base-node-host.ts
+          }
+          trap cleanup EXIT
+
+          sudo tee -a /etc/profile >/dev/null <<'PROFILE'
+
+          # PR #111455 proof-only controlled stall. The production node-host launches
+          # /bin/sh -lc for command lookup; this delays that real child process.
+          command() {
+            if [ "${1-}" = "-v" ] && [ -n "${OPENCLAW_PROOF_LOG-}" ]; then
+              printf 'command-v-start epoch=%s pid=%s command=%s\n' \
+                "$(/bin/date +%s)" "$$" "${2-}" >> "$OPENCLAW_PROOF_LOG"
+              /bin/sleep "${OPENCLAW_PROOF_DELAY_SECONDS:-6}"
+            fi
+            builtin command "$@"
+          }
+          PROFILE
+
+          smoke_log="${RUNNER_TEMP}/profile-smoke.log"
+          : > "$smoke_log"
+          smoke_start=$(node -e 'console.log(Date.now())')
+          OPENCLAW_PROOF_LOG="$smoke_log" OPENCLAW_PROOF_DELAY_SECONDS=1 \
+            /bin/sh -lc 'command -v true >/dev/null'
+          smoke_end=$(node -e 'console.log(Date.now())')
+          smoke_elapsed=$((smoke_end - smoke_start))
+          smoke_count=$(grep -c '^command-v-start ' "$smoke_log")
+          echo "profile_smoke_elapsed_ms=${smoke_elapsed} command_probe_starts=${smoke_count}"
+          [[ "$smoke_count" -eq 1 ]]
+          [[ "$smoke_elapsed" -ge 900 ]]
+
+          git show "${BASE_SHA}:extensions/teams-meetings/src/node-host.ts" \
+            > extensions/teams-meetings/src/.pr111455-base-node-host.ts
+
+          export OPENCLAW_PROOF_DELAY_SECONDS=6
+
+          export OPENCLAW_PROOF_LOG="${RUNNER_TEMP}/base-command-probes.log"
+          : > "$OPENCLAW_PROOF_LOG"
+          pnpm exec tsx scripts/proof/pr111455-teams-deadline.ts \
+            extensions/teams-meetings/src/.pr111455-base-node-host.ts base "$BASE_SHA"
+          sed -n '1,20p' "$OPENCLAW_PROOF_LOG"
+
+          export OPENCLAW_PROOF_LOG="${RUNNER_TEMP}/head-command-probes.log"
+          : > "$OPENCLAW_PROOF_LOG"
+          pnpm exec tsx scripts/proof/pr111455-teams-deadline.ts \
+            extensions/teams-meetings/src/node-host.ts head "$HEAD_SHA"
+          sed -n '1,20p' "$OPENCLAW_PROOF_LOG"
+
+          echo "PROOF_PASS base accumulates three real 6s child stalls; PR head stops within one shared ~10s deadline"
