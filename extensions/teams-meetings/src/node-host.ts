@@ -29,9 +29,13 @@ function assertTalkBackPrerequisites(
   if (process.platform !== "darwin") {
     throw new Error("Microsoft Teams meeting talk-back with BlackHole 2ch is macOS-only");
   }
+  // Keep all prerequisite probes inside one node-command budget. Reusing the full
+  // timeout per child can multiply how long the synchronous node host stays blocked.
+  const deadline = Date.now() + timeoutMs;
+  const remainingMs = () => Math.max(1, deadline - Date.now());
   const result = spawnSync(TEAMS_MEETINGS_SYSTEM_PROFILER_COMMAND, ["SPAudioDataType"], {
     encoding: "utf8",
-    timeout: timeoutMs,
+    timeout: remainingMs(),
   });
   const stderr =
     result.stderr ??
@@ -49,7 +53,7 @@ function assertTalkBackPrerequisites(
   }
   for (const argv of commands) {
     const command = argv[0];
-    if (!command || !commandExists(command, timeoutMs)) {
+    if (!command || Date.now() >= deadline || !commandExists(command, remainingMs())) {
       throw new Error(`Configured audio command not found on the node: ${command || "<empty>"}`);
     }
   }
