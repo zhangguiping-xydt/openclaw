@@ -30,7 +30,7 @@ jobs:
     steps:
       - name: Checkout exact PR head without credentials
         env:
-          EXPECTED_HEAD_SHA: 5789351ee3c5365f0d3a9f543908b0d1ecebf707
+          EXPECTED_HEAD_SHA: ad93d79abbe39dcb97de875691622e5ae6cabc30
         run: |
           set -euo pipefail
           git init "$GITHUB_WORKSPACE"
@@ -57,7 +57,7 @@ jobs:
 
       - name: Run live Gateway board.event proof
         env:
-          EXPECTED_HEAD_SHA: 5789351ee3c5365f0d3a9f543908b0d1ecebf707
+          EXPECTED_HEAD_SHA: ad93d79abbe39dcb97de875691622e5ae6cabc30
           OPENCLAW_STATE_DIR: ${{ runner.temp }}/openclaw-pr111702-state
         run: |
           set -euo pipefail
