@@ -5,7 +5,7 @@ on:
     paths-ignore:
       - "CHANGELOG.md"
   push:
-    branches: [main]
+    branches: [main, proof/pr-111702-runtime-20260720]
     paths-ignore:
       - "CHANGELOG.md"
   workflow_dispatch:
@@ -22,7 +22,7 @@ env:
 
 jobs:
   pr-111702-board-runtime-proof:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/proof/pr-111702-runtime-20260720'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
