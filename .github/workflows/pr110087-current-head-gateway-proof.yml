@@ -1,0 +1,385 @@
+name: PR 110087 current-head Gateway proof
+
+on:
+  push:
+    branches:
+      - proof/pr110087-current-head-gateway-20260721
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PROOF_HEAD_SHA: 31d7fd42213b7ca2a6080ce10b28ce83e8b1b85e
+
+jobs:
+  gateway-lifecycle-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out exact PR head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.PROOF_HEAD_SHA }}
+          persist-credentials: false
+
+      - name: Verify exact head
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PROOF_HEAD_SHA"
+          git status --short --branch
+
+      - name: Set up Node and dependencies
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: 24.x
+          install-bun: "false"
+          install-deps: "true"
+          frozen-lockfile: "true"
+          use-actions-cache: "true"
+
+      - name: Build official Gateway runtime profile
+        shell: bash
+        run: node scripts/build-all.mjs gatewayWatch
+
+      - name: Run lifecycle proof from official build output
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof_script="$RUNNER_TEMP/pr110087-current-head-proof.mjs"
+
+          cat > "$proof_script" <<'PROOF'
+          import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+          import net from "node:net";
+          import os from "node:os";
+          import path from "node:path";
+          import { pathToFileURL } from "node:url";
+
+          function assert(condition, message) {
+            if (!condition) {
+              throw new Error(message);
+            }
+          }
+
+          async function getFreePort() {
+            const listener = net.createServer();
+            await new Promise((resolve, reject) => {
+              listener.once("error", reject);
+              listener.listen(0, "127.0.0.1", resolve);
+            });
+            const address = listener.address();
+            assert(address && typeof address !== "string", "failed to reserve a Gateway port");
+            const port = address.port;
+            await new Promise((resolve, reject) => {
+              listener.close((error) => (error ? reject(error) : resolve()));
+            });
+            return port;
+          }
+
+          async function findBuildChunk(prefix, marker) {
+            const distDir = path.resolve("dist");
+            const candidates = (await readdir(distDir))
+              .filter((name) => name.startsWith(prefix) && name.endsWith(".js"))
+              .sort();
+            for (const name of candidates) {
+              const filePath = path.join(distDir, name);
+              if ((await readFile(filePath, "utf8")).includes(marker)) {
+                return filePath;
+              }
+            }
+            throw new Error(`official build chunk not found: ${prefix} / ${marker}`);
+          }
+
+          function requireNamedFunction(module, name) {
+            for (const value of Object.values(module)) {
+              if (typeof value === "function" && value.name === name) {
+                return value;
+              }
+            }
+            throw new Error(`official build export not found: ${name}`);
+          }
+
+          const stateDir = await mkdtemp(path.join(os.tmpdir(), "openclaw-pr110087-proof-"));
+          const configPath = path.join(stateDir, "openclaw.json");
+          const token = "pr110087-proof-token";
+          process.env.OPENCLAW_STATE_DIR = stateDir;
+          process.env.OPENCLAW_CONFIG_PATH = configPath;
+          process.env.OPENCLAW_GATEWAY_TOKEN = token;
+          process.env.OPENCLAW_SKIP_CHANNELS = "1";
+          process.env.OPENCLAW_SKIP_PROVIDERS = "1";
+          process.env.OPENCLAW_SKIP_GMAIL_WATCHER = "1";
+          process.env.OPENCLAW_SKIP_CRON = "1";
+          process.env.OPENCLAW_SKIP_CANVAS_HOST = "1";
+          process.env.OPENCLAW_SKIP_BROWSER_CONTROL_SERVER = "1";
+          process.env.OPENCLAW_TEST_MINIMAL_GATEWAY = "1";
+
+          await writeFile(
+            configPath,
+            `${JSON.stringify(
+              {
+                diagnostics: { enabled: true },
+                gateway: {
+                  mode: "local",
+                  bind: "loopback",
+                  auth: { mode: "token", token },
+                  controlUi: { enabled: false },
+                },
+              },
+              null,
+              2,
+            )}\n`,
+          );
+
+          const chunkPaths = {
+            server: await findBuildChunk("server-", "async function startGatewayServer"),
+            client: await findBuildChunk("client-", "createOpenClawGatewayClientHostDeps"),
+            activity: await findBuildChunk(
+              "diagnostic-run-activity-",
+              "openclaw.diagnosticRunActivityTestApi",
+            ),
+            events: await findBuildChunk(
+              "diagnostic-events-",
+              "function emitTrustedDiagnosticEventWithPrivateData",
+            ),
+          };
+          const [serverModule, clientModule, activityModule, eventsModule] = await Promise.all(
+            Object.values(chunkPaths).map((filePath) => import(pathToFileURL(filePath).href)),
+          );
+
+          const startGatewayServer = requireNamedFunction(serverModule, "startGatewayServer");
+          const GatewayClient = requireNamedFunction(clientModule, "GatewayClient");
+          const startDiagnosticRunActivityTracking = requireNamedFunction(
+            activityModule,
+            "startDiagnosticRunActivityTracking",
+          );
+          const stopDiagnosticRunActivityTracking = requireNamedFunction(
+            activityModule,
+            "stopDiagnosticRunActivityTracking",
+          );
+          const markDiagnosticEmbeddedRunStarted = requireNamedFunction(
+            activityModule,
+            "markDiagnosticEmbeddedRunStarted",
+          );
+          const clearDiagnosticEmbeddedRunActivityForSession = requireNamedFunction(
+            activityModule,
+            "clearDiagnosticEmbeddedRunActivityForSession",
+          );
+          const getDiagnosticSessionActivitySnapshot = requireNamedFunction(
+            activityModule,
+            "getDiagnosticSessionActivitySnapshot",
+          );
+          const emitTrustedDiagnosticEvent = requireNamedFunction(
+            eventsModule,
+            "emitTrustedDiagnosticEvent",
+          );
+          const waitForDiagnosticEventsDrained = requireNamedFunction(
+            eventsModule,
+            "waitForDiagnosticEventsDrained",
+          );
+          const getInternalDiagnosticEventSequence = requireNamedFunction(
+            eventsModule,
+            "getInternalDiagnosticEventSequence",
+          );
+
+          const port = await getFreePort();
+          let server;
+          let client;
+          try {
+            server = await startGatewayServer(port, {
+              bind: "loopback",
+              auth: { mode: "token", token },
+              controlUiEnabled: false,
+            });
+
+            await new Promise((resolve, reject) => {
+              let settled = false;
+              const finish = (error) => {
+                if (settled) {
+                  return;
+                }
+                settled = true;
+                clearTimeout(timer);
+                error ? reject(error) : resolve();
+              };
+              const timer = setTimeout(() => finish(new Error("gateway connect timeout")), 15_000);
+              client = new GatewayClient({
+                url: `ws://127.0.0.1:${port}`,
+                token,
+                clientName: "test",
+                clientDisplayName: "pr110087-current-head-proof",
+                clientVersion: "proof",
+                mode: "test",
+                role: "operator",
+                scopes: ["operator.read"],
+                requestTimeoutMs: 15_000,
+                onHelloOk: () => finish(),
+                onConnectError: (error) =>
+                  finish(error instanceof Error ? error : new Error(String(error))),
+                onClose: (code, reason) =>
+                  finish(new Error(`gateway closed during connect (${code}): ${reason}`)),
+              });
+              client.start();
+            });
+
+            startDiagnosticRunActivityTracking();
+
+            const replacementSession = {
+              sessionId: "proof-replacement-session",
+              sessionKey: "agent:main:proof-replacement",
+            };
+            emitTrustedDiagnosticEvent({
+              type: "run.started",
+              ...replacementSession,
+              runId: "proof-older-run",
+            });
+            await waitForDiagnosticEventsDrained();
+
+            emitTrustedDiagnosticEvent({
+              type: "run.started",
+              ...replacementSession,
+              runId: "proof-replacement-run",
+            });
+            markDiagnosticEmbeddedRunStarted(replacementSession);
+            emitTrustedDiagnosticEvent({
+              type: "run.completed",
+              ...replacementSession,
+              runId: "proof-older-run",
+              durationMs: 1,
+              outcome: "completed",
+            });
+            await waitForDiagnosticEventsDrained();
+
+            const retainedSnapshot = getDiagnosticSessionActivitySnapshot(replacementSession);
+            const replacementStartupRetainedAfterOlderCompletion =
+              retainedSnapshot.activeWorkKind === "embedded_run" &&
+              retainedSnapshot.hasActiveEmbeddedRun === true;
+            assert(
+              replacementStartupRetainedAfterOlderCompletion,
+              `replacement owner was lost: ${JSON.stringify(retainedSnapshot)}`,
+            );
+
+            emitTrustedDiagnosticEvent({
+              type: "run.completed",
+              ...replacementSession,
+              runId: "proof-replacement-run",
+              durationMs: 1,
+              outcome: "completed",
+            });
+            await waitForDiagnosticEventsDrained();
+            const completedSnapshot = getDiagnosticSessionActivitySnapshot(replacementSession);
+            const lastOwnerCompletionClearedActivity =
+              completedSnapshot.activeWorkKind === undefined &&
+              completedSnapshot.hasActiveEmbeddedRun !== true &&
+              completedSnapshot.lastProgressReason === "run:completed";
+            assert(
+              lastOwnerCompletionClearedActivity,
+              `last-owner cleanup failed: ${JSON.stringify(completedSnapshot)}`,
+            );
+
+            const recoverySession = {
+              sessionId: "proof-recovery-session",
+              sessionKey: "agent:main:proof-recovery",
+            };
+            emitTrustedDiagnosticEvent({
+              type: "model.call.started",
+              ...recoverySession,
+              runId: "proof-recovered-run",
+              callId: "proof-stale-call",
+              provider: "openai",
+              model: "proof-model",
+            });
+            const recoveryCutoff = getInternalDiagnosticEventSequence();
+            clearDiagnosticEmbeddedRunActivityForSession({
+              ...recoverySession,
+              activeSessionId: recoverySession.sessionId,
+              recoveryStartedAfterDiagnosticEventSequence: recoveryCutoff,
+            });
+            await waitForDiagnosticEventsDrained();
+            const staleRecoverySnapshot = getDiagnosticSessionActivitySnapshot(recoverySession);
+            const queuedPreRecoveryOwnerSuppressed =
+              staleRecoverySnapshot.activeWorkKind === undefined;
+            assert(
+              queuedPreRecoveryOwnerSuppressed,
+              `pre-recovery owner reactivated: ${JSON.stringify(staleRecoverySnapshot)}`,
+            );
+
+            emitTrustedDiagnosticEvent({
+              type: "model.call.started",
+              ...recoverySession,
+              runId: "proof-fresh-run",
+              callId: "proof-fresh-call",
+              provider: "openai",
+              model: "proof-model",
+            });
+            await waitForDiagnosticEventsDrained();
+            const freshRecoverySnapshot = getDiagnosticSessionActivitySnapshot(recoverySession);
+            const postRecoveryOwnerAccepted =
+              freshRecoverySnapshot.activeWorkKind === "model_call";
+            assert(
+              postRecoveryOwnerAccepted,
+              `post-recovery owner was rejected: ${JSON.stringify(freshRecoverySnapshot)}`,
+            );
+            emitTrustedDiagnosticEvent({
+              type: "model.call.completed",
+              ...recoverySession,
+              runId: "proof-fresh-run",
+              callId: "proof-fresh-call",
+              provider: "openai",
+              model: "proof-model",
+              durationMs: 1,
+            });
+            emitTrustedDiagnosticEvent({
+              type: "run.completed",
+              ...recoverySession,
+              runId: "proof-fresh-run",
+              durationMs: 1,
+              outcome: "completed",
+            });
+            await waitForDiagnosticEventsDrained();
+
+            const stability = await client.request(
+              "diagnostics.stability",
+              {},
+              { timeoutMs: 15_000 },
+            );
+            const gatewayRpcTopLevelKeys = Object.keys(stability).sort();
+            const gatewayRpcSucceededAfterLifecycle =
+              gatewayRpcTopLevelKeys.includes("events") &&
+              gatewayRpcTopLevelKeys.includes("summary");
+            assert(gatewayRpcSucceededAfterLifecycle, "diagnostics.stability payload was invalid");
+
+            process.stdout.write(
+              `${JSON.stringify(
+                {
+                  kind: "gateway-replacement-run-current-head-proof",
+                  head: process.env.PROOF_HEAD_SHA,
+                  buildProfile: "gatewayWatch",
+                  runtimeKind: "official gatewayWatch dist chunks executed on Node 24",
+                  buildChunks: Object.fromEntries(
+                    Object.entries(chunkPaths).map(([key, value]) => [key, path.basename(value)]),
+                  ),
+                  observedBehavior: {
+                    replacementRegisteredFromRunStartedBeforeFirstProgress: true,
+                    replacementStartupRetainedAfterOlderCompletion,
+                    lastOwnerCompletionClearedActivity,
+                    finalProgressReason: completedSnapshot.lastProgressReason,
+                    queuedPreRecoveryOwnerSuppressed,
+                    postRecoveryOwnerAccepted,
+                    gatewayRpcSucceededAfterLifecycle,
+                  },
+                  gatewayRpcTopLevelKeys,
+                },
+                null,
+                2,
+              )}\n`,
+            );
+          } finally {
+            stopDiagnosticRunActivityTracking();
+            await client?.stopAndWait({ timeoutMs: 2_000 }).catch(() => client?.stop());
+            await server?.close({ reason: "PR 110087 current-head proof complete" });
+            await rm(stateDir, { recursive: true, force: true });
+          }
+          PROOF
+
+          node "$proof_script"
