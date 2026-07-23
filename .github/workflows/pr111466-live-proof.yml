@@ -131,7 +131,7 @@ jobs:
               mode: "local",
               bind: "loopback",
               port: Number(process.env.PROOF_PORT),
-              auth: { mode: "none" },
+              auth: { mode: "token", token: "pr111466-proof-token" },
             },
             browser: {
               enabled: true,
