@@ -102,13 +102,16 @@ jobs:
             --no-sandbox \
             --disable-dev-shm-usage \
             --disable-gpu \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-search-engine-choice-screen \
             --remote-debugging-address=127.0.0.1 \
             --remote-debugging-port=9222 \
             --user-data-dir="$RUNNER_TEMP/pr111466-chrome" \
             --use-fake-ui-for-media-stream \
             --use-fake-device-for-media-stream \
             --autoplay-policy=no-user-gesture-required \
-            "$MEETING_URL" >"$proof_dir/chrome.log" 2>&1 &
+            about:blank >"$proof_dir/chrome.log" 2>&1 &
           chrome_pid=$!
 
           cdp_ready=0
@@ -139,6 +142,7 @@ jobs:
               profiles: {
                 "proof-remote": {
                   cdpUrl: "http://127.0.0.1:9222",
+                  attachOnly: true,
                   color: "#00AA00",
                 },
               },
@@ -151,6 +155,7 @@ jobs:
                     defaultMode: "transcribe",
                     chrome: {
                       launch: false,
+                      browserProfile: "proof-remote",
                       reuseExistingTab: true,
                       autoJoin: true,
                       guestName: "OpenClaw PR 111466 Proof",
@@ -198,7 +203,22 @@ jobs:
           fi
 
           run_cli browser --browser-profile proof-remote start
+          run_cli browser --browser-profile proof-remote --json open "$MEETING_URL" \
+            >"$proof_dir/opened-tab.json"
           run_cli browser --browser-profile proof-remote --json tabs >"$proof_dir/tabs-before.json"
+
+          OPENED_TAB="$proof_dir/opened-tab.json" TABS_BEFORE="$proof_dir/tabs-before.json" node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          const opened = JSON.parse(readFileSync(process.env.OPENED_TAB, "utf8"));
+          const listed = JSON.parse(readFileSync(process.env.TABS_BEFORE, "utf8"));
+          const targetId = opened.targetId;
+          const tabs = Array.isArray(listed.tabs) ? listed.tabs : [];
+          if (!targetId || !tabs.some((tab) => tab.targetId === targetId)) {
+            console.error("::error::OpenClaw Browser did not retain the pre-opened Teams target");
+            process.exit(1);
+          }
+          console.log(`REUSED_TAB_READY targetId=${targetId}`);
+          NODE
 
           echo "JOIN_START"
           run_cli teamsmeetings join "$MEETING_URL" --mode transcribe | tee "$proof_dir/join.json"
@@ -275,6 +295,7 @@ jobs:
             "status-before.json",
             "test-listen.json",
             "status-after.json",
+            "opened-tab.json",
             "tabs-before.json",
             "tabs-after.json",
             "timing.json",
