@@ -159,7 +159,7 @@ jobs:
                       reuseExistingTab: true,
                       autoJoin: true,
                       guestName: "OpenClaw PR 111466 Proof",
-                      joinTimeoutMs: 30000,
+                      joinTimeoutMs: 120000,
                       waitForInCallMs: 60000,
                     },
                   },
@@ -221,26 +221,26 @@ jobs:
           NODE
 
           echo "JOIN_START"
-          run_cli teamsmeetings join "$MEETING_URL" --mode transcribe | tee "$proof_dir/join.json"
+          run_cli teamsmeetings join "$MEETING_URL" --mode transcribe >"$proof_dir/join.json"
           echo "JOIN_COMPLETE"
-          run_cli teamsmeetings status | tee "$proof_dir/status-before.json"
+          run_cli teamsmeetings status >"$proof_dir/status-before.json"
 
-          echo "PHONE_AUDIO_WINDOW_STARTS_IN_75_SECONDS"
-          sleep 65
-          echo "TEST_LISTEN_STARTING_IN_10_SECONDS"
-          sleep 10
+          echo "PHONE_AUDIO_WINDOW_OPEN_FOR_120_SECONDS"
+          sleep 5
+          echo "TEST_LISTEN_STARTED"
 
           started_ms="$(date +%s%3N)"
           set +e
-          run_cli teamsmeetings test-listen "$MEETING_URL" --mode transcribe | tee "$proof_dir/test-listen.json"
-          probe_status=${PIPESTATUS[0]}
+          run_cli teamsmeetings test-listen "$MEETING_URL" --mode transcribe \
+            >"$proof_dir/test-listen.json"
+          probe_status=$?
           set -e
           finished_ms="$(date +%s%3N)"
           printf '{"startedMs":%s,"finishedMs":%s,"elapsedMs":%s,"exitCode":%s}\n' \
             "$started_ms" "$finished_ms" "$((finished_ms - started_ms))" "$probe_status" \
             >"$proof_dir/timing.json"
 
-          run_cli teamsmeetings status | tee "$proof_dir/status-after.json" || true
+          run_cli teamsmeetings status >"$proof_dir/status-after.json" || true
           run_cli browser --browser-profile proof-remote --json tabs >"$proof_dir/tabs-after.json" || true
 
           EXPECTED_HEAD="$EXPECTED_HEAD" PROOF_RESULT="$proof_dir/test-listen.json" PROOF_TIMING="$proof_dir/timing.json" PROOF_SUMMARY="$proof_dir/summary.json" node --input-type=module <<'NODE'
@@ -303,10 +303,37 @@ jobs:
             "gateway.log",
             "chrome.log",
           ];
+          const sanitizeJson = (value, key = "") => {
+            if (typeof value === "string") {
+              if (key.toLowerCase().includes("url") || /teams\.live\.com/i.test(value)) {
+                return "[redacted-url]";
+              }
+              return value.split(process.env.MEETING_URL).join("[redacted-meeting-url]");
+            }
+            if (Array.isArray(value)) return value.map((entry) => sanitizeJson(entry));
+            if (value && typeof value === "object") {
+              return Object.fromEntries(
+                Object.entries(value).map(([entryKey, entryValue]) => [
+                  entryKey,
+                  sanitizeJson(entryValue, entryKey),
+                ]),
+              );
+            }
+            return value;
+          };
           for (const name of files) {
             const source = join(process.env.RAW_DIR, name);
             if (!existsSync(source)) continue;
-            const redacted = readFileSync(source, "utf8").split(process.env.MEETING_URL).join("[redacted-meeting-url]");
+            const raw = readFileSync(source, "utf8");
+            let redacted;
+            if (name.endsWith(".json")) {
+              redacted = `${JSON.stringify(sanitizeJson(JSON.parse(raw)), null, 2)}\n`;
+            } else {
+              redacted = raw
+                .split(process.env.MEETING_URL)
+                .join("[redacted-meeting-url]")
+                .replace(/(?:https?|wss?):\/\/[^\s"']+/g, "[redacted-url]");
+            }
             writeFileSync(join(process.env.PUBLIC_DIR, name), redacted);
           }
           NODE
