@@ -1,0 +1,301 @@
+name: PR 111466 Live Teams Proof
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pr-111466-live-teams-proof
+  cancel-in-progress: false
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CI: "1"
+      EXPECTED_HEAD: eafd1ac0dee66615b6866b3e11a3674d5b094a0e
+      PR_BRANCH: fix/teams-meetings-reused-tab-listen-probe
+      MEETING_URL: ${{ vars.PR111466_MEETING_URL }}
+      PROOF_PORT: "19766"
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+
+      - name: Clone exact contributor head without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$MEETING_URL" ]]; then
+            echo "::error::PR111466_MEETING_URL is not configured"
+            exit 1
+          fi
+          echo "::add-mask::$MEETING_URL"
+          git init openclaw
+          cd openclaw
+          git remote add origin https://github.com/zhangguiping-xydt/openclaw.git
+          git fetch --depth=1 origin "$PR_BRANCH"
+          git checkout --detach FETCH_HEAD
+          actual_head="$(git rev-parse HEAD)"
+          echo "Exact PR head: $actual_head"
+          test "$actual_head" = "$EXPECTED_HEAD"
+
+      - name: Install pinned dependencies
+        shell: bash
+        working-directory: openclaw
+        run: |
+          set -euo pipefail
+          export XDG_CACHE_HOME="$RUNNER_TEMP/cache"
+          export COREPACK_HOME="$XDG_CACHE_HOME/corepack"
+          export PNPM_HOME="$RUNNER_TEMP/pnpm-home"
+          mkdir -p "$XDG_CACHE_HOME" "$COREPACK_HOME" "$PNPM_HOME"
+          export PATH="$PNPM_HOME:$PATH"
+          package_manager="$(node -e 'const p=require("./package.json"); process.stdout.write(p.packageManager || "")')"
+          case "$package_manager" in
+            pnpm@*) ;;
+            *) echo "::error::Unexpected packageManager: $package_manager"; exit 1 ;;
+          esac
+          corepack enable --install-directory "$PNPM_HOME"
+          corepack prepare "$package_manager" --activate
+          pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Run reused-tab Teams listening proof
+        id: live-proof
+        shell: bash
+        working-directory: openclaw
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$MEETING_URL"
+
+          proof_dir="$RUNNER_TEMP/pr111466-proof"
+          state_dir="$proof_dir/state"
+          config_file="$proof_dir/openclaw.json"
+          mkdir -p "$state_dir"
+
+          xvfb_pid=""
+          chrome_pid=""
+          gateway_pid=""
+          cleanup() {
+            for pid in "$gateway_pid" "$chrome_pid" "$xvfb_pid"; do
+              if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+              fi
+            done
+          }
+          trap cleanup EXIT
+
+          Xvfb :99 -screen 0 1440x900x24 >"$proof_dir/xvfb.log" 2>&1 &
+          xvfb_pid=$!
+          export DISPLAY=:99
+
+          chrome_bin="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || true)"
+          if [[ -z "$chrome_bin" ]]; then
+            echo "::error::Chrome/Chromium is unavailable"
+            exit 1
+          fi
+          echo "Browser binary: $chrome_bin"
+          "$chrome_bin" \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --remote-debugging-address=127.0.0.1 \
+            --remote-debugging-port=9222 \
+            --user-data-dir="$RUNNER_TEMP/pr111466-chrome" \
+            --use-fake-ui-for-media-stream \
+            --use-fake-device-for-media-stream \
+            --autoplay-policy=no-user-gesture-required \
+            "$MEETING_URL" >"$proof_dir/chrome.log" 2>&1 &
+          chrome_pid=$!
+
+          cdp_ready=0
+          for _ in $(seq 1 60); do
+            if curl --noproxy '*' --max-time 1 -fsS http://127.0.0.1:9222/json/version >/dev/null; then
+              cdp_ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$cdp_ready" != "1" ]]; then
+            echo "::error::Chrome CDP did not become ready"
+            exit 1
+          fi
+
+          PROOF_CONFIG="$config_file" PROOF_PORT="$PROOF_PORT" node --input-type=module <<'NODE'
+          import { writeFileSync } from "node:fs";
+          const config = {
+            gateway: {
+              mode: "local",
+              bind: "loopback",
+              port: Number(process.env.PROOF_PORT),
+              auth: { mode: "none" },
+            },
+            browser: {
+              enabled: true,
+              defaultProfile: "proof-remote",
+              profiles: {
+                "proof-remote": {
+                  cdpUrl: "http://127.0.0.1:9222",
+                  color: "#00AA00",
+                },
+              },
+            },
+            plugins: {
+              entries: {
+                "teams-meetings": {
+                  enabled: true,
+                  config: {
+                    defaultMode: "transcribe",
+                    chrome: {
+                      launch: false,
+                      reuseExistingTab: true,
+                      autoJoin: true,
+                      guestName: "OpenClaw PR 111466 Proof",
+                      joinTimeoutMs: 30000,
+                      waitForInCallMs: 60000,
+                    },
+                  },
+                },
+              },
+            },
+          };
+          writeFileSync(process.env.PROOF_CONFIG, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+          NODE
+
+          run_cli() {
+            env \
+              OPENCLAW_STATE_DIR="$state_dir" \
+              OPENCLAW_CONFIG_PATH="$config_file" \
+              OPENCLAW_GATEWAY_PORT="$PROOF_PORT" \
+              node scripts/run-node.mjs "$@"
+          }
+
+          env \
+            OPENCLAW_STATE_DIR="$state_dir" \
+            OPENCLAW_CONFIG_PATH="$config_file" \
+            OPENCLAW_GATEWAY_PORT="$PROOF_PORT" \
+            node scripts/run-node.mjs gateway run --port "$PROOF_PORT" >"$proof_dir/gateway.log" 2>&1 &
+          gateway_pid=$!
+
+          gateway_ready=0
+          for _ in $(seq 1 90); do
+            if curl --noproxy '*' --max-time 1 -fsS "http://127.0.0.1:$PROOF_PORT/readyz" >/dev/null; then
+              gateway_ready=1
+              break
+            fi
+            if ! kill -0 "$gateway_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$gateway_ready" != "1" ]]; then
+            echo "::error::Gateway did not become ready"
+            tail -n 120 "$proof_dir/gateway.log" || true
+            exit 1
+          fi
+
+          run_cli browser --browser-profile proof-remote start
+          run_cli browser --browser-profile proof-remote --json tabs >"$proof_dir/tabs-before.json"
+
+          echo "JOIN_START"
+          run_cli teamsmeetings join "$MEETING_URL" --mode transcribe | tee "$proof_dir/join.json"
+          echo "JOIN_COMPLETE"
+          run_cli teamsmeetings status | tee "$proof_dir/status-before.json"
+
+          echo "PHONE_AUDIO_WINDOW_STARTS_IN_75_SECONDS"
+          sleep 65
+          echo "TEST_LISTEN_STARTING_IN_10_SECONDS"
+          sleep 10
+
+          started_ms="$(date +%s%3N)"
+          set +e
+          run_cli teamsmeetings test-listen "$MEETING_URL" --mode transcribe | tee "$proof_dir/test-listen.json"
+          probe_status=${PIPESTATUS[0]}
+          set -e
+          finished_ms="$(date +%s%3N)"
+          printf '{"startedMs":%s,"finishedMs":%s,"elapsedMs":%s,"exitCode":%s}\n' \
+            "$started_ms" "$finished_ms" "$((finished_ms - started_ms))" "$probe_status" \
+            >"$proof_dir/timing.json"
+
+          run_cli teamsmeetings status | tee "$proof_dir/status-after.json" || true
+          run_cli browser --browser-profile proof-remote --json tabs >"$proof_dir/tabs-after.json" || true
+
+          EXPECTED_HEAD="$EXPECTED_HEAD" PROOF_RESULT="$proof_dir/test-listen.json" PROOF_TIMING="$proof_dir/timing.json" PROOF_SUMMARY="$proof_dir/summary.json" node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          const result = JSON.parse(readFileSync(process.env.PROOF_RESULT, "utf8"));
+          const timing = JSON.parse(readFileSync(process.env.PROOF_TIMING, "utf8"));
+          const chrome = result.session?.chrome;
+          const summary = {
+            head: process.env.EXPECTED_HEAD,
+            launched: chrome?.launched,
+            targetId: chrome?.browserTab?.targetId ?? null,
+            openedByPlugin: chrome?.browserTab?.openedByPlugin,
+            listenVerified: result.listenVerified,
+            listenTimedOut: result.listenTimedOut,
+            transcriptLines: result.transcriptLines,
+            lastCaptionText: result.lastCaptionText,
+            elapsedMs: timing.elapsedMs,
+            exitCode: timing.exitCode,
+          };
+          writeFileSync(process.env.PROOF_SUMMARY, `${JSON.stringify(summary, null, 2)}\n`);
+          console.log("PR111466_PROOF_SUMMARY");
+          console.log(JSON.stringify(summary, null, 2));
+          if (
+            timing.exitCode !== 0 ||
+            summary.launched !== false ||
+            !summary.targetId ||
+            summary.openedByPlugin !== false ||
+            summary.listenVerified !== true ||
+            summary.listenTimedOut !== false
+          ) {
+            process.exitCode = 1;
+          }
+          NODE
+
+          exit "$probe_status"
+
+      - name: Prepare redacted proof artifact
+        if: always()
+        shell: bash
+        working-directory: openclaw
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$MEETING_URL"
+          raw="$RUNNER_TEMP/pr111466-proof"
+          public="$RUNNER_TEMP/pr111466-proof-public"
+          mkdir -p "$public"
+          RAW_DIR="$raw" PUBLIC_DIR="$public" MEETING_URL="$MEETING_URL" node --input-type=module <<'NODE'
+          import { existsSync, readFileSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          const files = [
+            "join.json",
+            "status-before.json",
+            "test-listen.json",
+            "status-after.json",
+            "tabs-before.json",
+            "tabs-after.json",
+            "timing.json",
+            "summary.json",
+            "gateway.log",
+            "chrome.log",
+          ];
+          for (const name of files) {
+            const source = join(process.env.RAW_DIR, name);
+            if (!existsSync(source)) continue;
+            const redacted = readFileSync(source, "utf8").split(process.env.MEETING_URL).join("[redacted-meeting-url]");
+            writeFileSync(join(process.env.PUBLIC_DIR, name), redacted);
+          }
+          NODE
+          sha256sum "$public"/* >"$public/SHA256SUMS"
+
+      - name: Upload redacted terminal proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr111466-live-teams-proof
+          path: ${{ runner.temp }}/pr111466-proof-public
+          if-no-files-found: error
+          retention-days: 1
