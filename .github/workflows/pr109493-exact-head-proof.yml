@@ -3,7 +3,7 @@ name: PR 109493 exact-head worker quiescence proof
 on:
   push:
     branches:
-      - proof/pr109493-c895a54-20260730
+      - proof/pr109493-bf9f96d-20260730
 
 permissions:
   contents: read
@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: zhangguiping-xydt/openclaw
-          ref: c895a54dea0ee92b11c90df95e9382a6644c23d7
+          ref: bf9f96dae93b703331b08431f555bee969a029fa
           persist-credentials: false
           path: pr
 

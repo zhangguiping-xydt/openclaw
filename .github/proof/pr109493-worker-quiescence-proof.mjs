@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const EXPECTED_HEAD = "c895a54dea0ee92b11c90df95e9382a6644c23d7";
+const EXPECTED_HEAD = "bf9f96dae93b703331b08431f555bee969a029fa";
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = process.env.OPENCLAW_PROOF_REPO_ROOT
   ? path.resolve(process.env.OPENCLAW_PROOF_REPO_ROOT)
@@ -158,8 +158,7 @@ try {
 
   const psWrapper = `#!/bin/sh
 case "$*" in
-  *"stat=,lstart= -p"*) exec /bin/ps "$@" ;;
-  *"lstart= -p"*)
+  *"stat=,lstart= -p"*|*"lstart= -p"*)
     target=""
     for argument in "$@"; do target=$argument; done
     if [ -f "$OPENCLAW_PROOF_STALL_TARGET" ] && grep -qx "$target" "$OPENCLAW_PROOF_STALL_TARGET"; then
