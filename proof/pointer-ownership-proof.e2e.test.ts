@@ -790,6 +790,24 @@ suite.define(() => {
       };
     } catch (error) {
       failure = error;
+      const diagnostic: Record<string, unknown> = {
+        candidateSha,
+        error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
+      };
+      try {
+        diagnostic.layout = await readPersistedLayout(page);
+        diagnostic.trace = await readTrace(page);
+        diagnostic.ui = await readUiState(page);
+      } catch (diagnosticError) {
+        diagnostic.collectionError = String(diagnosticError);
+      }
+      await fs
+        .writeFile(
+          path.join(proofDir, "failure-evidence.json"),
+          `${JSON.stringify(diagnostic, null, 2)}\n`,
+          "utf8",
+        )
+        .catch(() => {});
       await page
         .screenshot({
           animations: "disabled",
