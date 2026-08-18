@@ -9,10 +9,58 @@ permissions:
   contents: read
 
 env:
-  CANDIDATE_SHA: e1b437e2a4ee9bd10eaa6e11d26929c91d6b75b5
+  CANDIDATE_SHA: 174b4498e928210e59369c9b495d232942457af6
   PROOF_DIR: .artifacts/control-ui-e2e/pr-118591-pointer-ownership
 
 jobs:
+  focused-tests:
+    name: exact-head focused UI tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Assert exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$CANDIDATE_SHA" ]]; then
+            echo "Expected $CANDIDATE_SHA, checked out $actual_sha" >&2
+            exit 1
+          fi
+
+      - name: Setup candidate Node and pnpm environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          use-actions-cache: "true"
+
+      - name: Run focused dock ownership tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROOF_DIR"
+          {
+            node scripts/run-vitest.mjs ui/src/components/dock-layout-controller.test.ts
+            node scripts/run-vitest.mjs ui/src/components/terminal/terminal-panel-resizer.test.ts
+          } 2>&1 | tee "$PROOF_DIR/focused-tests.log"
+
+      - name: Upload focused test output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-118591-focused-tests-174b4498e
+          path: ${{ env.PROOF_DIR }}/focused-tests.log
+          if-no-files-found: error
+          retention-days: 30
+
   chromium-proof:
     name: exact-head Chromium multi-pointer proof
     runs-on: ubuntu-24.04
@@ -93,15 +141,15 @@ jobs:
             echo
             echo "- Candidate: \`$CANDIDATE_SHA\`"
             echo "- Input: Chromium CDP touch-owner + mouse-foreign events"
-            echo "- Scenario: foreign pointer move/end ignored; owner continues and persists"
-            echo "- Artifact: \`pr-118591-pointer-ownership-e1b437e2a\`"
+            echo "- Scenario: close during owner touch; reopen; next pointer resizes before old touch ends"
+            echo "- Artifact: \`pr-118591-pointer-ownership-174b4498e\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload screenshots, recording, and evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-118591-pointer-ownership-e1b437e2a
+          name: pr-118591-pointer-ownership-174b4498e
           path: ${{ env.PROOF_DIR }}
           if-no-files-found: error
           retention-days: 30

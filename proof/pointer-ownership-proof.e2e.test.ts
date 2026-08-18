@@ -32,7 +32,9 @@ type TraceEvent = {
 
 type UiState = {
   capturedByOwner: boolean;
+  capturedByLatestPointer: boolean;
   foreignPointerId: number | null;
+  latestPointerId: number | null;
   ownerPointerId: number | null;
   panelWidth: number;
   persistedWidth: number | null;
@@ -46,7 +48,9 @@ const proofDir = process.env.OPENCLAW_POINTER_PROOF_DIR?.trim() ?? "";
 const storageKey = "openclaw.terminal.panel.v1";
 const initialWidth = 520;
 const ownerDelta = 60;
-const expectedFinalWidth = initialWidth + ownerDelta;
+const nextPointerDelta = 40;
+const widthBeforeClose = initialWidth + ownerDelta;
+const expectedFinalWidth = widthBeforeClose + nextPointerDelta;
 
 const suite = createControlUiE2eSuite({
   name: "PR 118591 exact-head Chromium pointer ownership proof",
@@ -101,28 +105,44 @@ async function installEvidenceOverlay(page: Page): Promise<void> {
     }
 
     const proofWindow = window as typeof window & {
-      __openclawPointerProof?: { trace: TraceEvent[] };
+      __openclawPointerProof?: {
+        record: (event: Event) => void;
+        resizers: WeakSet<HTMLElement>;
+        trace: TraceEvent[];
+      };
     };
-    const trace: TraceEvent[] = [];
-    proofWindow.__openclawPointerProof = { trace };
-    const record = (rawEvent: Event) => {
-      const event = rawEvent as PointerEvent;
-      trace.push({
-        clientX: event.clientX,
-        clientY: event.clientY,
-        isTrusted: event.isTrusted,
-        pointerId: event.pointerId,
-        pointerType: event.pointerType,
-        time: performance.now(),
-        type: event.type,
-      });
-    };
-    resizer.addEventListener("pointerdown", record, true);
-    resizer.addEventListener("gotpointercapture", record, true);
-    resizer.addEventListener("lostpointercapture", record, true);
-    window.addEventListener("pointermove", record, true);
-    window.addEventListener("pointerup", record, true);
-    window.addEventListener("pointercancel", record, true);
+    const proof =
+      proofWindow.__openclawPointerProof ??
+      (() => {
+        const trace: TraceEvent[] = [];
+        const record = (rawEvent: Event) => {
+          const event = rawEvent as PointerEvent;
+          trace.push({
+            clientX: event.clientX,
+            clientY: event.clientY,
+            isTrusted: event.isTrusted,
+            pointerId: event.pointerId,
+            pointerType: event.pointerType,
+            time: performance.now(),
+            type: event.type,
+          });
+        };
+        window.addEventListener("pointermove", record, true);
+        window.addEventListener("pointerup", record, true);
+        window.addEventListener("pointercancel", record, true);
+        return { record, resizers: new WeakSet<HTMLElement>(), trace };
+      })();
+    proofWindow.__openclawPointerProof = proof;
+    if (!proof.resizers.has(resizer)) {
+      resizer.addEventListener("pointerdown", proof.record, true);
+      resizer.addEventListener("gotpointercapture", proof.record, true);
+      resizer.addEventListener("lostpointercapture", proof.record, true);
+      proof.resizers.add(resizer);
+    }
+
+    if (document.querySelector("#pointer-proof-overlay")) {
+      return;
+    }
 
     const overlay = document.createElement("section");
     overlay.id = "pointer-proof-overlay";
@@ -236,8 +256,10 @@ async function updateOverlay(
   page: Page,
   update: {
     foreign?: { ended: boolean; x: number; y: number };
+    foreignLabel?: string;
     lines: string[];
     owner?: { ended: boolean; x: number; y: number };
+    ownerLabel?: string;
     result?: "pass" | "running";
     title: string;
     verdict: string;
@@ -262,9 +284,9 @@ async function updateOverlay(
       verdict.textContent = next.verdict;
       overlay.dataset.result = next.result ?? "running";
 
-      for (const [id, point] of [
-        ["pointer-proof-owner", next.owner],
-        ["pointer-proof-foreign", next.foreign],
+      for (const [id, point, label] of [
+        ["pointer-proof-owner", next.owner, next.ownerLabel],
+        ["pointer-proof-foreign", next.foreign, next.foreignLabel],
       ] as const) {
         const marker = document.querySelector<HTMLElement>(`#${id}`);
         if (!marker) {
@@ -275,6 +297,9 @@ async function updateOverlay(
           marker.style.left = `${point.x}px`;
           marker.style.top = `${point.y}px`;
           marker.dataset.ended = String(point.ended);
+          if (label) {
+            marker.dataset.label = label;
+          }
         }
       }
     },
@@ -297,12 +322,21 @@ async function readUiState(page: Page): Promise<UiState> {
     const pointerDowns = trace.filter((event) => event.type === "pointerdown");
     const ownerPointerId = pointerDowns[0]?.pointerId ?? null;
     const foreignPointerId = pointerDowns[1]?.pointerId ?? null;
+    const latestPointerId = pointerDowns.at(-1)?.pointerId ?? null;
     let capturedByOwner = false;
     if (ownerPointerId !== null) {
       try {
         capturedByOwner = resizer.hasPointerCapture(ownerPointerId);
       } catch {
         capturedByOwner = false;
+      }
+    }
+    let capturedByLatestPointer = false;
+    if (latestPointerId !== null) {
+      try {
+        capturedByLatestPointer = resizer.hasPointerCapture(latestPointerId);
+      } catch {
+        capturedByLatestPointer = false;
       }
     }
     let persistedWidth: number | null = null;
@@ -316,7 +350,9 @@ async function readUiState(page: Page): Promise<UiState> {
     }
     return {
       capturedByOwner,
+      capturedByLatestPointer,
       foreignPointerId,
+      latestPointerId,
       ownerPointerId,
       panelWidth: surface.getBoundingClientRect().width,
       persistedWidth,
@@ -329,6 +365,34 @@ async function readUiState(page: Page): Promise<UiState> {
   }, storageKey);
 }
 
+async function readPersistedLayout(
+  page: Page,
+): Promise<{ open: boolean | null; width: number | null }> {
+  return await page.evaluate((key) => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(key) ?? "null") as {
+        open?: unknown;
+        width?: unknown;
+      } | null;
+      return {
+        open: typeof stored?.open === "boolean" ? stored.open : null,
+        width: typeof stored?.width === "number" ? stored.width : null,
+      };
+    } catch {
+      return { open: null, width: null };
+    }
+  }, storageKey);
+}
+
+async function readTrace(page: Page): Promise<TraceEvent[]> {
+  return await page.evaluate(() => {
+    const proofWindow = window as typeof window & {
+      __openclawPointerProof?: { trace: TraceEvent[] };
+    };
+    return [...(proofWindow.__openclawPointerProof?.trace ?? [])];
+  });
+}
+
 async function screenshot(page: Page, name: string): Promise<void> {
   await page.screenshot({
     animations: "disabled",
@@ -338,8 +402,8 @@ async function screenshot(page: Page, name: string): Promise<void> {
 }
 
 suite.define(() => {
-  it("shows a foreign pointer cannot move or end the owner gesture", async () => {
-    expect(candidateSha).toBe("e1b437e2a4ee9bd10eaa6e11d26929c91d6b75b5");
+  it("reopens for the next pointer while the original owner remains down", async () => {
+    expect(candidateSha).toBe("174b4498e928210e59369c9b495d232942457af6");
     expect(proofDir).not.toBe("");
     await fs.mkdir(proofDir, { recursive: true });
 
@@ -359,10 +423,12 @@ suite.define(() => {
     let result:
       | {
           browserVersion: string;
+          closed: { open: boolean | null; trace: TraceEvent[]; width: number | null };
           final: UiState;
           foreignIgnored: UiState;
           initial: UiState;
-          ownerContinues: UiState;
+          ownerResized: UiState;
+          reopenedResized: UiState;
           inputCoordinates: Record<string, number>;
           userAgent: string;
         }
@@ -533,71 +599,167 @@ suite.define(() => {
         .toBe(true);
       await expect.poll(async () => (await readUiState(page)).reserveRight).toBe("580px");
 
-      const ownerContinues = await readUiState(page);
-      expect(ownerContinues.capturedByOwner).toBe(true);
-      expect(Math.round(ownerContinues.panelWidth)).toBe(expectedFinalWidth);
-      expect(ownerContinues.persistedWidth).toBe(initialWidth);
-      expect(ownerContinues.trace.every((event) => event.isTrusted)).toBe(true);
+      const ownerResized = await readUiState(page);
+      expect(ownerResized.capturedByOwner).toBe(true);
+      expect(Math.round(ownerResized.panelWidth)).toBe(widthBeforeClose);
+      expect(ownerResized.persistedWidth).toBe(initialWidth);
+      expect(ownerResized.trace.every((event) => event.isTrusted)).toBe(true);
       await updateOverlay(page, {
         foreign: { ended: true, x: foreignMovedX, y: foreignY },
         lines: [
           `owner moved       -${ownerDelta} px`,
-          `panel width       ${Math.round(ownerContinues.panelWidth)} px`,
-          `persisted width   ${ownerContinues.persistedWidth} px (until owner end)`,
+          `panel width       ${Math.round(ownerResized.panelWidth)} px`,
+          `persisted width   ${ownerResized.persistedWidth} px (until close)`,
           `owner capture     ACTIVE`,
           `trusted events    true`,
         ],
         owner: { ended: false, x: ownerMovedX, y: ownerY },
-        title: "Owner continues after foreign end",
-        verdict: "OWNER STILL CONTROLS",
+        title: "Owner resized before close",
+        verdict: "OWNER STILL DOWN",
       });
-      await screenshot(page, "03-owner-continues.png");
+      await screenshot(page, "03-owner-resized.png");
       await page.waitForTimeout(900);
 
-      await dispatchTouch(cdp, "touchEnd", []);
+      await panel.getByRole("button", { name: "Hide terminal" }).click();
+      await expect(surface).toHaveCount(0);
+      await expect.poll(async () => (await readPersistedLayout(page)).open).toBe(false);
+      await expect.poll(async () => (await readPersistedLayout(page)).width).toBe(widthBeforeClose);
       await expect
         .poll(async () => {
-          const state = await readUiState(page);
-          return state.trace.some(
-            (event) => event.type === "pointerup" && event.pointerId === state.ownerPointerId,
+          const trace = await readTrace(page);
+          return trace.some(
+            (event) =>
+              event.type === "lostpointercapture" &&
+              event.pointerId === ownerResized.ownerPointerId,
           );
         })
         .toBe(true);
-      await expect.poll(async () => (await readUiState(page)).capturedByOwner).toBe(false);
-      await expect.poll(async () => (await readUiState(page)).persistedWidth).toBe(580);
+      const closedLayout = await readPersistedLayout(page);
+      const closedTrace = await readTrace(page);
+      expect(closedTrace.every((event) => event.isTrusted)).toBe(true);
+      const closed = { ...closedLayout, trace: closedTrace };
+      await updateOverlay(page, {
+        foreign: { ended: true, x: foreignMovedX, y: foreignY },
+        lines: [
+          `panel             CLOSED`,
+          `persisted width   ${closed.width} px`,
+          `old capture       RELEASED`,
+          `old touch         STILL PHYSICALLY DOWN`,
+        ],
+        owner: { ended: false, x: ownerMovedX, y: ownerY },
+        title: "Closed during owner touch",
+        verdict: "OWNERSHIP CLEARED",
+      });
+      await screenshot(page, "04-closed-owner-still-down.png");
+      await page.waitForTimeout(900);
+
+      await page.keyboard.press("Control+Backquote");
+      await expect(resizer).toBeVisible();
+      await installEvidenceOverlay(page);
+      const reopened = await readUiState(page);
+      expect(Math.round(reopened.panelWidth)).toBe(widthBeforeClose);
+      expect(reopened.persistedWidth).toBe(widthBeforeClose);
+      expect(reopened.capturedByOwner).toBe(false);
+
+      const reopenedBox = await resizer.boundingBox();
+      expect(reopenedBox).not.toBeNull();
+      if (!reopenedBox) {
+        throw new Error("Reopened terminal resizer has no live Chromium geometry");
+      }
+      const nextPointerX = Math.round(reopenedBox.x + reopenedBox.width / 2);
+      const nextPointerY = Math.round(
+        reopenedBox.y + Math.min(230, reopenedBox.height * 0.45),
+      );
+      const nextPointerMovedX = nextPointerX - nextPointerDelta;
+
+      await dispatchMouse(cdp, "mouseMoved", nextPointerX, nextPointerY);
+      await dispatchMouse(cdp, "mousePressed", nextPointerX, nextPointerY);
+      await expect
+        .poll(async () => {
+          const state = await readUiState(page);
+          return state.trace.filter((event) => event.type === "pointerdown").length;
+        })
+        .toBe(3);
+      const nextPointerStarted = await readUiState(page);
+      expect(nextPointerStarted.latestPointerId).not.toBe(nextPointerStarted.ownerPointerId);
+      expect(nextPointerStarted.capturedByLatestPointer).toBe(true);
+
+      await dispatchMouse(cdp, "mouseMoved", nextPointerMovedX, nextPointerY);
+      await expect.poll(async () => (await readUiState(page)).reserveRight).toBe("620px");
+      const reopenedResized = await readUiState(page);
+      expect(Math.round(reopenedResized.panelWidth)).toBe(expectedFinalWidth);
+      expect(reopenedResized.persistedWidth).toBe(widthBeforeClose);
+      expect(reopenedResized.capturedByLatestPointer).toBe(true);
+      expect(reopenedResized.trace.every((event) => event.isTrusted)).toBe(true);
+      await updateOverlay(page, {
+        foreign: { ended: false, x: nextPointerMovedX, y: nextPointerY },
+        foreignLabel: "NEXT",
+        lines: [
+          `old owner DOM id  ${reopenedResized.ownerPointerId} (still down)`,
+          `next DOM id       ${reopenedResized.latestPointerId} (captured)`,
+          `next moved        -${nextPointerDelta} px`,
+          `panel width       ${Math.round(reopenedResized.panelWidth)} px`,
+          `persisted width   ${reopenedResized.persistedWidth} px (until next end)`,
+        ],
+        owner: { ended: false, x: ownerMovedX, y: ownerY },
+        title: "Next pointer resized immediately",
+        verdict: "NO STALE OWNER BLOCK",
+      });
+      await screenshot(page, "05-reopened-next-pointer-resized.png");
+      await page.waitForTimeout(900);
+
+      await dispatchMouse(cdp, "mouseReleased", nextPointerMovedX, nextPointerY);
+      await expect
+        .poll(async () => (await readUiState(page)).capturedByLatestPointer)
+        .toBe(false);
+      await expect
+        .poll(async () => (await readUiState(page)).persistedWidth)
+        .toBe(expectedFinalWidth);
+
+      // End the original touch only after the reopened panel's next pointer has
+      // completed and persisted its resize.
+      await dispatchTouch(cdp, "touchEnd", []);
+      await page.waitForTimeout(250);
 
       const final = await readUiState(page);
       expect(Math.round(final.panelWidth)).toBe(expectedFinalWidth);
+      expect(final.persistedWidth).toBe(expectedFinalWidth);
       expect(final.reserveRight).toBe(`${expectedFinalWidth}px`);
       expect(final.touchAction).toBe("none");
       expect(final.trace.every((event) => event.isTrusted)).toBe(true);
       await updateOverlay(page, {
-        foreign: { ended: true, x: foreignMovedX, y: foreignY },
+        foreign: { ended: true, x: nextPointerMovedX, y: nextPointerY },
+        foreignLabel: "NEXT",
         lines: [
-          `owner DOM id      ${final.ownerPointerId}`,
-          `foreign DOM id    ${final.foreignPointerId}`,
+          `old owner DOM id  ${final.ownerPointerId} (ended last)`,
+          `next DOM id       ${final.latestPointerId} (ended first)`,
           `final width       ${Math.round(final.panelWidth)} px`,
           `persisted width   ${final.persistedWidth} px`,
-          `owner capture     RELEASED`,
+          `next capture      RELEASED`,
           `all pointer events isTrusted=true`,
         ],
         owner: { ended: true, x: ownerMovedX, y: ownerY },
         result: "pass",
-        title: "Pointer ownership preserved",
+        title: "Close/reopen ownership reset",
         verdict: "PASS",
       });
-      await screenshot(page, "04-final-pass.png");
+      await screenshot(page, "06-final-pass.png");
       await page.waitForTimeout(1_100);
 
       result = {
         browserVersion: suite.browser.version(),
+        closed,
         final,
         foreignIgnored,
         initial,
-        ownerContinues,
+        ownerResized,
+        reopenedResized,
         inputCoordinates: {
           foreignMovedX,
           foreignY,
+          nextPointerMovedX,
+          nextPointerX,
+          nextPointerY,
           ownerCdpId,
           ownerMovedX,
           ownerX,
@@ -635,7 +797,7 @@ suite.define(() => {
     }
 
     const evidence = {
-      schema: "openclaw-control-ui-pointer-ownership-proof-v1",
+      schema: "openclaw-control-ui-pointer-ownership-proof-v2",
       candidateSha,
       generatedAt: new Date().toISOString(),
       github: {
@@ -648,45 +810,76 @@ suite.define(() => {
         browser: `Chromium ${result.browserVersion}`,
         mockedGateway: true,
         source:
-          "Input.dispatchTouchEvent (owner) + Input.dispatchMouseEvent (foreign) through one Chromium CDP session",
+          "Input.dispatchTouchEvent (original owner) + Input.dispatchMouseEvent (foreign and post-reopen pointer) through one Chromium CDP session",
         userAgent: result.userAgent,
         viewport: { height: 800, width: 1280 },
       },
       assertions: {
-        finalOwnerCaptureReleased: !result.final.capturedByOwner,
+        closePersistedOwnerWidth:
+          result.closed.open === false && result.closed.width === widthBeforeClose,
+        closeReleasedOriginalCapture: result.closed.trace.some(
+          (event) =>
+            event.type === "lostpointercapture" &&
+            event.pointerId === result.ownerResized.ownerPointerId,
+        ),
+        finalNextPointerCaptureReleased: !result.final.capturedByLatestPointer,
+        finalOriginalOwnerCaptureReleased: !result.final.capturedByOwner,
         finalWidthPersisted: result.final.persistedWidth === expectedFinalWidth,
         foreignEndDidNotReleaseOwnerCapture: result.foreignIgnored.capturedByOwner,
         foreignMoveDidNotChangePanelWidth:
           Math.round(result.foreignIgnored.panelWidth) === initialWidth,
-        ownerContinuedAfterForeignEnd:
-          Math.round(result.ownerContinues.panelWidth) === expectedFinalWidth,
+        nextPointerAcceptedAfterReopen:
+          result.reopenedResized.capturedByLatestPointer &&
+          result.reopenedResized.latestPointerId !== result.reopenedResized.ownerPointerId,
+        nextPointerResizedBeforeOriginalTouchEnded:
+          Math.round(result.reopenedResized.panelWidth) === expectedFinalWidth,
+        nextPointerWaitedToPersistUntilItsOwnEnd:
+          result.reopenedResized.persistedWidth === widthBeforeClose,
+        originalOwnerResizedBeforeClose:
+          Math.round(result.ownerResized.panelWidth) === widthBeforeClose,
         pointerEventsAreTrusted: result.final.trace.every((event) => event.isTrusted),
         touchActionNone: result.final.touchAction === "none",
       },
       cdpInputs: {
         foreign: "mouse:left",
+        inputSequence: [
+          "original touch start",
+          "foreign mouse move/end",
+          "original touch resize",
+          "Hide terminal click",
+          "Ctrl+Backquote reopen",
+          "next mouse resize/end",
+          "original touch end",
+        ],
+        nextPointerAfterReopen: "mouse:left",
         ownerTouchPointId: result.inputCoordinates.ownerCdpId,
       },
       domPointerIds: {
         foreign: result.final.foreignPointerId,
-        owner: result.final.ownerPointerId,
+        nextAfterReopen: result.final.latestPointerId,
+        originalOwner: result.final.ownerPointerId,
       },
       widths: {
+        closedPersisted: result.closed.width,
         finalPanel: Math.round(result.final.panelWidth),
         finalPersisted: result.final.persistedWidth,
         foreignIgnoredPanel: Math.round(result.foreignIgnored.panelWidth),
         foreignIgnoredPersisted: result.foreignIgnored.persistedWidth,
         initialPanel: Math.round(result.initial.panelWidth),
         initialPersisted: result.initial.persistedWidth,
-        ownerContinuesPanel: Math.round(result.ownerContinues.panelWidth),
-        ownerContinuesPersisted: result.ownerContinues.persistedWidth,
+        ownerBeforeClosePanel: Math.round(result.ownerResized.panelWidth),
+        ownerBeforeClosePersisted: result.ownerResized.persistedWidth,
+        reopenedNextPointerPanel: Math.round(result.reopenedResized.panelWidth),
+        reopenedNextPointerPersisted: result.reopenedResized.persistedWidth,
       },
       eventTrace: result.final.trace,
       artifacts: [
         "01-initial.png",
         "02-foreign-ignored.png",
-        "03-owner-continues.png",
-        "04-final-pass.png",
+        "03-owner-resized.png",
+        "04-closed-owner-still-down.png",
+        "05-reopened-next-pointer-resized.png",
+        "06-final-pass.png",
         "pointer-ownership-proof.webm",
       ],
     };
