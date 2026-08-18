@@ -451,6 +451,7 @@ suite.define(() => {
           final: UiState;
           foreignIgnored: UiState;
           initial: UiState;
+          nextPointerStarted: UiState;
           ownerResized: UiState;
           reopenedResized: UiState;
           inputCoordinates: Record<string, number>;
@@ -710,14 +711,13 @@ suite.define(() => {
       const reopenedResized = await readUiState(page);
       expect(Math.round(reopenedResized.panelWidth)).toBe(expectedFinalWidth);
       expect(reopenedResized.persistedWidth).toBe(widthBeforeClose);
-      expect(reopenedResized.capturedByLatestPointer).toBe(true);
       expect(reopenedResized.trace.every((event) => event.isTrusted)).toBe(true);
       await updateOverlay(page, {
         foreign: { ended: false, x: nextPointerMovedX, y: nextPointerY },
         foreignLabel: "NEXT",
         lines: [
           `old owner DOM id  ${reopenedResized.ownerPointerId} (still down)`,
-          `next DOM id       ${reopenedResized.latestPointerId} (captured)`,
+          `next DOM id       ${reopenedResized.latestPointerId} (accepted)`,
           `next moved        -${nextPointerDelta} px`,
           `panel width       ${Math.round(reopenedResized.panelWidth)} px`,
           `persisted width   ${reopenedResized.persistedWidth} px (until next end)`,
@@ -773,6 +773,7 @@ suite.define(() => {
         final,
         foreignIgnored,
         initial,
+        nextPointerStarted,
         ownerResized,
         reopenedResized,
         inputCoordinates: {
@@ -864,8 +865,8 @@ suite.define(() => {
         foreignMoveDidNotChangePanelWidth:
           Math.round(result.foreignIgnored.panelWidth) === initialWidth,
         nextPointerAcceptedAfterReopen:
-          result.reopenedResized.capturedByLatestPointer &&
-          result.reopenedResized.latestPointerId !== result.reopenedResized.ownerPointerId,
+          result.nextPointerStarted.capturedByLatestPointer &&
+          result.nextPointerStarted.latestPointerId !== result.nextPointerStarted.ownerPointerId,
         nextPointerResizedBeforeOriginalTouchEnded:
           Math.round(result.reopenedResized.panelWidth) === expectedFinalWidth,
         nextPointerWaitedToPersistUntilItsOwnEnd:
