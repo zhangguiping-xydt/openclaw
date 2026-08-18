@@ -339,7 +339,7 @@ async function screenshot(page: Page, name: string): Promise<void> {
 
 suite.define(() => {
   it("shows a foreign pointer cannot move or end the owner gesture", async () => {
-    expect(candidateSha).toBe("afcfddbcbc5f9058ec7dafa4e135c68d1ed645ce");
+    expect(candidateSha).toBe("e1b437e2a4ee9bd10eaa6e11d26929c91d6b75b5");
     expect(proofDir).not.toBe("");
     await fs.mkdir(proofDir, { recursive: true });
 
