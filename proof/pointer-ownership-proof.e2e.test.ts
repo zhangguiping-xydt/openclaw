@@ -694,7 +694,6 @@ suite.define(() => {
       );
       const nextPointerMovedX = nextPointerX - nextPointerDelta;
 
-      await dispatchMouse(cdp, "mouseMoved", nextPointerX, nextPointerY);
       await dispatchMouse(cdp, "mousePressed", nextPointerX, nextPointerY);
       await expect
         .poll(async () => {
