@@ -1,0 +1,107 @@
+name: PR 118591 pointer ownership proof
+
+on:
+  push:
+    branches:
+      - proof/pr118591-pointer-ownership-afcfddbcb
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: afcfddbcbc5f9058ec7dafa4e135c68d1ed645ce
+  PROOF_DIR: .artifacts/control-ui-e2e/pr-118591-pointer-ownership
+
+jobs:
+  chromium-proof:
+    name: exact-head Chromium multi-pointer proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout isolated proof harness
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          path: .proof-harness
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Pin candidate and install temporary proof spec
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$CANDIDATE_SHA" ]]; then
+            echo "Expected $CANDIDATE_SHA, checked out $actual_sha" >&2
+            exit 1
+          fi
+          cp \
+            .proof-harness/proof/pointer-ownership-proof.e2e.test.ts \
+            ui/src/e2e/pointer-ownership-proof.e2e.test.ts
+          printf 'candidate=%s\nharness=%s\n' "$actual_sha" "${GITHUB_SHA}"
+
+      - name: Setup candidate Node and pnpm environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          use-actions-cache: "true"
+
+      - name: Install candidate-pinned Chromium
+        run: node --import tsx scripts/ensure-playwright-chromium.mts
+
+      - name: Run visible multi-pointer proof
+        env:
+          CI: "1"
+          OPENCLAW_POINTER_PROOF_DIR: ${{ env.PROOF_DIR }}
+          OPENCLAW_UI_E2E_ALLOW_MISSING_CHROMIUM: "0"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROOF_DIR"
+          node scripts/run-vitest.mjs run \
+            --config test/vitest/vitest.ui-e2e.config.ts \
+            --configLoader runner \
+            ui/src/e2e/pointer-ownership-proof.e2e.test.ts \
+            2>&1 | tee "$PROOF_DIR/test-output.log"
+
+      - name: Hash proof artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d "$PROOF_DIR" ]]; then
+            find "$PROOF_DIR" -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z \
+              | xargs -0 -r sha256sum \
+              > "$PROOF_DIR/SHA256SUMS.txt"
+          fi
+
+      - name: Publish proof summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## PR #118591 exact-head Chromium proof"
+            echo
+            echo "- Candidate: \`$CANDIDATE_SHA\`"
+            echo "- Input: Chromium CDP touch-owner + mouse-foreign events"
+            echo "- Scenario: foreign pointer move/end ignored; owner continues and persists"
+            echo "- Artifact: \`pr-118591-pointer-ownership-afcfddbcb\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload screenshots, recording, and evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-118591-pointer-ownership-afcfddbcb
+          path: ${{ env.PROOF_DIR }}
+          if-no-files-found: error
+          retention-days: 30
