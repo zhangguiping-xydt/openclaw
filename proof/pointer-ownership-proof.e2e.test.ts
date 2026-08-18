@@ -694,7 +694,8 @@ suite.define(() => {
       );
       const nextPointerMovedX = nextPointerX - nextPointerDelta;
 
-      await dispatchMouse(cdp, "mousePressed", nextPointerX, nextPointerY);
+      await page.mouse.move(nextPointerX, nextPointerY);
+      await page.mouse.down();
       await expect
         .poll(async () => {
           const state = await readUiState(page);
@@ -705,7 +706,7 @@ suite.define(() => {
       expect(nextPointerStarted.latestPointerId).not.toBe(nextPointerStarted.ownerPointerId);
       expect(nextPointerStarted.capturedByLatestPointer).toBe(true);
 
-      await dispatchMouse(cdp, "mouseMoved", nextPointerMovedX, nextPointerY);
+      await page.mouse.move(nextPointerMovedX, nextPointerY);
       await expect.poll(async () => (await readUiState(page)).reserveRight).toBe("620px");
       const reopenedResized = await readUiState(page);
       expect(Math.round(reopenedResized.panelWidth)).toBe(expectedFinalWidth);
@@ -728,7 +729,7 @@ suite.define(() => {
       await screenshot(page, "05-reopened-next-pointer-resized.png");
       await page.waitForTimeout(900);
 
-      await dispatchMouse(cdp, "mouseReleased", nextPointerMovedX, nextPointerY);
+      await page.mouse.up();
       await expect
         .poll(async () => (await readUiState(page)).capturedByLatestPointer)
         .toBe(false);
@@ -849,7 +850,7 @@ suite.define(() => {
         browser: `Chromium ${result.browserVersion}`,
         mockedGateway: true,
         source:
-          "Input.dispatchTouchEvent (original owner) + Input.dispatchMouseEvent (foreign and post-reopen pointer) through one Chromium CDP session",
+          "Input.dispatchTouchEvent (original owner) + Chromium mouse input (foreign and post-reopen pointer); all observed PointerEvents are trusted",
         userAgent: result.userAgent,
         viewport: { height: 800, width: 1280 },
       },
