@@ -3,13 +3,13 @@ name: PR 118591 pointer ownership proof
 on:
   push:
     branches:
-      - proof/pr118591-pointer-ownership-afcfddbcb
+      - proof/pr-118591-e1b437e
 
 permissions:
   contents: read
 
 env:
-  CANDIDATE_SHA: afcfddbcbc5f9058ec7dafa4e135c68d1ed645ce
+  CANDIDATE_SHA: e1b437e2a4ee9bd10eaa6e11d26929c91d6b75b5
   PROOF_DIR: .artifacts/control-ui-e2e/pr-118591-pointer-ownership
 
 jobs:
@@ -94,14 +94,14 @@ jobs:
             echo "- Candidate: \`$CANDIDATE_SHA\`"
             echo "- Input: Chromium CDP touch-owner + mouse-foreign events"
             echo "- Scenario: foreign pointer move/end ignored; owner continues and persists"
-            echo "- Artifact: \`pr-118591-pointer-ownership-afcfddbcb\`"
+            echo "- Artifact: \`pr-118591-pointer-ownership-e1b437e2a\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload screenshots, recording, and evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-118591-pointer-ownership-afcfddbcb
+          name: pr-118591-pointer-ownership-e1b437e2a
           path: ${{ env.PROOF_DIR }}
           if-no-files-found: error
           retention-days: 30
