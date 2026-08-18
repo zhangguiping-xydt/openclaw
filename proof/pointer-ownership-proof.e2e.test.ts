@@ -106,6 +106,7 @@ async function installEvidenceOverlay(page: Page): Promise<void> {
 
     const proofWindow = window as typeof window & {
       __openclawPointerProof?: {
+        firstResizer: HTMLElement;
         record: (event: Event) => void;
         resizers: WeakSet<HTMLElement>;
         trace: TraceEvent[];
@@ -130,7 +131,7 @@ async function installEvidenceOverlay(page: Page): Promise<void> {
         window.addEventListener("pointermove", record, true);
         window.addEventListener("pointerup", record, true);
         window.addEventListener("pointercancel", record, true);
-        return { record, resizers: new WeakSet<HTMLElement>(), trace };
+        return { firstResizer: resizer, record, resizers: new WeakSet<HTMLElement>(), trace };
       })();
     proofWindow.__openclawPointerProof = proof;
     if (!proof.resizers.has(resizer)) {
@@ -393,6 +394,24 @@ async function readTrace(page: Page): Promise<TraceEvent[]> {
   });
 }
 
+async function readOriginalOwnerCapture(page: Page, pointerId: number | null): Promise<boolean> {
+  return await page.evaluate((ownerPointerId) => {
+    if (ownerPointerId === null) {
+      return false;
+    }
+    const proofWindow = window as typeof window & {
+      __openclawPointerProof?: { firstResizer: HTMLElement };
+    };
+    try {
+      return (
+        proofWindow.__openclawPointerProof?.firstResizer.hasPointerCapture(ownerPointerId) ?? false
+      );
+    } catch {
+      return false;
+    }
+  }, pointerId);
+}
+
 async function screenshot(page: Page, name: string): Promise<void> {
   await page.screenshot({
     animations: "disabled",
@@ -423,7 +442,12 @@ suite.define(() => {
     let result:
       | {
           browserVersion: string;
-          closed: { open: boolean | null; trace: TraceEvent[]; width: number | null };
+          closed: {
+            originalOwnerCaptured: boolean;
+            open: boolean | null;
+            trace: TraceEvent[];
+            width: number | null;
+          };
           final: UiState;
           foreignIgnored: UiState;
           initial: UiState;
@@ -625,19 +649,16 @@ suite.define(() => {
       await expect.poll(async () => (await readPersistedLayout(page)).open).toBe(false);
       await expect.poll(async () => (await readPersistedLayout(page)).width).toBe(widthBeforeClose);
       await expect
-        .poll(async () => {
-          const trace = await readTrace(page);
-          return trace.some(
-            (event) =>
-              event.type === "lostpointercapture" &&
-              event.pointerId === ownerResized.ownerPointerId,
-          );
-        })
-        .toBe(true);
+        .poll(() => readOriginalOwnerCapture(page, ownerResized.ownerPointerId))
+        .toBe(false);
       const closedLayout = await readPersistedLayout(page);
       const closedTrace = await readTrace(page);
       expect(closedTrace.every((event) => event.isTrusted)).toBe(true);
-      const closed = { ...closedLayout, trace: closedTrace };
+      const closed = {
+        ...closedLayout,
+        originalOwnerCaptured: await readOriginalOwnerCapture(page, ownerResized.ownerPointerId),
+        trace: closedTrace,
+      };
       await updateOverlay(page, {
         foreign: { ended: true, x: foreignMovedX, y: foreignY },
         lines: [
@@ -817,11 +838,7 @@ suite.define(() => {
       assertions: {
         closePersistedOwnerWidth:
           result.closed.open === false && result.closed.width === widthBeforeClose,
-        closeReleasedOriginalCapture: result.closed.trace.some(
-          (event) =>
-            event.type === "lostpointercapture" &&
-            event.pointerId === result.ownerResized.ownerPointerId,
-        ),
+        closeReleasedOriginalCapture: !result.closed.originalOwnerCaptured,
         finalNextPointerCaptureReleased: !result.final.capturedByLatestPointer,
         finalOriginalOwnerCaptureReleased: !result.final.capturedByOwner,
         finalWidthPersisted: result.final.persistedWidth === expectedFinalWidth,
