@@ -94,6 +94,16 @@ beforeAll(async () => {
 afterAll(() => {
   clearRuntimeConfigSnapshot();
   resetAgentEventsForTest();
+  vi.doUnmock("../../plugins/cli-backends.runtime.js");
+  vi.doUnmock("../../agents/embedded-agent-runner/model.js");
+  vi.doUnmock("../../plugins/hook-runner-global.js");
+  vi.doUnmock("../../context-engine/init.js");
+  vi.doUnmock("../../context-engine/registry.js");
+  vi.doUnmock("../../agents/runtime-plugins.js");
+  vi.doUnmock("../../agents/prepared-model-runtime.js");
+  vi.doUnmock("../../plugins/provider-hook-runtime.js");
+  vi.doUnmock("../../agents/harness/runtime-plugin.js");
+  vi.resetModules();
 });
 
 async function createFailedResponsesServer(): Promise<{
@@ -194,6 +204,7 @@ function createTypingSignaler(): TypingSignaler {
 }
 
 function createTurnParams(params: {
+  abortSignal: AbortSignal;
   agentDir: string;
   config: OpenClawConfig;
   runId: string;
@@ -239,6 +250,7 @@ function createTurnParams(params: {
       MessageSid: "transport-recovery-proof",
     } as unknown as TemplateContext,
     opts: {
+      abortSignal: params.abortSignal,
       runId: params.runId,
       disableTools: true,
     } satisfies GetReplyOptions,
@@ -285,6 +297,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
         events.push(event);
       }
     });
+    const abortController = new AbortController();
     let executionPromise: ReturnType<typeof executeAgentTurn> | undefined;
 
     try {
@@ -325,6 +338,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
 
       executionPromise = executeAgentTurn(
         createTurnParams({
+          abortSignal: abortController.signal,
           agentDir,
           config,
           runId,
@@ -408,6 +422,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
         })}`,
       );
     } finally {
+      abortController.abort();
       await fs.writeFile(releasePath, "release", "utf8").catch(() => undefined);
       await executionPromise?.catch(() => undefined);
       unsubscribe();
