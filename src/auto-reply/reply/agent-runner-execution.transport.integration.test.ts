@@ -267,7 +267,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
     const workspaceDir = path.join(root, "workspace");
     const markerPath = path.join(root, "cli-child.pid");
     const releasePath = path.join(root, "release-cli-child");
-    const sessionFile = path.join(root, "session.jsonl");
+    const sessionStore = path.join(root, "sessions.json");
     await Promise.all([
       fs.mkdir(agentDir, { recursive: true }),
       fs.mkdir(workspaceDir, { recursive: true }),
@@ -290,6 +290,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
     try {
       const apiKeyField = ["api", "Key"].join("");
       const config = {
+        session: { store: sessionStore },
         agents: {
           defaults: {
             workspace: workspaceDir,
@@ -327,7 +328,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
           agentDir,
           config,
           runId,
-          sessionFile,
+          sessionFile: sessionKey,
           sessionId,
           sessionKey,
           workspaceDir,
@@ -350,9 +351,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
       expect(
         transport.requests,
         `primary fallback attempt: ${primaryAttempt?.error ?? result.outcome.kind}`,
-      ).toEqual([
-        { method: "POST", path: expect.stringMatching(/^\/v1\/responses(?:\?|$)/) },
-      ]);
+      ).toEqual([{ method: "POST", path: expect.stringMatching(/^\/v1\/responses(?:\?|$)/) }]);
       const childPid = Number((await fs.readFile(markerPath, "utf8")).trim());
       expect(childPid).toBeGreaterThan(0);
       expect(result).toMatchObject({
