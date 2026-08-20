@@ -745,8 +745,9 @@ describe("plugin registry runtime config scope", () => {
         storePath: "/tmp/sessions.json",
       },
     };
-    const forgedCollectionRunParams = {
+    const forgedHostOnlyRunParams = {
       ...runParams,
+      onDeferredLifecycleOwner: vi.fn(),
       skillWorkshopCollectionReconcile: { approvedSkillNames: new Set(["forged"]) },
     };
 
@@ -758,10 +759,11 @@ describe("plugin registry runtime config scope", () => {
     ).resolves.toMatchObject(reservedEntry);
     await expect(ownerApi.runtime.agent.runEmbeddedAgent(runParams)).resolves.toEqual({ ok: true });
     await expect(
-      ownerApi.runtime.agent.runEmbeddedAgent(forgedCollectionRunParams),
+      ownerApi.runtime.agent.runEmbeddedAgent(forgedHostOnlyRunParams),
     ).resolves.toEqual({ ok: true });
     expect(runEmbeddedAgent).toHaveBeenLastCalledWith({
       ...runParams,
+      onDeferredLifecycleOwner: undefined,
       skillWorkshopCollectionReconcile: undefined,
     });
     await expect(
