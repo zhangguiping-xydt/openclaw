@@ -104,6 +104,7 @@ async function createRetryableFailureResponsesServer(): Promise<{
   const requests: Array<{ method: string; path: string }> = [];
   const server = createServer((request, response) => {
     requests.push({ method: request.method ?? "", path: request.url ?? "" });
+    process.stderr.write(`[transport-debug] http-request count=${requests.length}\n`);
     request.resume();
     request.on("end", () => {
       response.writeHead(503, {
@@ -267,6 +268,9 @@ describe("agent runner transport to CLI fallback recovery", () => {
     const unsubscribe = onAgentEvent((event) => {
       if (event.runId === runId) {
         events.push(event);
+        process.stderr.write(
+          `[transport-debug] event stream=${event.stream} phase=${String(event.data.phase ?? "")}\n`,
+        );
       }
     });
     let executionPromise: ReturnType<typeof executeAgentTurn> | undefined;
@@ -307,6 +311,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
         },
       } as OpenClawConfig;
 
+      process.stderr.write("[transport-debug] execute-start\n");
       executionPromise = executeAgentTurn(
         createTurnParams({
           agentDir,
@@ -318,13 +323,20 @@ describe("agent runner transport to CLI fallback recovery", () => {
           workspaceDir,
         }),
       );
+      void executionPromise.then(
+        (result) =>
+          process.stderr.write(`[transport-debug] execute-settled kind=${result.outcome.kind}\n`),
+        (error) => process.stderr.write(`[transport-debug] execute-rejected error=${String(error)}\n`),
+      );
 
+      process.stderr.write("[transport-debug] marker-wait-start\n");
       await Promise.race([
         waitForFile(markerPath),
         executionPromise.then(() => {
           throw new Error("turn settled before the CLI child published its start marker");
         }),
       ]);
+      process.stderr.write("[transport-debug] marker-wait-complete\n");
       const activeEmbeddedRunAtCliStart = isEmbeddedAgentRunHandleActive(sessionId);
       expect(activeEmbeddedRunAtCliStart).toBe(false);
       await fs.writeFile(releasePath, "release", "utf8");
@@ -397,8 +409,10 @@ describe("agent runner transport to CLI fallback recovery", () => {
         })}`,
       );
     } finally {
+      process.stderr.write("[transport-debug] finally-start\n");
       await fs.writeFile(releasePath, "release", "utf8").catch(() => undefined);
       await executionPromise?.catch(() => undefined);
+      process.stderr.write("[transport-debug] execution-cleanup-complete\n");
       unsubscribe();
       await closeServer(transport.server);
       await fs.rm(root, { recursive: true, force: true });
