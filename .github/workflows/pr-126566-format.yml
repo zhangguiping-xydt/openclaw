@@ -1,0 +1,68 @@
+name: PR 126566 format patch
+
+on:
+  push:
+    branches:
+      - ci/pr-126566-format-v1
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout formatter commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify exact source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="7fbb5233ec2"
+          test "$(git rev-parse --short=11 HEAD^)" = "$expected_sha"
+          git diff --exit-code HEAD^ HEAD -- . ':(exclude).github/workflows/pr-126566-format.yml'
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24.15.0"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          package_manager="$(node -p 'require("./package.json").packageManager')"
+          corepack prepare "$package_manager" --activate
+          pnpm install --frozen-lockfile
+
+      - name: Produce format patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/pr-126566-format
+          pnpm format \
+            src/agents/command/attempt-execution.ts \
+            src/agents/command/attempt-execution.cli.test.ts
+          git diff --check
+          git diff --binary -- \
+            src/agents/command/attempt-execution.ts \
+            src/agents/command/attempt-execution.cli.test.ts \
+            > .artifacts/pr-126566-format/format.patch
+          test -s .artifacts/pr-126566-format/format.patch
+
+      - name: Upload format patch
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-126566-format-patch
+          path: .artifacts/pr-126566-format/format.patch
+          if-no-files-found: error
+          retention-days: 7
