@@ -141,16 +141,16 @@ async function createFailedResponsesServer(): Promise<{
   };
   const server = createServer((request, response) => {
     requests.push({ method: request.method ?? "", path: request.url ?? "" });
+    // The guarded transport owns request-body streaming. Respond as soon as the
+    // request reaches the fixture so proof does not depend on upload drain timing.
     request.resume();
-    request.on("end", () => {
-      response.writeHead(200, {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache",
-        connection: "keep-alive",
-      });
-      response.write(`event: response.failed\ndata: ${JSON.stringify(event)}\n\n`);
-      response.end();
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
     });
+    response.write(`event: response.failed\ndata: ${JSON.stringify(event)}\n\n`);
+    response.end();
   });
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error) => reject(error);
