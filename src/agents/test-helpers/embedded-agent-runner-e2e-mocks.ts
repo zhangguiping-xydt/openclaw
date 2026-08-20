@@ -167,10 +167,20 @@ export function installEmbeddedRunnerBaseE2eMocks(options?: {
   });
   vi.doMock("../../plugins/provider-hook-runtime.js", () => ({
     attachModelProviderRuntimePluginHandle: (model: unknown) => model,
+    ensureProviderRuntimePluginHandle: vi.fn(
+      (params: { runtimeHandle?: object }) => params.runtimeHandle ?? params,
+    ),
+    getModelProviderRuntimePluginHandle: vi.fn(() => undefined),
     prepareProviderExtraParams: vi.fn(() => undefined),
+    resolveLoadedProviderRuntimePlugin: vi.fn(() => undefined),
+    resolveProviderAuthProfileId: vi.fn(() => undefined),
     resolveProviderExtraParamsForTransport: vi.fn(() => undefined),
+    resolveProviderFollowupFallbackRoute: vi.fn(() => undefined),
+    resolveProviderHookPlugin: vi.fn(() => undefined),
+    resolveProviderPluginsForHooks: vi.fn(() => []),
     resolveProviderRuntimePlugin: vi.fn(() => undefined),
     resolveProviderRuntimePluginHandle: vi.fn((params: object) => params),
+    wrapProviderSimpleCompletionStreamFn: vi.fn(() => undefined),
     wrapProviderStreamFn: vi.fn(() => undefined),
   }));
   vi.doMock("../harness/runtime-plugin.js", () => ({
