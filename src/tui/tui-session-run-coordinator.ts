@@ -147,6 +147,16 @@ export class TuiSessionRunCoordinator {
     );
   }
 
+  clearSessionRunOwnership(runIds: Iterable<string>): void {
+    for (const runId of runIds) {
+      this.streamAssembler.drop(runId);
+    }
+    // Preserve terminal/persistence maps so a final envelope arriving after
+    // the idle snapshot remains displayable and deduplicated normally.
+    this.sessionRuns.clear();
+    this.confirmedStreamRunIds.clear();
+  }
+
   isHistoryTerminalDiagnosticRun(runId: string): boolean {
     return (
       this.finalizedRuns.has(runId) &&

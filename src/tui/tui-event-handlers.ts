@@ -434,7 +434,7 @@ export function createEventHandlers(context: EventHandlerContext) {
           void refreshSessionInfo?.();
         }
       }
-      flushPendingHistoryRefreshIfIdle();
+      flushPendingHistoryRefreshIfIdle(evt.activeRunIds);
       return;
     }
     if (evt.reason !== "new" && evt.reason !== "reset") {

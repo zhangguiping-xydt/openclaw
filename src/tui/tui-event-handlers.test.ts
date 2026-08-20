@@ -3609,6 +3609,8 @@ describe("tui-event-handlers: streaming watchdog", () => {
         rawHandlers.handleChatEvent(makeChatEvent(state, event)),
       handleAgentEvent: (event: Partial<AgentEvent>) =>
         rawHandlers.handleAgentEvent(makeAgentEvent(event)),
+      handleSessionsChangedEvent: (event: Partial<SessionChangedEvent>) =>
+        rawHandlers.handleSessionsChangedEvent({ sessionKey: state.currentSessionKey, ...event }),
     };
     return { state, chatLog, tui, setActivityStatus, loadHistory, noteLocalRunId, handlers };
   };
@@ -3658,6 +3660,76 @@ describe("tui-event-handlers: streaming watchdog", () => {
     expect(state.activeChatRunId).toBe("run-stuck");
     expect(setActivityStatus).not.toHaveBeenCalledWith("idle");
     expect(loadHistory).not.toHaveBeenCalled();
+
+    handlers.dispose?.();
+  });
+
+  it("clears stale activity and its watchdog notice when the Gateway proves the session idle", () => {
+    const { state, chatLog, setActivityStatus, handlers } = createHarness({
+      streamingWatchdogMs: 5_000,
+    });
+
+    handlers.handleChatEvent({
+      runId: "run-stale",
+      message: { content: "complete reply" },
+    });
+    state.activityStatus = "streaming";
+    vi.advanceTimersByTime(5_001);
+    expect(chatLog.addPendingSystem).toHaveBeenCalledWith("run-stale", expectedTimeoutMessage);
+
+    handlers.handleSessionsChangedEvent({
+      phase: "end",
+      runId: "run-terminal-event",
+      activeRunIds: [],
+    });
+
+    expect(state.activeChatRunId).toBeNull();
+    expect(state.activityStatus).toBe("idle");
+    expect(setActivityStatus).toHaveBeenLastCalledWith("idle");
+    expect(chatLog.dismissPendingSystem).toHaveBeenCalledWith("run-stale");
+
+    handlers.handleChatEvent({
+      runId: "run-terminal-event",
+      state: "final",
+      message: { content: [{ type: "text", text: "complete reply" }] },
+    });
+    expect(state.activeChatRunId).toBeNull();
+    expect(chatLog.finalizeAssistant).toHaveBeenCalledWith("complete reply", "run-terminal-event");
+
+    chatLog.addPendingSystem.mockClear();
+    vi.advanceTimersByTime(10_000);
+    expect(chatLog.addPendingSystem).not.toHaveBeenCalled();
+
+    handlers.dispose?.();
+  });
+
+  it.each([
+    { name: "a non-empty exact set", event: { activeRunIds: ["run-active"] } },
+    { name: "an identity tombstone", event: { activeRunIds: null } },
+    { name: "omitted identities", event: {} },
+  ])("preserves active state for $name", ({ event }) => {
+    const { state, chatLog, setActivityStatus, handlers } = createHarness({
+      streamingWatchdogMs: 5_000,
+    });
+
+    handlers.handleChatEvent({
+      runId: "run-active",
+      message: { content: "still running" },
+    });
+    state.activityStatus = "streaming";
+    setActivityStatus.mockClear();
+    chatLog.dismissPendingSystem.mockClear();
+
+    handlers.handleSessionsChangedEvent({
+      phase: "end",
+      runId: "run-other",
+      ...event,
+    });
+
+    expect(state.activeChatRunId).toBe("run-active");
+    expect(state.activityStatus).toBe("streaming");
+    expect(setActivityStatus).not.toHaveBeenCalledWith("idle");
+    expect(chatLog.dismissPendingSystem).not.toHaveBeenCalledWith("run-active");
 
     handlers.dispose?.();
   });

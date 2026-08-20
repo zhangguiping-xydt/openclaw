@@ -69,7 +69,25 @@ export function createTuiRunLifecycle(context: TuiRunLifecycleContext) {
   let streamingWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   let streamingWatchdogRunId: string | null = null;
 
-  const flushPendingHistoryRefreshIfIdle = () => {
+  const flushPendingHistoryRefreshIfIdle = (activeRunIds?: string[] | null) => {
+    // Only an explicit empty exact set proves idle; null or omitted identities
+    // can still hide another live owner and must preserve local run state.
+    if (Array.isArray(activeRunIds) && activeRunIds.length === 0) {
+      const staleRunIds = new Set(sessionRuns.keys());
+      if (state.activeChatRunId) {
+        staleRunIds.add(state.activeChatRunId);
+      }
+      runCoordinator.clearSessionRunOwnership(staleRunIds);
+      for (const runId of staleRunIds) {
+        chatLog.dismissPendingSystem(runId);
+      }
+      state.activeChatRunId = null;
+      reconnectPendingRunId = null;
+      state.activityStatus = "idle";
+      setActivityStatus("idle");
+      clearStreamingWatchdog();
+      tui.requestRender();
+    }
     if (state.activeChatRunId || hasPendingSubmit(state)) {
       return;
     }
