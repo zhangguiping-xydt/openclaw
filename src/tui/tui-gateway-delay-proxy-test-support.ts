@@ -8,6 +8,11 @@ type DelayedGatewayRpcRequest = {
   params?: Record<string, unknown>;
 };
 
+type GatewayEventFrame = {
+  event: string;
+  payload: unknown;
+};
+
 function decodeGatewayFrame(data: RawData): string {
   if (Array.isArray(data)) {
     return Buffer.concat(data).toString("utf8");
@@ -105,6 +110,97 @@ export async function startGatewayRpcDelayProxy(
     },
     release: (method: string) => gates.get(method)?.release.resolve(),
     stop: async () => {
+      for (const socket of sockets) {
+        socket.close();
+      }
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    },
+  };
+}
+
+export async function startGatewayEventDelayProxy(
+  targetUrl: string,
+  shouldDelay: (frame: GatewayEventFrame) => boolean,
+) {
+  const delayedSeen = createDeferred();
+  const releaseDelayed = createDeferred();
+  const delayedForwarded = createDeferred();
+  const events: GatewayEventFrame[] = [];
+  const sockets = new Set<WebSocket>();
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+
+  server.on("connection", (downstream) => {
+    const upstream = new WebSocket(targetUrl);
+    sockets.add(downstream);
+    sockets.add(upstream);
+    const queued: Array<{ data: RawData; isBinary: boolean }> = [];
+    upstream.on("open", () => {
+      for (const message of queued.splice(0)) {
+        upstream.send(message.data, { binary: message.isBinary });
+      }
+    });
+    downstream.on("message", (data, isBinary) => {
+      if (upstream.readyState === WebSocket.OPEN) {
+        upstream.send(data, { binary: isBinary });
+      } else {
+        queued.push({ data, isBinary });
+      }
+    });
+    upstream.on("message", (data, isBinary) => {
+      // Keep forwarding tasks independent so a later lifecycle snapshot can
+      // overtake the deliberately delayed terminal chat envelope.
+      void (async () => {
+        let delay = false;
+        try {
+          const frame = JSON.parse(decodeGatewayFrame(data)) as {
+            type?: unknown;
+            event?: unknown;
+            payload?: unknown;
+          };
+          if (frame.type === "event" && typeof frame.event === "string") {
+            const eventFrame = { event: frame.event, payload: frame.payload };
+            events.push(eventFrame);
+            delay = shouldDelay(eventFrame);
+          }
+        } catch {
+          // Forward malformed frames so the real TUI remains the protocol authority.
+        }
+        if (delay) {
+          delayedSeen.resolve();
+          await releaseDelayed.promise;
+        }
+        if (downstream.readyState === WebSocket.OPEN) {
+          downstream.send(data, { binary: isBinary });
+        }
+        if (delay) {
+          delayedForwarded.resolve();
+        }
+      })();
+    });
+    downstream.on("close", () => upstream.close());
+    upstream.on("close", () => downstream.close());
+    downstream.on("error", () => upstream.close());
+    upstream.on("error", () => downstream.close());
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Gateway event delay proxy did not bind");
+  }
+  return {
+    url: `ws://127.0.0.1:${address.port}`,
+    events,
+    waitForDelayed: async () => await delayedSeen.promise,
+    release: () => releaseDelayed.resolve(),
+    waitForForwarded: async () => await delayedForwarded.promise,
+    stop: async () => {
+      releaseDelayed.resolve();
       for (const socket of sockets) {
         socket.close();
       }

@@ -21,7 +21,10 @@ import { runExec } from "../process/exec.js";
 import { sleep } from "../utils/sleep.js";
 import { GatewayChatClient } from "./gateway-chat.js";
 import { extractTextFromMessage } from "./tui-formatters.js";
-import { startGatewayRpcDelayProxy } from "./tui-gateway-delay-proxy-test-support.js";
+import {
+  startGatewayEventDelayProxy,
+  startGatewayRpcDelayProxy,
+} from "./tui-gateway-delay-proxy-test-support.js";
 import { buildTuiLastSessionScopeKey, writeTuiLastSessionKey } from "./tui-last-session.js";
 import {
   synchronizedFrameRows,
@@ -50,6 +53,7 @@ type MockModelServer = {
 type MockModelBehavior = {
   replyText: string;
   holdFirstResponse?: boolean;
+  holdAfterText?: boolean;
   followupReplyText?: string;
   invalidEditLoop?: boolean;
 };
@@ -146,6 +150,15 @@ const GATEWAY_SCENARIOS = {
     toolsProfile: "minimal",
     replyText: "RECONNECTED_RUN_COMPLETE",
   },
+  idleSnapshot: {
+    agentId: SHARED_GATEWAY_AGENT_ID,
+    modelId: "tui-pty-idle-snapshot",
+    toolsProfile: "minimal",
+    replyText: "IDLE_SNAPSHOT_REPLY_COMPLETE",
+    followupReplyText: "POST_LATE_FINAL_REPLY_COMPLETE",
+    holdFirstResponse: true,
+    holdAfterText: true,
+  },
 } as const satisfies Record<string, GatewayScenario>;
 
 type GatewayScenarioId = keyof typeof GATEWAY_SCENARIOS;
@@ -204,6 +217,7 @@ async function writeResponsesSse(
   res: ServerResponse,
   text: string,
   completionGate?: Promise<void>,
+  holdAfterText = false,
 ) {
   const id = "msg_tui_pty_local";
   const events = [
@@ -258,7 +272,13 @@ async function writeResponsesSse(
     "cache-control": "no-store",
     connection: "keep-alive",
   });
-  res.write(`data: ${JSON.stringify(events[0])}\n\n`);
+  const preGateCount = holdAfterText ? 2 : 1;
+  res.write(
+    events
+      .slice(0, preGateCount)
+      .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+      .join(""),
+  );
   if (completionGate) {
     await completionGate;
   }
@@ -266,7 +286,7 @@ async function writeResponsesSse(
     return;
   }
   const completionBody = `${events
-    .slice(1)
+    .slice(preGateCount)
     .map((event) => `data: ${JSON.stringify(event)}\n\n`)
     .join("")}data: [DONE]\n\n`;
   res.end(completionBody);
@@ -368,6 +388,7 @@ async function startRoutedMockModelServer(
               ? behavior.replyText
               : (behavior.followupReplyText ?? behavior.replyText),
             requestIndex === 0 ? firstResponseGates.get(modelId)?.promise : undefined,
+            behavior.holdAfterText,
           );
           return;
         }
@@ -730,6 +751,7 @@ async function startSharedGatewayFixture(): Promise<SharedGatewayFixture> {
             replyText: scenario.replyText,
             holdFirstResponse: scenario.holdFirstResponse,
             followupReplyText: scenario.followupReplyText,
+            holdAfterText: scenario.holdAfterText,
             invalidEditLoop: scenario.invalidEditLoop,
           },
         ]),
@@ -2193,6 +2215,145 @@ export default {
           await externalClient?.stopAndWait({ timeoutMs: 1_000 });
         } finally {
           await fixture.cleanup();
+        }
+      }
+    },
+    LOCAL_TEST_TIMEOUT_MS,
+  );
+
+  registerGatewayTest(
+    "returns to idle from an exact Gateway snapshot before a late final",
+    async ({ onTestFinished }) => {
+      const shared = await requireSharedGatewayFixture();
+      const scenario = GATEWAY_SCENARIOS.idleSnapshot;
+      const sessionKey = `agent:${scenario.agentId}:tui-pty-idle-snapshot-${++gatewaySessionSequence}`;
+      const requestOffset = shared.mockModel.requests(scenario.modelId).length;
+      await shared.controlClient.createSession({ key: sessionKey, agentId: scenario.agentId });
+      await shared.controlClient.patchSession({
+        key: sessionKey,
+        agentId: scenario.agentId,
+        model: `tui-pty-mock/${scenario.modelId}`,
+      });
+
+      const proxy = await startGatewayEventDelayProxy(shared.gateway.url, ({ event, payload }) => {
+        const chat = payload as { sessionKey?: unknown; state?: unknown } | null;
+        return event === "chat" && chat?.sessionKey === sessionKey && chat.state === "final";
+      });
+      const cleanupProxy = registerIdempotentCleanup(onTestFinished, proxy.stop);
+      const attached = await startIsolatedGatewayPty({
+        gateway: shared.gateway,
+        registerCleanup: onTestFinished,
+        sessionKey,
+        url: proxy.url,
+      });
+      const watchdogMarker = "This response is taking longer than expected.";
+      try {
+        await attached.run.waitForOutput("gateway connected", LOCAL_STARTUP_TIMEOUT_MS);
+        await attached.run.write("prove exact idle snapshot recovery\r");
+        await waitFor({
+          timeoutMs: LOCAL_OUTPUT_TIMEOUT_MS,
+          read: () =>
+            shared.mockModel.requests(scenario.modelId).length === requestOffset + 1 ? true : null,
+          onTimeout: () => new Error("idle-snapshot prompt did not reach the mock model"),
+        });
+        await attached.run.waitForOutput(scenario.replyText, LOCAL_OUTPUT_TIMEOUT_MS);
+        const watchdogFrame = await waitForSynchronizedFrameRows(
+          attached.run,
+          (rows) =>
+            rows.some((row) => row.includes(watchdogMarker)) &&
+            rows.some((row) => row.includes("streaming") && row.includes("| connected")),
+          LOCAL_OUTPUT_TIMEOUT_MS,
+        );
+
+        shared.mockModel.releaseFirstResponse(scenario.modelId);
+        await proxy.waitForDelayed();
+        await waitFor({
+          timeoutMs: LOCAL_OUTPUT_TIMEOUT_MS,
+          read: () =>
+            proxy.events.some(({ event, payload }) => {
+              const session = payload as {
+                activeRunIds?: unknown;
+                phase?: unknown;
+                sessionKey?: unknown;
+              } | null;
+              return (
+                event === "sessions.changed" &&
+                session?.sessionKey === sessionKey &&
+                session.phase === "end" &&
+                Array.isArray(session.activeRunIds) &&
+                session.activeRunIds.length === 0
+              );
+            })
+              ? true
+              : null,
+          onTimeout: () => new Error("Gateway did not publish an exact empty active-run snapshot"),
+        });
+        const idleBeforeFinal = await waitForSynchronizedFrameRows(
+          attached.run,
+          (rows) =>
+            rows.some((row) => row.includes(scenario.replyText)) &&
+            rows.some((row) => row.includes("| idle")) &&
+            !rows.some((row) => row.includes(watchdogMarker)),
+          LOCAL_OUTPUT_TIMEOUT_MS,
+        );
+
+        proxy.release();
+        await proxy.waitForForwarded();
+        await sleep(SUBMISSION_SETTLE_MS);
+        const finalFrame = await waitForSynchronizedFrameRows(
+          attached.run,
+          (rows) =>
+            rows.some((row) => row.includes(scenario.replyText)) &&
+            rows.some((row) => row.includes("| idle")) &&
+            !rows.some((row) => row.includes(watchdogMarker)),
+          LOCAL_OUTPUT_TIMEOUT_MS,
+        );
+        await attached.run.write("turn after delayed final\r");
+        await waitFor({
+          timeoutMs: LOCAL_OUTPUT_TIMEOUT_MS,
+          read: () =>
+            shared.mockModel.requests(scenario.modelId).length === requestOffset + 2 ? true : null,
+          onTimeout: () => new Error("TUI did not accept a turn after the delayed final"),
+        });
+        await attached.run.waitForOutput(scenario.followupReplyText, LOCAL_OUTPUT_TIMEOUT_MS);
+        const followupFrame = await waitForSynchronizedFrameRows(
+          attached.run,
+          (rows) =>
+            rows.some((row) => row.includes(scenario.followupReplyText)) &&
+            rows.some((row) => row.includes("| idle")) &&
+            !rows.some((row) => row.includes(watchdogMarker)),
+          LOCAL_OUTPUT_TIMEOUT_MS,
+        );
+        console.info(
+          "[behavior-evidence] tui-real-gateway-idle-before-late-final",
+          JSON.stringify({
+            terminal: "real PTY",
+            transport: "real Gateway WebSocket",
+            watchdogVisibleBeforeCompletion: watchdogFrame.some((row) =>
+              row.includes(watchdogMarker),
+            ),
+            busyBeforeCompletion: watchdogFrame.some(
+              (row) => row.includes("streaming") && row.includes("| connected"),
+            ),
+            idleBeforeLateFinal: idleBeforeFinal.some((row) => row.includes("| idle")),
+            lateFinalForwarded: true,
+            replyVisibleAfterLateFinal: finalFrame.some((row) => row.includes(scenario.replyText)),
+            watchdogClearedAfterLateFinal: !finalFrame.some((row) =>
+              row.includes(watchdogMarker),
+            ),
+            postLateFinalTurnCompleted: followupFrame.some((row) =>
+              row.includes(scenario.followupReplyText),
+            ),
+          }),
+        );
+      } finally {
+        shared.mockModel.releaseFirstResponse(scenario.modelId);
+        proxy.release();
+        try {
+          await shared.controlClient.abortChat({ sessionKey });
+        } finally {
+          await attached.cleanup();
+          await cleanupProxy();
         }
       }
     },
