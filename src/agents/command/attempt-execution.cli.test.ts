@@ -33,10 +33,8 @@ import { clearRuntimeAuthProfileStoreSnapshots } from "../auth-profiles/runtime-
 import { saveAuthProfileStore } from "../auth-profiles/store.js";
 import { testing as cliBackendsTesting } from "../cli-backends.test-support.js";
 import { createCronCreatorAuthorityCapability } from "../cron-creator-authority-context.js";
+import { createDeferredEmbeddedRunLifecycleManager } from "../embedded-agent-runner/run/deferred-lifecycle-owner.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent.js";
-import {
-  createDeferredEmbeddedRunLifecycleManager,
-} from "../embedded-agent-runner/run/deferred-lifecycle-owner.js";
 import { FailoverError } from "../failover-error.js";
 import { attachToolAllowlistIntersection } from "../tool-policy.js";
 import {
