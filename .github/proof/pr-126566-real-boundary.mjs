@@ -1,24 +1,21 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { runQaSuite } from "../../extensions/qa-lab/src/suite-launch.runtime.ts";
 
-const exactHead = execFileSync("/usr/bin/git", ["rev-parse", "HEAD^"], {
-  encoding: "utf8",
-}).trim();
-if (exactHead !== process.env.EXPECTED_PR_HEAD) {
-  throw new Error(`expected PR head ${process.env.EXPECTED_PR_HEAD}, got ${exactHead}`);
+const exactHead = process.env.EXPECTED_PR_HEAD?.trim();
+if (!exactHead || !/^[0-9a-f]{40}$/u.test(exactHead)) {
+  throw new Error("EXPECTED_PR_HEAD must be a full commit SHA");
 }
+execFileSync("/usr/bin/git", ["merge-base", "--is-ancestor", exactHead, "HEAD"]);
 
-const outputDir = path.resolve(".artifacts/issue-126311-real-boundary-proof");
+const outputDir = path.resolve(".artifacts/issue-126311-embedded-fallback-proof");
 const primaryModel = "mock-openai/gpt-5.6-luna";
 const operatorModel = "mock-openai/gpt-5.6-luna-alt";
-const fallbackModel = "proof-cli/fallback";
-const cliPluginId = "pr-126566-proof-cli";
-const cliPluginDir = path.resolve(".github/proof/pr-126566-cli-backend-fixture");
+const fallbackModel = "mock-openai/gpt-5.6-luna-alt";
 const requestTrace = [];
 let requestSeq = 0;
 let upstreamBaseUrl;
@@ -116,7 +113,8 @@ const proxy = http.createServer(async (req, res) => {
         hasToolOutput,
         httpStatus: upstreamResponse.status,
         outcome: upstreamResponse.ok ? "provider-response" : "provider-error",
-        returnedTerminalMarker: responseText.includes(
+        returnedFallbackMarker: responseText.includes("QA-SUBAGENT-TERMINAL-FALLBACK-OK"),
+        returnedMetadataSentinel: responseText.includes(
           "QA-SUBAGENT-TERMINAL-INTERNAL-MUST-NOT-LEAK",
         ),
       });
@@ -184,19 +182,6 @@ try {
       }
       gatewayTempRoot = path.dirname(workspace);
       const modelSelection = { primary: primaryModel, fallbacks: [fallbackModel] };
-      cfg.plugins = {
-        ...cfg.plugins,
-        enabled: true,
-        allow: [...new Set([...(cfg.plugins?.allow ?? []), cliPluginId])],
-        load: {
-          ...cfg.plugins?.load,
-          paths: [...new Set([...(cfg.plugins?.load?.paths ?? []), cliPluginDir])],
-        },
-        entries: {
-          ...cfg.plugins?.entries,
-          [cliPluginId]: { enabled: true },
-        },
-      };
       cfg.agents.defaults.subagents = {
         ...cfg.agents.defaults.subagents,
         model: modelSelection,
@@ -235,12 +220,6 @@ if (!fallbackVerdict) {
 }
 
 const stateDbPath = path.join(gatewayTempRoot, "state", "state", "openclaw.sqlite");
-const cliMarkerPath = path.join(
-  gatewayTempRoot,
-  "state",
-  "pr-126566-proof-cli-child.json",
-);
-const cliMarker = JSON.parse(await readFile(cliMarkerPath, "utf8"));
 const stateDb = new DatabaseSync(stateDbPath, { readOnly: true });
 const taskRows = stateDb
   .prepare(
@@ -292,14 +271,22 @@ const trajectory = trajectoryRows.map((row) => {
   const data = event && typeof event.data === "object" && event.data ? event.data : {};
   return {
     seq: Number(row.seq),
+    runIdHash: hashId(typeof row.run_id === "string" ? row.run_id : undefined),
     type: String(event.type ?? "unknown"),
-    provider: typeof data.provider === "string" ? data.provider : undefined,
-    model:
-      typeof data.model === "string"
-        ? data.model
-        : typeof data.modelId === "string"
-          ? data.modelId
+    provider:
+      typeof event.provider === "string"
+        ? event.provider
+        : typeof data.provider === "string"
+          ? data.provider
           : undefined,
+    model:
+      typeof event.modelId === "string"
+        ? event.modelId
+        : typeof data.model === "string"
+          ? data.model
+          : typeof data.modelId === "string"
+            ? data.modelId
+            : undefined,
     status: typeof data.status === "string" ? data.status : undefined,
     terminalError: typeof data.terminalError === "string" ? data.terminalError : undefined,
     stopReason: typeof data.stopReason === "string" ? data.stopReason : undefined,
@@ -315,9 +302,26 @@ const terminalTrajectory = trajectory.filter((event) => event.type === "session.
 const failedEmbeddedCompletions = trajectory.filter(
   (event) => event.type === "model.completed" && event.stopReason === "error",
 );
+const successfulFallbackCompletions = trajectory.filter(
+  (event) =>
+    event.type === "model.completed" &&
+    event.provider === "mock-openai" &&
+    event.model === "gpt-5.6-luna-alt" &&
+    event.stopReason !== "error",
+);
 const injectedFailures = requestTrace.filter(
   (event) => event.model === primaryModel && event.httpStatus === 503,
 );
+const fallbackResponses = requestTrace.filter(
+  (event) =>
+    event.model === fallbackModel &&
+    event.httpStatus === 200 &&
+    event.outcome === "provider-response" &&
+    event.returnedFallbackMarker === true,
+);
+const winningTerminal = terminalTrajectory[0];
+const failedCompletionSeq = failedEmbeddedCompletions[0]?.seq;
+const fallbackCompletionSeq = successfulFallbackCompletions[0]?.seq;
 
 const assertions = {
   scenarioPassed: scenario.status === "pass",
@@ -327,13 +331,25 @@ const assertions = {
   deliverySettled: task.delivery_status === "delivered",
   taskEnded: typeof task.ended_at === "number" && task.ended_at > 0,
   primaryFailureObserved: injectedFailures.length >= 1,
-  cliMarkerSchema: cliMarker.schema === "openclaw-pr-126566-proof-cli-v1",
-  cliChildStarted: typeof cliMarker.pid === "number" && cliMarker.pid > 0,
-  cliChildReceivedPrompt: typeof cliMarker.stdinBytes === "number" && cliMarker.stdinBytes > 0,
-  cliChildReturnedFallbackMarker:
-    cliMarker.responseMarker === "QA-SUBAGENT-TERMINAL-FALLBACK-OK",
+  embeddedFallbackResponseObserved: fallbackResponses.length === 1,
+  embeddedFallbackReturnedProtectedMetadata:
+    fallbackResponses[0]?.returnedMetadataSentinel === true,
   failedEmbeddedAttemptRecorded: failedEmbeddedCompletions.length === 1,
-  failedEmbeddedOwnerDiscarded: terminalTrajectory.length === 0,
+  embeddedFallbackAttemptRecorded: successfulFallbackCompletions.length === 1,
+  fallbackReplacedPrimaryOwner:
+    typeof failedCompletionSeq === "number" &&
+    typeof fallbackCompletionSeq === "number" &&
+    fallbackCompletionSeq > failedCompletionSeq,
+  exactlyOneWinningTerminalTrajectory:
+    terminalTrajectory.length === 1 &&
+    winningTerminal?.provider === "mock-openai" &&
+    winningTerminal.model === "gpt-5.6-luna-alt" &&
+    winningTerminal.status === "success" &&
+    winningTerminal.terminalError === undefined,
+  failedPrimaryOwnerDiscarded:
+    !terminalTrajectory.some(
+      (event) => event.provider === "mock-openai" && event.model === "gpt-5.6-luna",
+    ),
   exactlyOneSuccessfulTaskLifecycle:
     taskRows.length === 1 &&
     task.status === "succeeded" &&
@@ -348,7 +364,7 @@ const assertions = {
 };
 
 const evidence = {
-  schema: "openclaw-real-boundary-cli-fallback-proof-v3",
+  schema: "openclaw-real-boundary-embedded-fallback-proof-v1",
   exactHead,
   issue: 126311,
   pr: 126566,
@@ -357,7 +373,7 @@ const evidence = {
     credentials: "none",
     transport: "real loopback HTTP OpenAI Responses boundary",
     gateway: "ephemeral production Gateway child",
-    cliFallback: "real Node child process through a startup-loaded CLI backend plugin",
+    embeddedFallback: "second embedded model through the production fallback coordinator",
     ingress: "qa-channel",
     taskStore: "SQLite task_runs",
     trajectoryStore: "per-agent SQLite trajectory_runtime_events",
@@ -384,17 +400,19 @@ const evidence = {
     terminalOutcome: task.terminal_outcome,
     terminalDeliveryCount: fallbackVerdict.actualTerminalSendCount,
   },
-  cliFallback: {
-    backend: "proof-cli",
-    model: "fallback",
-    childProcessStarted: typeof cliMarker.pid === "number" && cliMarker.pid > 0,
-    stdinBytes: cliMarker.stdinBytes,
-    responseMarker: cliMarker.responseMarker,
-  },
   embeddedOwnerHandoff: {
     trajectory,
     failedModelCompletionCount: failedEmbeddedCompletions.length,
-    staleSessionEndedCount: terminalTrajectory.length,
+    fallbackModelCompletionCount: successfulFallbackCompletions.length,
+    sessionEndedCount: terminalTrajectory.length,
+    winningTerminal: winningTerminal
+      ? {
+          provider: winningTerminal.provider,
+          model: winningTerminal.model,
+          status: winningTerminal.status,
+          terminalError: winningTerminal.terminalError,
+        }
+      : null,
   },
   assertions,
   qaArtifacts: {
