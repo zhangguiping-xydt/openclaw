@@ -217,7 +217,7 @@ function createTurnParams(params: {
       sessionFile: params.sessionFile,
       workspaceDir: params.workspaceDir,
       config: params.config,
-      skillsSnapshot: {},
+      skillsSnapshot: { prompt: "", skills: [] },
       provider: "openai",
       model: "transport-primary",
       verboseLevel: "off",
