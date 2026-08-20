@@ -32,8 +32,7 @@ const cliFixtureScript = [
 ].join("");
 
 let executeAgentTurn: typeof import("./agent-runner-execution.js").executeAgentTurn;
-let isEmbeddedAgentRunHandleActive:
-  typeof import("../../agents/embedded-agent.js").isEmbeddedAgentRunHandleActive;
+let isEmbeddedAgentRunHandleActive: typeof import("../../agents/embedded-agent.js").isEmbeddedAgentRunHandleActive;
 let onAgentEvent: typeof import("../../infra/agent-events.js").onAgentEvent;
 let resetAgentEventsForTest: typeof import("../../infra/agent-events.js").resetAgentEventsForTest;
 let clearRuntimeConfigSnapshot: typeof import("../../config/config.js").clearRuntimeConfigSnapshot;
