@@ -113,8 +113,8 @@ async function createRetryableFailureResponsesServer(): Promise<{
       response.end(
         JSON.stringify({
           error: {
-            code: "server_error",
-            message: "primary transport failed for fallback proof",
+            code: "server_is_overloaded",
+            message: "primary transport overloaded for fallback proof",
           },
         }),
       );
@@ -361,7 +361,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
       }
       expect(result.outcome.result.meta.error).toBeUndefined();
       expect(JSON.stringify(result.outcome.result.payloads)).not.toContain(
-        "primary transport failed for fallback proof",
+        "primary transport overloaded for fallback proof",
       );
       const lifecyclePhases = events
         .filter((event) => event.stream === "lifecycle")
