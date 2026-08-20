@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { SessionCreatedActor } from "../../packages/gateway-protocol/src/index.js";
 import { resetProviderAuthAliasMapCacheForTest } from "../agents/provider-auth-aliases.test-support.js";
 import type { OpenClawConfig } from "../config/config.js";
-import type { InternalSessionEntry, SessionEntry } from "../config/sessions.js";
+import type { SessionEntry } from "../config/sessions.js";
 import type { PluginManifestRecord } from "../plugins/manifest-registry.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
@@ -1230,6 +1230,43 @@ describe("gateway sessions patch", () => {
     expect(entry.thinkingLevel).toBe("medium");
   });
 
+  test("rejects thinking levels forbidden by the concrete runtime policy", async () => {
+    providerThinkingMocks.resolveProviderThinkingProfile.mockImplementation(({ provider }) =>
+      provider === "claude-cli"
+        ? { levels: [{ id: "off" }], defaultLevel: "off" }
+        : {
+            levels: [{ id: "minimal" }, { id: "medium" }, { id: "adaptive" }],
+            defaultLevel: "adaptive",
+            preserveWhenCatalogReasoningFalse: true,
+          },
+    );
+
+    const result = await runPatch({
+      cfg: {
+        agents: {
+          defaults: {
+            model: { primary: "anthropic/claude-mythos-5" },
+          },
+        },
+      } as OpenClawConfig,
+      patch: {
+        key: MAIN_SESSION_KEY,
+        thinkingLevel: "medium",
+      },
+      loadGatewayModelCatalog: async () => [
+        {
+          provider: "anthropic",
+          id: "claude-mythos-5",
+          name: "Claude Mythos 5",
+          reasoning: false,
+          thinkingPolicyProvider: "claude-cli",
+        },
+      ],
+    });
+
+    expectPatchError(result, 'thinkingLevel "medium" is not supported');
+  });
+
   test("accepts xhigh thinking patches from configured catalog compat", async () => {
     const entry = expectPatchOk(
       await runPatch({
@@ -1330,12 +1367,6 @@ describe("gateway sessions patch", () => {
     );
 
     expect(entry.thinkingLevel).toBe("ultra");
-    expect((entry as InternalSessionEntry).thinkingLevelSelection).toEqual({
-      provider: "openai",
-      model: "gpt-5.6-luna",
-      agentRuntime: "openclaw",
-      level: "ultra",
-    });
   });
 
   test("remaps stored Ultra to Max when a model patch selects Codex Luna", async () => {
@@ -1358,12 +1389,6 @@ describe("gateway sessions patch", () => {
     );
 
     expect(entry.thinkingLevel).toBe("max");
-    expect((entry as InternalSessionEntry).thinkingLevelSelection).toEqual({
-      provider: "openai",
-      model: "gpt-5.6-luna",
-      agentRuntime: "codex",
-      level: "max",
-    });
   });
 
   test("honors an explicit OpenClaw session runtime override for Luna Ultra", async () => {

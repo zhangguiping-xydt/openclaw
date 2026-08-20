@@ -2512,12 +2512,6 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
       return entry?.thinkingLevel === "medium";
     })?.[0] as { entry?: Record<string, unknown> } | undefined;
     expect(touchWrite?.entry?.lastInteractionAt).toBeDefined();
-    expectRecordFields(touchWrite?.entry?.thinkingLevelSelection, {
-      provider: "anthropic",
-      model: "claude",
-      agentRuntime: "openclaw",
-      level: "medium",
-    });
     expect(state.updateSessionStoreAfterAgentRunMock).toHaveBeenCalledTimes(1);
   });
 
@@ -4958,15 +4952,18 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
     expect(transcriptParams.transcriptBody).not.toContain(INTERNAL_RUNTIME_CONTEXT_END);
   });
 
-  it("marks ACP execution start when the prompt is submitted", async () => {
+  it("marks ACP execution start before prompt submission", async () => {
     setupAcpSession();
     const onExecutionStarted = vi.fn();
     state.acpRunTurnMock.mockImplementationOnce(async (params: unknown) => {
       const callbacks = params as {
+        onBeforePrompt?: () => void;
         onLifecycle?: (event: { type: string; at: number }) => void;
         onEvent?: (event: unknown) => void;
       };
       expect(onExecutionStarted).not.toHaveBeenCalled();
+      callbacks.onBeforePrompt?.();
+      expect(onExecutionStarted).toHaveBeenCalledOnce();
       callbacks.onLifecycle?.({ type: "prompt_submitted", at: Date.now() });
       callbacks.onEvent?.({ type: "done", stopReason: "end_turn" });
     });
