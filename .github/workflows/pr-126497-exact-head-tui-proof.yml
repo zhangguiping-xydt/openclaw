@@ -1,0 +1,49 @@
+name: PR 126497 exact-head TUI proof
+
+on:
+  push:
+    branches:
+      - ci/pr-126497-tui-proof
+
+permissions:
+  contents: read
+
+jobs:
+  tui-proof:
+    name: Real Gateway and PTY idle recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout proof commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Verify PR source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="4e25d933b7a041e9d36be5e4d02f3c49934a2ad1"
+          test "$(git rev-parse HEAD^)" = "$expected_sha"
+          git diff --exit-code "$expected_sha" HEAD -- . \
+            ':(exclude).github/workflows/pr-126497-exact-head-tui-proof.yml'
+          echo "[proof-source] $expected_sha"
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          use-actions-cache: "true"
+
+      - name: Run focused real Gateway and PTY regression
+        env:
+          CI: "true"
+          OPENCLAW_BEHAVIOR_EVIDENCE: "1"
+          OPENCLAW_TUI_PTY_INCLUDE_LOCAL: "1"
+          OPENCLAW_VITEST_MAX_WORKERS: "1"
+        run: |
+          node scripts/run-vitest.mjs run \
+            --config test/vitest/vitest.tui-pty.config.ts \
+            src/tui/tui-pty-local.e2e.test.ts \
+            --testNamePattern "returns to idle from an exact Gateway snapshot before a late final"
