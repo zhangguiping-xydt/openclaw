@@ -37,6 +37,7 @@ import {
   resolveTerminalAssistantTexts,
 } from "./attempt-trajectory-status.js";
 import { shouldFlagCompactionTimeout } from "./compaction-timeout.js";
+import type { EmbeddedAttemptDeferredLifecycleOwner } from "./deferred-lifecycle-owner.js";
 import { resolveFinalAssistantVisibleText } from "./helpers.js";
 import {
   isEmbeddedRunTerminalInterrupted,
@@ -51,6 +52,7 @@ import type {
 type FinalizeEmbeddedAttemptParams = {
   result: EmbeddedRunAttemptResult;
   trajectoryRecorder?: EmbeddedRunAttemptTrajectoryRecorder | null;
+  deferredLifecycleOwner?: EmbeddedAttemptDeferredLifecycleOwner;
   synthesizedPayloadCount: number;
   emptyAssistantReplyIsSilent: boolean;
   hasTerminalOutput: boolean;
@@ -157,7 +159,7 @@ export function finalizeEmbeddedAttempt(
       lastToolError: result.lastToolError,
     }),
   );
-  trajectoryRecorder.recordEvent("session.ended", {
+  const sessionEndData = {
     status: terminal.status,
     aborted: terminalState.aborted,
     externalAbort: terminalState.externalAbort,
@@ -169,7 +171,12 @@ export function finalizeEmbeddedAttempt(
     promptError,
     terminalError: terminal.terminalError,
     stopReason,
-  });
+  };
+  if (params.deferredLifecycleOwner) {
+    params.deferredLifecycleOwner.recordSessionEnd(sessionEndData);
+  } else {
+    trajectoryRecorder.recordEvent("session.ended", sessionEndData);
+  }
 
   return result;
 }

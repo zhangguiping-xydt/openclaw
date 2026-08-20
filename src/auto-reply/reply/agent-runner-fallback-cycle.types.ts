@@ -1,4 +1,5 @@
 import type { PreparedAgentRunAdmission } from "../../agents/admitted-run-context.js";
+import type { DeferredEmbeddedRunLifecycleManager } from "../../agents/embedded-agent-runner/run/deferred-lifecycle-owner.js";
 import type { RunEmbeddedAgentParams } from "../../agents/embedded-agent-runner/run/params.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -19,6 +20,7 @@ export type AgentFallbackCycleState = {
   attemptedRuntimeProvider: string;
   attemptedRuntimeModel: string;
   bootstrapPromptWarningSignaturesSeen: string[];
+  deferredLifecycle: DeferredEmbeddedRunLifecycleManager;
   pendingLifecycleTerminal?: {
     provider: string;
     model: string;

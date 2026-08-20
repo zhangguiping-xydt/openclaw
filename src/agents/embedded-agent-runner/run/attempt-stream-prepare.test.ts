@@ -487,6 +487,65 @@ describe("prepareEmbeddedAttemptStream", () => {
     expect(prepared.queueHandle.isAborted?.()).toBe(true);
   });
 
+  it("transfers active-run cleanup when terminal lifecycle is deferred", async () => {
+    let deferredOwner:
+      | {
+          discard: () => void;
+        }
+      | undefined;
+    prepareEmbeddedAttemptStream({
+      attempt: {
+        runId: "run-deferred-lifecycle",
+        sessionId: "session-deferred-lifecycle",
+        sessionKey: "agent:main:deferred-lifecycle",
+        deferTerminalLifecycle: true,
+        onDeferredLifecycleOwner: (owner: { discard: () => void }) => {
+          deferredOwner = owner;
+        },
+      } as never,
+      activeSession: { agent: {}, isStreaming: false } as never,
+      hookRunner: undefined as never,
+      hookAgentId: "main",
+      diagnosticTrace: {} as never,
+      diagnosticOwner: {} as never,
+      clientToolCallSlots: [],
+      toolSearchTargetTranscriptProjections: [],
+      isReplaySafeTool: () => false,
+      runAbortController: new AbortController(),
+      abortRun: vi.fn(),
+      markExternalAbort: vi.fn(),
+      getRunState: () => ({
+        aborted: false,
+        promptError: undefined,
+        timedOut: false,
+        yieldDetected: false,
+      }),
+      hasDeliveredSourceReply: () => false,
+      markSourceReplyDelivered: vi.fn(),
+      onBlockReply: vi.fn(),
+      onBlockReplyFlush: vi.fn(),
+      sandboxSessionKey: "agent:main:deferred-lifecycle",
+      builtinToolNames: new Set(),
+      replaySafeToolNames: new Set(),
+    });
+
+    const subscriptionParams = mocks.subscribe.mock.calls.at(-1)?.[0] as
+      | { onBeforeLifecycleTerminal?: () => void | Promise<void> }
+      | undefined;
+    await subscriptionParams?.onBeforeLifecycleTerminal?.();
+
+    expect(deferredOwner).toBeDefined();
+    expect(mocks.clearActiveRun).not.toHaveBeenCalled();
+
+    deferredOwner?.discard();
+    expect(mocks.clearActiveRun).toHaveBeenCalledWith(
+      "session-deferred-lifecycle",
+      expect.objectContaining({ runId: "run-deferred-lifecycle" }),
+      "agent:main:deferred-lifecycle",
+      undefined,
+    );
+  });
+
   it("processes aliased cancel and abort through one external-abort sequence", () => {
     const markExternalAbort = vi.fn();
     const onAttemptAbort = vi.fn();

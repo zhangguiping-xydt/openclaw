@@ -100,6 +100,7 @@ export async function runEmbeddedFallbackCandidate(params: {
   presentation: EmbeddedPresentation;
   timing: AgentTurnTimingTracker;
   onLifecycleBackstop: (backstop: AgentLifecycleTerminalBackstop) => void;
+  onDeferredLifecycleOwner: NonNullable<RunEmbeddedAgentParams["onDeferredLifecycleOwner"]>;
   onCompactionCount: (count: number) => void;
 }): Promise<{
   result: Awaited<ReturnType<typeof runEmbeddedAgent>>;
@@ -281,6 +282,7 @@ export async function runEmbeddedFallbackCandidate(params: {
         abortSignal: params.runAbortSignal,
         replyOperation: turn.replyOperation,
         deferTerminalLifecycle: true,
+        onDeferredLifecycleOwner: params.onDeferredLifecycleOwner,
         onExecutionStarted: (info) => {
           if (info?.lifecycleGeneration) {
             params.onLifecycleGeneration(info.lifecycleGeneration);

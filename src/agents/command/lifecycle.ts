@@ -101,6 +101,22 @@ export function createAgentCommandLifecycle(params: {
   };
 
   return {
+    emitBasicError(error: string) {
+      if (params.state.lifecycleEnded) {
+        return;
+      }
+      emitAgentEvent({
+        runId: params.runId,
+        lifecycleGeneration: params.lifecycleGeneration(),
+        stream: "lifecycle",
+        data: {
+          phase: "error",
+          startedAt: params.startedAt,
+          endedAt: Date.now(),
+          error: formatErrorMessage(error),
+        },
+      });
+    },
     emitFinishing(terminal: EmbeddedAgentRunEntryTerminal) {
       if (
         params.state.lifecycleEnded ||

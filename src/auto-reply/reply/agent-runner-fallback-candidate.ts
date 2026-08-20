@@ -263,6 +263,7 @@ export async function runAgentFallbackCandidates(params: AgentFallbackCycleParam
           onLifecycleBackstop: (backstop: AgentLifecycleTerminalBackstop) => {
             params.state.pendingLifecycleTerminal = { provider, model, backstop };
           },
+          onDeferredLifecycleOwner: params.state.deferredLifecycle.adopt,
         };
         if (runtime.useCliExecution) {
           const candidate = await runCliFallbackCandidate({

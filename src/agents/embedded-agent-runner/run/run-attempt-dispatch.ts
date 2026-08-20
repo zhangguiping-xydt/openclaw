@@ -459,6 +459,7 @@ export async function dispatchEmbeddedRunAttempt(input: {
     onAgentEvent: control.onAgentEvent,
     // Normalize the shipped harness alias once; attempt internals consume only the canonical flag.
     deferTerminalLifecycle: params.deferTerminalLifecycle ?? params.deferTerminalLifecycleEnd,
+    onDeferredLifecycleOwner: params.onDeferredLifecycleOwner,
     onExecutionPhase: params.onExecutionPhase,
     extraSystemPrompt,
     sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,

@@ -93,6 +93,7 @@ export async function finalizeEmbeddedAgentCommand(params: {
     userTurnTranscriptRecorder,
     fallbackTrajectoryRecorder,
     lifecycle,
+    deferredLifecycle,
     terminal,
     lifecycleGeneration,
   } = params.attempt;
@@ -507,10 +508,14 @@ export async function finalizeEmbeddedAgentCommand(params: {
       }
     }
 
-    if (fallbackExhausted || lifecycle.resolveResultError(result, false)) {
-      lifecycle.emitResultError(result, fallbackExhausted, terminal);
-    } else {
-      lifecycle.emitEnd(terminal);
+    try {
+      if (fallbackExhausted || lifecycle.resolveResultError(result, false)) {
+        lifecycle.emitResultError(result, fallbackExhausted, terminal);
+      } else {
+        lifecycle.emitEnd(terminal);
+      }
+    } finally {
+      await deferredLifecycle.complete();
     }
     return {
       deliveryResult,
@@ -519,7 +524,11 @@ export async function finalizeEmbeddedAgentCommand(params: {
       sessionReboundDuringRun,
     };
   } catch (error) {
-    lifecycle.emitPostTurnError(error, terminal);
+    try {
+      lifecycle.emitPostTurnError(error, terminal);
+    } finally {
+      await deferredLifecycle.complete();
+    }
     throw error;
   }
 }

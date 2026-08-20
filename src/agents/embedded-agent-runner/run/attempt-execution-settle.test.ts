@@ -403,6 +403,31 @@ describe("runEmbeddedAttemptSettledPhase", () => {
     );
   });
 
+  it("leaves active-run cleanup with a deferred logical-turn owner", async () => {
+    const fixture = createFixture();
+    const deferredLifecycleOwner = {
+      complete: vi.fn(async () => undefined),
+      discard: vi.fn(),
+      recordSessionEnd: vi.fn(),
+    };
+    fixture.input.preparedStreamRuntime.stream.deferredLifecycleOwner = deferredLifecycleOwner;
+
+    await runEmbeddedAttemptSettledPhase(fixture.input);
+
+    expect(mocks.clearActiveEmbeddedRun).not.toHaveBeenCalled();
+    expect(fixture.order).toEqual([
+      "prompt",
+      "finalize",
+      "clear-timers",
+      "unsubscribe",
+      "detach-backend",
+      "result",
+    ]);
+    expect(mocks.completeResult).toHaveBeenCalledWith(
+      expect.objectContaining({ deferredLifecycleOwner }),
+    );
+  });
+
   it("persists image failure notes after after-turn transcript reconciliation", async () => {
     const fixture = createFixture();
     fixture.sessionRuntimeState.currentTurnImageFailureCount = 1;

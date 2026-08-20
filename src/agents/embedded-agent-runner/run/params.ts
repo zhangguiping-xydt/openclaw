@@ -64,6 +64,12 @@ export type { ClientToolDefinition } from "../../command/shared-types.js";
 
 export type EmbeddedRunTrigger = "cron" | "heartbeat" | "manual" | "memory" | "overflow" | "user";
 
+/** Candidate-owned resources retained until the outer logical run settles. */
+export type DeferredEmbeddedRunLifecycleOwner = {
+  complete: () => Promise<void>;
+  discard: () => void;
+};
+
 export type ResolvedToolPromptFinalizer = (params: {
   prompt: string;
   messageToolAvailable: boolean;
@@ -375,6 +381,8 @@ export type RunEmbeddedAgentParams = {
   deferTerminalLifecycle?: boolean;
   /** @deprecated Use deferTerminalLifecycle. */
   deferTerminalLifecycleEnd?: boolean;
+  /** Transfers deferred active-run and trajectory ownership to the logical-turn coordinator. */
+  onDeferredLifecycleOwner?: (owner: DeferredEmbeddedRunLifecycleOwner) => void;
   lane?: string;
   enqueue?: CommandQueueEnqueueFn;
   extraSystemPrompt?: string;

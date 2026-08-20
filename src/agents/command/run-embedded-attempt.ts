@@ -26,6 +26,7 @@ import {
   runEmbeddedAgentEntry,
   type EmbeddedAgentRunEntryTerminal,
 } from "../embedded-agent-runner/run-entry.js";
+import { createDeferredEmbeddedRunLifecycleManager } from "../embedded-agent-runner/run/deferred-lifecycle-owner.js";
 import { resolveFastModeState } from "../fast-mode.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../harness/hook-helpers.js";
 import { prepareInternalSessionEffectsSession } from "../internal-session-effects.js";
@@ -201,6 +202,7 @@ export async function runEmbeddedAgentAttempt(params: {
     abortSignal: params.opts.abortSignal,
     state: attemptLifecycleState,
   });
+  const deferredLifecycle = createDeferredEmbeddedRunLifecycleManager();
   const attemptExecutionRuntime = await measureAgentStartup(
     "attempt-runtime-import",
     () => loadAttemptExecutionRuntime(),
@@ -509,6 +511,7 @@ export async function runEmbeddedAgentAttempt(params: {
             },
             onAgentEvent: attemptLifecycleCallbacks.onAgentEvent,
             deferTerminalLifecycle: true,
+            onDeferredLifecycleOwner: deferredLifecycle.adopt,
           });
         },
       });
@@ -540,19 +543,8 @@ export async function runEmbeddedAgentAttempt(params: {
     } catch (err) {
       if (err instanceof LiveSessionModelSwitchError) {
         if (isModelSelectionLocked(sessionEntry)) {
-          if (!attemptLifecycleState.lifecycleEnded) {
-            emitAgentEvent({
-              runId,
-              lifecycleGeneration,
-              stream: "lifecycle",
-              data: {
-                phase: "error",
-                startedAt,
-                endedAt: Date.now(),
-                error: MODEL_SELECTION_LOCKED_MESSAGE,
-              },
-            });
-          }
+          lifecycle.emitBasicError(MODEL_SELECTION_LOCKED_MESSAGE);
+          await deferredLifecycle.complete();
           await fallbackTrajectoryRecorder?.flush();
           throw new ModelSelectionLockedError();
         }
@@ -560,6 +552,7 @@ export async function runEmbeddedAgentAttempt(params: {
           sessionKey &&
           hasNewGeneratedMediaTaskForSessionKey(sessionKey, liveSwitchMediaTaskIds)
         ) {
+          await deferredLifecycle.complete();
           throw err;
         }
         liveSwitchRetries += 1;
@@ -567,19 +560,8 @@ export async function runEmbeddedAgentAttempt(params: {
           log.error(
             `Live session model switch in subagent run ${runId}: exceeded maximum retries (${MAX_LIVE_SWITCH_RETRIES})`,
           );
-          if (!attemptLifecycleState.lifecycleEnded) {
-            emitAgentEvent({
-              runId,
-              lifecycleGeneration,
-              stream: "lifecycle",
-              data: {
-                phase: "error",
-                startedAt,
-                endedAt: Date.now(),
-                error: "Agent run failed",
-              },
-            });
-          }
+          lifecycle.emitBasicError("Agent run failed");
+          await deferredLifecycle.complete();
           await fallbackTrajectoryRecorder?.flush();
           throw new Error(
             `Exceeded maximum live model switch retries (${MAX_LIVE_SWITCH_RETRIES})`,
@@ -599,19 +581,8 @@ export async function runEmbeddedAgentAttempt(params: {
             `Live session model switch in subagent run ${runId}: ` +
               `rejected ${sanitizeForLog(err.provider)}/${sanitizeForLog(err.model)} (not in allowlist)`,
           );
-          if (!attemptLifecycleState.lifecycleEnded) {
-            emitAgentEvent({
-              runId,
-              lifecycleGeneration,
-              stream: "lifecycle",
-              data: {
-                phase: "error",
-                startedAt,
-                endedAt: Date.now(),
-                error: "Agent run failed",
-              },
-            });
-          }
+          lifecycle.emitBasicError("Agent run failed");
+          await deferredLifecycle.complete();
           await fallbackTrajectoryRecorder?.flush();
           throw new Error(
             `Live model switch rejected: ${sanitizeForLog(err.provider)}/${sanitizeForLog(err.model)} is not in the agent allowlist`,
@@ -673,6 +644,7 @@ export async function runEmbeddedAgentAttempt(params: {
           },
         });
       }
+      await deferredLifecycle.complete();
       await fallbackTrajectoryRecorder?.flush();
       throw err;
     }
@@ -695,6 +667,7 @@ export async function runEmbeddedAgentAttempt(params: {
     userTurnTranscriptRecorder,
     fallbackTrajectoryRecorder,
     lifecycle,
+    deferredLifecycle,
     terminal,
   };
 }

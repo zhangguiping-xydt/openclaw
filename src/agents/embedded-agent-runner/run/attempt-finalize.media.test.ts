@@ -140,4 +140,30 @@ describe("finalizeEmbeddedAttempt trajectory capture", () => {
       media: [{ path: "/media/canonical.png", contentType: "image/png" }],
     });
   });
+
+  it("transfers the session terminal event to a deferred lifecycle owner", () => {
+    const recordEvent = vi.fn();
+    const recordSessionEnd = vi.fn();
+    finalizeEmbeddedAttempt({
+      result: {
+        terminal: { kind: "ok" },
+        assistantTexts: ["done"],
+        toolMetas: [],
+        messagingToolSentTexts: [],
+        messagingToolSentMediaUrls: [],
+        messagingToolSentTargets: [],
+        currentAttemptAssistant: assistant("stop"),
+      } as unknown as EmbeddedRunAttemptResult,
+      trajectoryRecorder: { recordEvent, flush: async () => undefined },
+      deferredLifecycleOwner: { recordSessionEnd } as never,
+      synthesizedPayloadCount: 0,
+      emptyAssistantReplyIsSilent: false,
+      hasTerminalOutput: false,
+    });
+
+    expect(recordEvent).not.toHaveBeenCalledWith("session.ended", expect.anything());
+    expect(recordSessionEnd).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "success", stopReason: "stop" }),
+    );
+  });
 });

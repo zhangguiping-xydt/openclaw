@@ -4729,6 +4729,7 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
   });
 
   it("emits a failure lifecycle after delivering a preserved exhausted result", async () => {
+    const completeDeferredLifecycle = vi.fn(async () => undefined);
     const exhaustedResult = {
       payloads: [{ text: "Terminal tool summary", isError: true }],
       meta: {
@@ -4747,9 +4748,17 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
     state.runAgentAttemptMock.mockImplementationOnce(async (attemptParams: unknown) => {
       const params = attemptParams as {
         deferTerminalLifecycle?: boolean;
+        onDeferredLifecycleOwner?: (owner: {
+          complete: () => Promise<void>;
+          discard: () => void;
+        }) => void;
         onAgentEvent?: (event: { stream: string; data: Record<string, unknown> }) => void;
       };
       expect(params.deferTerminalLifecycle).toBe(true);
+      params.onDeferredLifecycleOwner?.({
+        complete: completeDeferredLifecycle,
+        discard: vi.fn(),
+      });
       params.onAgentEvent?.({
         stream: "lifecycle",
         data: {
@@ -4783,6 +4792,7 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
 
     expect(state.deliverAgentCommandResultMock).toHaveBeenCalledTimes(1);
     expect(onModelFallbackExhausted).toHaveBeenCalledTimes(1);
+    expect(completeDeferredLifecycle).toHaveBeenCalledOnce();
     const lifecycleEvents = state.emitAgentEventMock.mock.calls
       .map((call) => call[0] as { stream?: string; data?: Record<string, unknown> })
       .filter((event) => event.stream === "lifecycle");

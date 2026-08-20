@@ -530,6 +530,7 @@ export function runAgentAttempt(params: {
     sessionKey?: string;
   }) => void;
   deferTerminalLifecycle?: boolean;
+  onDeferredLifecycleOwner?: Parameters<typeof runEmbeddedAgent>[0]["onDeferredLifecycleOwner"];
   authProfileProvider: string;
   sessionStore?: Record<string, SessionEntry>;
   storePath?: string;
@@ -1236,6 +1237,7 @@ export function runAgentAttempt(params: {
     allowEmptyAssistantReplyAsSilent: isSubagentLane || isSubagentAnnounceHandoff,
     onAgentEvent: params.onAgentEvent,
     deferTerminalLifecycle: params.deferTerminalLifecycle,
+    onDeferredLifecycleOwner: params.onDeferredLifecycleOwner,
     suppressNextUserMessagePersistence: params.suppressPromptPersistenceOnRetry === true,
     userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
     contextEngineLogicalTurnLease: params.contextEngineLogicalTurnLease,
