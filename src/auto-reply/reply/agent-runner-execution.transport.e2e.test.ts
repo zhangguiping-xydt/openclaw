@@ -171,7 +171,9 @@ async function waitForFile(filePath: string, timeoutMs = 10_000): Promise<void> 
         throw error;
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 10);
+    });
   }
   throw new Error(`timed out waiting for ${path.basename(filePath)}`);
 }
