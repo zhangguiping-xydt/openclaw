@@ -96,44 +96,28 @@ afterAll(() => {
   resetAgentEventsForTest();
 });
 
-async function createFailedResponsesServer(): Promise<{
+async function createRetryableFailureResponsesServer(): Promise<{
   server: Server;
   baseUrl: string;
   requests: Array<{ method: string; path: string }>;
 }> {
   const requests: Array<{ method: string; path: string }> = [];
-  const event = {
-    type: "response.failed",
-    sequence_number: 0,
-    response: {
-      id: "resp-transport-cli-recovery",
-      model: "transport-primary",
-      status: "failed",
-      error: {
-        code: "server_error",
-        message: "primary transport failed for fallback proof",
-      },
-      output: [],
-      usage: {
-        input_tokens: 3,
-        output_tokens: 0,
-        total_tokens: 3,
-        input_tokens_details: { cached_tokens: 0 },
-        output_tokens_details: { reasoning_tokens: 0 },
-      },
-    },
-  };
   const server = createServer((request, response) => {
     requests.push({ method: request.method ?? "", path: request.url ?? "" });
     request.resume();
     request.on("end", () => {
-      response.writeHead(200, {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache",
-        connection: "keep-alive",
+      response.writeHead(503, {
+        "content-type": "application/json; charset=utf-8",
+        "retry-after-ms": "1",
       });
-      response.write(`event: response.failed\ndata: ${JSON.stringify(event)}\n\n`);
-      response.end();
+      response.end(
+        JSON.stringify({
+          error: {
+            code: "server_error",
+            message: "primary transport failed for fallback proof",
+          },
+        }),
+      );
     });
   });
   await new Promise<void>((resolve, reject) => {
@@ -272,7 +256,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
       fs.mkdir(agentDir, { recursive: true }),
       fs.mkdir(workspaceDir, { recursive: true }),
     ]);
-    const transport = await createFailedResponsesServer();
+    const transport = await createRetryableFailureResponsesServer();
     fixtureState.markerPath = markerPath;
     fixtureState.releasePath = releasePath;
     fixtureState.responsesBaseUrl = transport.baseUrl;
@@ -351,7 +335,12 @@ describe("agent runner transport to CLI fallback recovery", () => {
       expect(
         transport.requests,
         `primary fallback attempt: ${primaryAttempt?.error ?? result.outcome.kind}`,
-      ).toEqual([{ method: "POST", path: expect.stringMatching(/^\/v1\/responses(?:\?|$)/) }]);
+      ).toEqual(
+        Array.from({ length: 3 }, () => ({
+          method: "POST",
+          path: expect.stringMatching(/^\/v1\/responses(?:\?|$)/),
+        })),
+      );
       const childPid = Number((await fs.readFile(markerPath, "utf8")).trim());
       expect(childPid).toBeGreaterThan(0);
       expect(result).toMatchObject({
@@ -389,7 +378,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
           transport: {
             requests: transport.requests.length,
             path: transport.requests[0]?.path,
-            terminal: "response.failed",
+            terminal: "http_503",
           },
           fallback: {
             runtime: result.outcome.resolved.provider,
