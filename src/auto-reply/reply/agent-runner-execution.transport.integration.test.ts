@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Model } from "openclaw/plugin-sdk/llm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { attachModelProviderRequestTransport } from "../../agents/provider-request-config.js";
 import { installEmbeddedRunnerBaseE2eMocks } from "../../agents/test-helpers/embedded-agent-runner-e2e-mocks.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { AgentEventPayload } from "../../infra/agent-events.js";
@@ -68,18 +69,23 @@ beforeAll(async () => {
         if (provider !== "openai" || modelId !== "transport-primary") {
           throw new Error(`unexpected embedded model resolution: ${provider}/${modelId}`);
         }
-        const model = {
-          id: modelId,
-          name: "Transport primary",
-          api: "openai-responses",
-          provider,
-          baseUrl: fixtureState.responsesBaseUrl,
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 16_000,
-          maxTokens: 2_048,
-        } satisfies Model;
+        // The mock bypasses resolveModelAsync's normal request metadata attachment.
+        // Mirror the explicit provider opt-in so the trusted loopback fixture is reachable.
+        const model = attachModelProviderRequestTransport(
+          {
+            id: modelId,
+            name: "Transport primary",
+            api: "openai-responses",
+            provider,
+            baseUrl: fixtureState.responsesBaseUrl,
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 16_000,
+            maxTokens: 2_048,
+          } satisfies Model,
+          { allowPrivateNetwork: true },
+        );
         return { model, error: undefined, ...stores };
       },
     };
@@ -320,6 +326,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
               api: "openai-responses",
               [apiKeyField]: "transport-fixture-key",
               baseUrl: transport.baseUrl,
+              request: { allowPrivateNetwork: true },
               models: [
                 {
                   id: "transport-primary",
