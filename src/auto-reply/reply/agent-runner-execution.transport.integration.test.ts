@@ -111,7 +111,7 @@ async function createFailedResponsesServer(): Promise<{
       status: "failed",
       error: {
         code: "server_error",
-        message: "primary transport failed for fallback proof",
+        message: "model_not_found: primary transport model is unavailable for fallback proof",
       },
       output: [],
       usage: {
@@ -372,7 +372,7 @@ describe("agent runner transport to CLI fallback recovery", () => {
       }
       expect(result.outcome.result.meta.error).toBeUndefined();
       expect(JSON.stringify(result.outcome.result.payloads)).not.toContain(
-        "primary transport failed for fallback proof",
+        "primary transport model is unavailable for fallback proof",
       );
       const lifecyclePhases = events
         .filter((event) => event.stream === "lifecycle")
