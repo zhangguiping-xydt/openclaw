@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({
   error: vi.fn(),
 }));
 
-vi.mock("./attempt-finalize.js", () => ({
+vi.mock("./attempt-trajectory-flush.js", () => ({
   flushEmbeddedAttemptTrajectoryRecorder: mocks.flushTrajectory,
 }));
 vi.mock("../logger.js", () => ({

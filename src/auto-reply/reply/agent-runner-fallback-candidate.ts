@@ -266,6 +266,10 @@ export async function runAgentFallbackCandidates(params: AgentFallbackCycleParam
           onDeferredLifecycleOwner: params.state.deferredLifecycle.adopt,
         };
         if (runtime.useCliExecution) {
+          // CLI fallback publishes its own lifecycle start before execution and
+          // has no embedded active-run handle. Retaining the previous embedded
+          // owner would keep a stale watchdog handle and terminal trajectory.
+          params.state.deferredLifecycle.discard();
           const candidate = await runCliFallbackCandidate({
             ...common,
             cliExecutionProvider: runtime.cliExecutionProvider,

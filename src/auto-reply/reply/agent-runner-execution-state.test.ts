@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { LiveSessionModelSwitchError } from "../../agents/live-model-switch-error.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { TemplateContext } from "../templating.js";
@@ -636,6 +636,57 @@ describe("executeAgentTurn: session state", () => {
     expectMockCallArgFields(state.runEmbeddedAgentMock, 0, "embedded fallback candidate", {
       suppressAssistantErrorPersistence: false,
     });
+  });
+
+  it("releases a failed embedded lifecycle owner before a CLI fallback starts", async () => {
+    const runId = "run-embedded-to-cli-fallback";
+    const ownershipOrder: string[] = [];
+    const embeddedOwner = {
+      complete: vi.fn(async () => {
+        ownershipOrder.push("stale-embedded-complete");
+      }),
+      discard: vi.fn(() => {
+        ownershipOrder.push("embedded-discard");
+      }),
+    };
+    state.isCliProviderMock.mockImplementation((provider: unknown) => provider === "anthropic");
+    state.runWithModelFallbackMock.mockImplementationOnce(async (params: FallbackRunnerParams) => {
+      await params.run("openai", "gpt-5.4").catch(() => undefined);
+      return {
+        result: await params.run("anthropic", "claude-opus-4-7"),
+        provider: "anthropic",
+        model: "claude-opus-4-7",
+        attempts: [],
+      };
+    });
+    state.runEmbeddedAgentMock.mockImplementationOnce(
+      async (args: { onDeferredLifecycleOwner?: (owner: typeof embeddedOwner) => void }) => {
+        args.onDeferredLifecycleOwner?.(embeddedOwner);
+        throw new Error("embedded provider failed");
+      },
+    );
+    state.runCliAgentMock.mockImplementationOnce(async () => {
+      ownershipOrder.push("cli-start");
+      return { payloads: [{ text: "cli recovered" }], meta: {} };
+    });
+    const emitAgentEvent = vi.mocked((await import("../../infra/agent-events.js")).emitAgentEvent);
+
+    const executeAgentTurn = await getExecuteAgentTurnForTest();
+    const result = await executeAgentTurn(createMinimalRunAgentTurnParams({ opts: { runId } }));
+
+    expect(result).toMatchObject({
+      kind: "success",
+      runResult: { payloads: [{ text: "cli recovered" }] },
+      fallbackProvider: "anthropic",
+    });
+    expect(ownershipOrder).toEqual(["embedded-discard", "cli-start"]);
+    expect(embeddedOwner.discard).toHaveBeenCalledOnce();
+    expect(embeddedOwner.complete).not.toHaveBeenCalled();
+    const lifecycleEvents = emitAgentEvent.mock.calls
+      .map((call) => call[0])
+      .filter((event) => event.runId === runId && event.stream === "lifecycle");
+    expect(lifecycleEvents.map((event) => event.data.phase)).toEqual(["start", "end"]);
+    expect(lifecycleEvents.at(-1)?.data).not.toHaveProperty("error");
   });
 
   it("latches queued user message persistence across main reply fallback candidates", async () => {

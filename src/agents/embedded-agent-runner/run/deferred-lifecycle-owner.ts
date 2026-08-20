@@ -1,6 +1,6 @@
 import { formatErrorMessage } from "../../../infra/errors.js";
 import { log } from "../logger.js";
-import { flushEmbeddedAttemptTrajectoryRecorder } from "./attempt-finalize.js";
+import { flushEmbeddedAttemptTrajectoryRecorder } from "./attempt-trajectory-flush.js";
 import type { DeferredEmbeddedRunLifecycleOwner, RunEmbeddedAgentParams } from "./params.js";
 
 type DeferredTrajectoryRecorder = {
