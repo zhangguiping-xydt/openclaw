@@ -1,0 +1,72 @@
+name: PR 126566 exact-head real fallback proof
+
+on:
+  push:
+    branches:
+      - ci/pr-126566-real-boundary-proof-v5
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  fallback-proof:
+    name: Primary overload to terminal fallback
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout proof commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify exact PR source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="2546731664f4f7766f9832881505f73a27981d10"
+          test "$(git rev-parse HEAD^)" = "$expected_sha"
+          git diff --exit-code "$expected_sha" HEAD -- . \
+            ':(exclude).github/proof/pr-126566-real-boundary.mjs' \
+            ':(exclude).github/workflows/pr-126566-real-boundary-proof.yml'
+          printf '[proof-source] %s\n' "$expected_sha"
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24.15.0"
+
+      - name: Install exact-head dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          package_manager="$(node -p 'require("./package.json").packageManager')"
+          corepack prepare "$package_manager" --activate
+          pnpm install --frozen-lockfile
+
+      - name: Build exact-head Gateway and private QA
+        env:
+          OPENCLAW_BUILD_PRIVATE_QA: "1"
+        run: pnpm build
+
+      - name: Run real transport fallback proof
+        shell: bash
+        env:
+          CI: "true"
+          EXPECTED_PR_HEAD: "2546731664f4f7766f9832881505f73a27981d10"
+          OPENCLAW_QA_KEEP_TEMP: "1"
+          OPENCLAW_QA_SUITE_PROGRESS: "1"
+        run: node --import tsx .github/proof/pr-126566-real-boundary.mjs
+
+      - name: Publish redacted proof artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-126566-real-boundary-proof
+          path: .artifacts/issue-126311-real-boundary-proof
+          if-no-files-found: warn
+          retention-days: 30
