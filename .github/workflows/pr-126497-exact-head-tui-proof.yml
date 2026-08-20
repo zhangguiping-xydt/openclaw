@@ -17,6 +17,7 @@ jobs:
       - name: Checkout proof commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify PR source identity
@@ -24,7 +25,7 @@ jobs:
         run: |
           set -euo pipefail
           expected_sha="4e25d933b7a041e9d36be5e4d02f3c49934a2ad1"
-          test "$(git rev-parse HEAD^)" = "$expected_sha"
+          git merge-base --is-ancestor "$expected_sha" HEAD
           git diff --exit-code "$expected_sha" HEAD -- . \
             ':(exclude).github/workflows/pr-126497-exact-head-tui-proof.yml'
           echo "[proof-source] $expected_sha"
