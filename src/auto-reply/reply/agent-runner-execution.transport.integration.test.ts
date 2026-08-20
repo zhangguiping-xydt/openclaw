@@ -344,8 +344,13 @@ describe("agent runner transport to CLI fallback recovery", () => {
       expect(activeEmbeddedRunAtCliStart).toBe(false);
       await fs.writeFile(releasePath, "release", "utf8");
       const result = await executionPromise;
+      const primaryAttempt =
+        result.outcome.kind === "settled" ? result.outcome.fallback.attempts[0] : undefined;
 
-      expect(transport.requests).toEqual([
+      expect(
+        transport.requests,
+        `primary fallback attempt: ${primaryAttempt?.error ?? result.outcome.kind}`,
+      ).toEqual([
         { method: "POST", path: expect.stringMatching(/^\/v1\/responses(?:\?|$)/) },
       ]);
       const childPid = Number((await fs.readFile(markerPath, "utf8")).trim());
