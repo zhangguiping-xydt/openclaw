@@ -34,6 +34,9 @@ import { saveAuthProfileStore } from "../auth-profiles/store.js";
 import { testing as cliBackendsTesting } from "../cli-backends.test-support.js";
 import { createCronCreatorAuthorityCapability } from "../cron-creator-authority-context.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent.js";
+import {
+  createDeferredEmbeddedRunLifecycleManager,
+} from "../embedded-agent-runner/run/deferred-lifecycle-owner.js";
 import { FailoverError } from "../failover-error.js";
 import { attachToolAllowlistIntersection } from "../tool-policy.js";
 import {
@@ -845,6 +848,41 @@ describe("CLI attempt execution", () => {
     });
 
     expect(firstRunCliAgentArg().onExecutionStarted).toBe(onExecutionStarted);
+  });
+
+  it("releases a retained embedded owner before a CLI fallback starts", async () => {
+    const sessionKey = "agent:main:direct:embedded-to-cli-fallback";
+    const sessionEntry = makeSessionEntry("session-embedded-to-cli-fallback");
+    const sessionStore = { [sessionKey]: sessionEntry };
+    await writeSessionStoreSeed(sessionStore);
+    const order: string[] = [];
+    const retainedOwner = {
+      complete: vi.fn(async () => undefined),
+      discard: vi.fn(() => order.push("embedded-discard")),
+    };
+    const deferredLifecycle = createDeferredEmbeddedRunLifecycleManager();
+    deferredLifecycle.adopt(retainedOwner);
+    runCliAgentMock.mockImplementationOnce(async () => {
+      order.push("cli-start");
+      expect(retainedOwner.discard).toHaveBeenCalledOnce();
+      return makeCliResult("fallback recovered");
+    });
+
+    await runStoredAttempt({
+      providerOverride: "claude-cli",
+      modelOverride: "opus",
+      sessionEntry,
+      sessionKey,
+      body: "recover with CLI",
+      isFallbackRetry: true,
+      runId: "run-embedded-to-cli-fallback",
+      sessionStore,
+      deferredLifecycle,
+    });
+
+    expect(order).toEqual(["embedded-discard", "cli-start"]);
+    expect(retainedOwner.complete).not.toHaveBeenCalled();
+    expect(runEmbeddedAgentMock).not.toHaveBeenCalled();
   });
 
   it("forwards authoritative group type to CLI runs with opaque session keys", async () => {

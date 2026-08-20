@@ -511,7 +511,7 @@ export async function runEmbeddedAgentAttempt(params: {
             },
             onAgentEvent: attemptLifecycleCallbacks.onAgentEvent,
             deferTerminalLifecycle: true,
-            onDeferredLifecycleOwner: deferredLifecycle.adopt,
+            deferredLifecycle,
           });
         },
       });

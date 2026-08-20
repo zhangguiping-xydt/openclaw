@@ -4748,14 +4748,13 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
     state.runAgentAttemptMock.mockImplementationOnce(async (attemptParams: unknown) => {
       const params = attemptParams as {
         deferTerminalLifecycle?: boolean;
-        onDeferredLifecycleOwner?: (owner: {
-          complete: () => Promise<void>;
-          discard: () => void;
-        }) => void;
+        deferredLifecycle?: {
+          adopt: (owner: { complete: () => Promise<void>; discard: () => void }) => void;
+        };
         onAgentEvent?: (event: { stream: string; data: Record<string, unknown> }) => void;
       };
       expect(params.deferTerminalLifecycle).toBe(true);
-      params.onDeferredLifecycleOwner?.({
+      params.deferredLifecycle?.adopt({
         complete: completeDeferredLifecycle,
         discard: vi.fn(),
       });

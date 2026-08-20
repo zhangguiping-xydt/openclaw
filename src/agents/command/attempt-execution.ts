@@ -76,6 +76,9 @@ import {
 } from "../cli-session.js";
 import { resolveConversationCapabilityProfile } from "../conversation-capability-profile.js";
 import { resolveConversationToolPolicies } from "../conversation-tool-policy-pipeline.js";
+import type {
+  DeferredEmbeddedRunLifecycleManager,
+} from "../embedded-agent-runner/run/deferred-lifecycle-owner.js";
 import type { RunEmbeddedAgentInternalParams } from "../embedded-agent-runner/run/internal-params.js";
 import { runEmbeddedAgent, type EmbeddedAgentRunResult } from "../embedded-agent.js";
 import { appendGitCoauthorContext } from "../git-coauthor-attribution.js";
@@ -530,7 +533,7 @@ export function runAgentAttempt(params: {
     sessionKey?: string;
   }) => void;
   deferTerminalLifecycle?: boolean;
-  onDeferredLifecycleOwner?: Parameters<typeof runEmbeddedAgent>[0]["onDeferredLifecycleOwner"];
+  deferredLifecycle?: DeferredEmbeddedRunLifecycleManager;
   authProfileProvider: string;
   sessionStore?: Record<string, SessionEntry>;
   storePath?: string;
@@ -796,6 +799,10 @@ export function runAgentAttempt(params: {
       ? "openclaw"
       : undefined);
   if (!isRawModelRun && isCliExecutionProvider) {
+    // CLI publishes its own lifecycle and has no embedded active-run handle.
+    // Release a failed embedded candidate before CLI startup so its watchdog
+    // cannot remain active.
+    params.deferredLifecycle?.discard();
     const cliSessionBinding = getCliSessionBinding(params.sessionEntry, cliExecutionProvider);
     const cliProcessCwd = params.cwd ? resolveUserPath(params.cwd) : params.workspaceDir;
     const cliContinuationBody = params.opts.execApprovalContinuationPromptRange
@@ -1237,7 +1244,7 @@ export function runAgentAttempt(params: {
     allowEmptyAssistantReplyAsSilent: isSubagentLane || isSubagentAnnounceHandoff,
     onAgentEvent: params.onAgentEvent,
     deferTerminalLifecycle: params.deferTerminalLifecycle,
-    onDeferredLifecycleOwner: params.onDeferredLifecycleOwner,
+    onDeferredLifecycleOwner: params.deferredLifecycle?.adopt,
     suppressNextUserMessagePersistence: params.suppressPromptPersistenceOnRetry === true,
     userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
     contextEngineLogicalTurnLease: params.contextEngineLogicalTurnLease,
