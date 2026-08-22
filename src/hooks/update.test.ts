@@ -1,10 +1,10 @@
 // Hook update tests cover updating installed hook records and config.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HookInstallRecord } from "../config/types.hooks.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { HookNpmIntegrityDriftParams } from "./install.js";
 
 const installHooksFromNpmSpecMock = vi.fn();
@@ -32,6 +32,7 @@ vi.mock("./installs.js", () => ({
 }));
 
 const { updateNpmInstalledHookPacks } = await import("./update.js");
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 function createHookInstallConfig(params: {
   hookId: string;
@@ -51,7 +52,7 @@ function createHookInstallConfig(params: {
 }
 
 function createInstalledHookPackDir(version: string): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-hook-pack-"));
+  const dir = tempDirs.make("openclaw-hook-pack-");
   fs.writeFileSync(
     path.join(dir, "package.json"),
     JSON.stringify({ name: "@openclaw/demo-hooks", version }),
