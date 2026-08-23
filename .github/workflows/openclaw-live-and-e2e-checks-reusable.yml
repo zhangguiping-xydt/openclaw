@@ -20,14 +20,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: zhangguiping-xydt/openclaw
-          ref: 52093c67a28d4ad3d6b62f276f37283c254f2a0d
+          ref: 52093c67a2831b4c5ccc00d9cc8371dced0fb1dc
           fetch-depth: 1
           persist-credentials: false
 
       - name: Verify exact head
         shell: bash
         run: |
-          test "$(git rev-parse HEAD)" = "52093c67a28d4ad3d6b62f276f37283c254f2a0d"
+          test "$(git rev-parse HEAD)" = "52093c67a2831b4c5ccc00d9cc8371dced0fb1dc"
 
       - name: Prewarm source plugin runtime before the test clock
         shell: bash
