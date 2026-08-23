@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   focused-proof:
-    name: PR 127853 exact-head focused Gateway proof diagnostic
+    name: PR 127853 candidate deferred-sidecar Gateway proof
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -29,66 +29,74 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "5f8c56adb4aec2f8aa75c836e3578dedb90c8e54"
 
-      - name: Apply proof-only diagnostics
+      - name: Apply candidate test-harness fix and diagnostics
         shell: bash
         run: |
           node <<'NODE'
           const fs = require("node:fs");
-          const file = "test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts";
-          let source = fs.readFileSync(file, "utf8");
-          function replaceOnce(from, to) {
-            const parts = source.split(from);
-            if (parts.length !== 2) {
-              throw new Error(`diagnostic anchor count ${parts.length - 1}: ${from.slice(0, 80)}`);
+          function edit(file, replacements) {
+            let source = fs.readFileSync(file, "utf8");
+            for (const [from, to] of replacements) {
+              const parts = source.split(from);
+              if (parts.length !== 2) {
+                throw new Error(`${file}: candidate anchor count ${parts.length - 1}: ${from.slice(0, 80)}`);
+              }
+              source = `${parts[0]}${to}${parts[1]}`;
             }
-            source = `${parts[0]}${to}${parts[1]}`;
+            fs.writeFileSync(file, source);
           }
+          edit("src/gateway/test-helpers.e2e.ts", [
+            [
+              'import { startGatewayServer } from "./server.js";',
+              'import { startGatewayServer } from "./server.js";\nimport type { GatewaySidecarStartupMode } from "./server-sidecar-startup-mode.js";',
+            ],
+            [
+              '  clientDisplayName?: string;\n}) {',
+              '  clientDisplayName?: string;\n  sidecarStartup?: GatewaySidecarStartupMode;\n}) {',
+            ],
+            [
+              '    controlUiEnabled: false,\n  });',
+              '    controlUiEnabled: false,\n    sidecarStartup: params.sidecarStartup,\n  });',
+            ],
+          ]);
           const marker = (name) => `process.stdout.write("pr127853-diagnostic ${name}\\n");`;
-          replaceOnce("{ timeout: 90_000 }", "{ timeout: 300_000 }");
-          replaceOnce(
-            "        const providerAddress = providerServer.address();",
-            `        ${marker("provider-listening")}\n        const providerAddress = providerServer.address();`,
-          );
-          replaceOnce(
-            "        const runtimeConfig = getRuntimeConfigSnapshot();",
-            `        ${marker("gateway-started")}\n        const runtimeConfig = getRuntimeConfigSnapshot();`,
-          );
-          replaceOnce(
-            "        await expect\n          .poll(() => typeof getProofDispatch(dispatchKey), { timeout: 10_000, interval: 50 })",
-            `        ${marker("dispatcher-wait")}\n        await expect\n          .poll(() => typeof getProofDispatch(dispatchKey), { timeout: 10_000, interval: 50 })`,
-          );
-          replaceOnce(
-            "          .toBe(\"function\");\n        const dispatch = getProofDispatch(dispatchKey);",
-            `          .toBe("function");\n        ${marker("dispatcher-ready")}\n        const dispatch = getProofDispatch(dispatchKey);`,
-          );
-          replaceOnce(
-            "        await dispatch({\n          body: \"\",",
-            `        ${marker("runtime-dispatch-start")}\n        await dispatch({\n          body: "",`,
-          );
-          replaceOnce(
-            "        });\n        expect(providerRequests).toHaveLength(1);",
-            `        });\n        ${marker("runtime-dispatch-complete")}\n        expect(providerRequests).toHaveLength(1);`,
-          );
-          replaceOnce(
-            "        await dispatch({\n          body: visibleUserMessage,",
-            `        ${marker("visible-dispatch-start")}\n        await dispatch({\n          body: visibleUserMessage,`,
-          );
-          replaceOnce(
-            "        });\n        expect(providerRequests).toHaveLength(2);",
-            `        });\n        ${marker("visible-dispatch-complete")}\n        expect(providerRequests).toHaveLength(2);`,
-          );
-          replaceOnce(
-            "        const transcriptText = JSON.stringify(await readSessionTranscript(sessionKey));",
-            `        ${marker("transcript-ready")}\n        const transcriptText = JSON.stringify(await readSessionTranscript(sessionKey));`,
-          );
-          replaceOnce(
-            "      } finally {\n        if (gateway) {",
-            `      } finally {\n        ${marker("cleanup-start")}\n        if (gateway) {`,
-          );
-          fs.writeFileSync(file, source);
+          edit("test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts", [
+            [
+              '          clientDisplayName: "vitest-gateway-runtime-only-inbound-context",\n        });',
+              '          clientDisplayName: "vitest-gateway-runtime-only-inbound-context",\n          sidecarStartup: "defer",\n        });',
+            ],
+            [
+              "        const providerAddress = providerServer.address();",
+              `        ${marker("provider-listening")}\n        const providerAddress = providerServer.address();`,
+            ],
+            [
+              "        const runtimeConfig = getRuntimeConfigSnapshot();",
+              `        ${marker("gateway-started")}\n        const runtimeConfig = getRuntimeConfigSnapshot();`,
+            ],
+            [
+              "          .toBe(\"function\");\n        const dispatch = getProofDispatch(dispatchKey);",
+              `          .toBe("function");\n        ${marker("dispatcher-ready")}\n        const dispatch = getProofDispatch(dispatchKey);`,
+            ],
+            [
+              "        await dispatch({\n          body: \"\",",
+              `        ${marker("runtime-dispatch-start")}\n        await dispatch({\n          body: "",`,
+            ],
+            [
+              "        });\n        expect(providerRequests).toHaveLength(1);",
+              `        });\n        ${marker("runtime-dispatch-complete")}\n        expect(providerRequests).toHaveLength(1);`,
+            ],
+            [
+              "        await dispatch({\n          body: visibleUserMessage,",
+              `        ${marker("visible-dispatch-start")}\n        await dispatch({\n          body: visibleUserMessage,`,
+            ],
+            [
+              "        });\n        expect(providerRequests).toHaveLength(2);",
+              `        });\n        ${marker("visible-dispatch-complete")}\n        expect(providerRequests).toHaveLength(2);`,
+            ],
+          ]);
           NODE
           git diff --check
-          git diff -- test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts
+          git diff -- src/gateway/test-helpers.e2e.ts test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -101,7 +109,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --prefer-offline --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
 
-      - name: Run focused Gateway proof diagnostic
+      - name: Run candidate focused Gateway proof
         env:
           CI: "true"
           OPENCLAW_BUILD_PRIVATE_QA: "1"
