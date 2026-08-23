@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   focused-proof:
-    name: PR 127853 candidate runtime-channel preload proof
+    name: PR 127853 candidate deferred-sidecar preload proof
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -46,6 +46,18 @@ jobs:
             fs.writeFileSync(file, source);
           }
           edit("src/gateway/test-helpers.e2e.ts", [
+            [
+              'import { startGatewayServer } from "./server.js";',
+              'import { startGatewayServer } from "./server.js";\nimport type { GatewaySidecarStartupMode } from "./server-sidecar-startup-mode.js";',
+            ],
+            [
+              '  onEvent?: (evt: { event?: string; payload?: unknown }) => void;\n}) {',
+              '  onEvent?: (evt: { event?: string; payload?: unknown }) => void;\n  sidecarStartup?: GatewaySidecarStartupMode;\n}) {',
+            ],
+            [
+              '      controlUiEnabled: false,\n    });',
+              '      controlUiEnabled: false,\n      sidecarStartup: params.sidecarStartup,\n    });',
+            ],
             [
               '    const startedServer = await startGatewayServer(port, {',
               '    process.stdout.write("pr127853-diagnostic start-server-start\\n");\n    const startedServer = await startGatewayServer(port, {',
@@ -84,6 +96,10 @@ jobs:
             [
               'import { afterEach, beforeEach, describe, expect, it } from "vitest";',
               'import { afterEach, beforeEach, describe, expect, it } from "vitest";\nimport "../../../../src/plugins/runtime/runtime-channel.js";',
+            ],
+            [
+              '          clientDisplayName: "vitest-gateway-runtime-only-inbound-context",\n        });',
+              '          clientDisplayName: "vitest-gateway-runtime-only-inbound-context",\n          sidecarStartup: "defer",\n        });',
             ],
             [
               "        const providerAddress = providerServer.address();",
