@@ -20,14 +20,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: zhangguiping-xydt/openclaw
-          ref: 5f8c56adb4aec2f8aa75c836e3578dedb90c8e54
+          ref: 56e616884e16396417b4eaadf322caf2691e34f1
           fetch-depth: 1
           persist-credentials: false
 
       - name: Verify exact head
         shell: bash
         run: |
-          test "$(git rev-parse HEAD)" = "5f8c56adb4aec2f8aa75c836e3578dedb90c8e54"
+          test "$(git rev-parse HEAD)" = "56e616884e16396417b4eaadf322caf2691e34f1"
 
       - name: Prewarm source plugin runtime before the test clock
         shell: bash
@@ -79,7 +79,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: dist
-          key: pr127853-e2e-dist-5f8c56adb4a-node24-privateqa-v1
+          key: pr127853-e2e-dist-56e616884e1-node24-privateqa-v1
 
       - name: Run source-runtime prewarmed Gateway proof
         env:
@@ -99,4 +99,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: dist
-          key: pr127853-e2e-dist-5f8c56adb4a-node24-privateqa-v1
+          key: pr127853-e2e-dist-56e616884e1-node24-privateqa-v1
