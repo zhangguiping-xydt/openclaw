@@ -70,6 +70,26 @@ jobs:
               '      onEvent: params.onEvent,\n    });\n\n    return {',
               '      onEvent: params.onEvent,\n    });\n    process.stdout.write("pr127853-diagnostic connect-client-complete\\n");\n\n    return {',
             ],
+            [
+              '  const role = params.role ?? "operator";',
+              '  process.stdout.write("pr127853-diagnostic connect-helper-enter\\n");\n  const role = params.role ?? "operator";',
+            ],
+            [
+              '      })(),\n    });\n  return await new Promise<InstanceType<typeof GatewayClient>>',
+              '      })(),\n    });\n  process.stdout.write("pr127853-diagnostic connect-identity-complete\\n");\n  return await new Promise<InstanceType<typeof GatewayClient>>',
+            ],
+            [
+              '    const client: InstanceType<typeof GatewayClient> | undefined = new GatewayClient({',
+              '    process.stdout.write("pr127853-diagnostic connect-client-construct-start\\n");\n    const client: InstanceType<typeof GatewayClient> | undefined = new GatewayClient({',
+            ],
+            [
+              '    const timer = setTimeout(\n      () => stop(new Error(params.timeoutMessage ?? "gateway connect timeout")),',
+              '    process.stdout.write("pr127853-diagnostic connect-client-construct-complete\\n");\n    const timer = setTimeout(\n      () => {\n        process.stdout.write("pr127853-diagnostic connect-helper-timeout\\n");\n        stop(new Error(params.timeoutMessage ?? "gateway connect timeout"));\n      },',
+            ],
+            [
+              '    client.start();\n  });',
+              '    process.stdout.write("pr127853-diagnostic connect-client-start-call\\n");\n    client.start();\n    process.stdout.write("pr127853-diagnostic connect-client-start-return\\n");\n  });',
+            ],
           ]);
           const marker = (name) => `process.stdout.write("pr127853-diagnostic ${name}\\n");`;
           edit("test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts", [
@@ -121,9 +141,29 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --prefer-offline --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
 
+      - name: Restore PR 127853 E2E dist
+        id: pr127853-dist-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: dist
+          key: pr127853-e2e-dist-5f8c56adb4a-node24-privateqa-v1
+
       - name: Run candidate focused Gateway proof
         env:
           CI: "true"
           OPENCLAW_BUILD_PRIVATE_QA: "1"
+          OPENCLAW_E2E_SKIP_BUILD: ${{ steps.pr127853-dist-cache.outputs.cache-hit == 'true' && '1' || '0' }}
           OPENCLAW_E2E_WORKERS: "1"
-        run: timeout --signal=TERM --kill-after=30s 10m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts
+          OPENCLAW_GATEWAY_STARTUP_TRACE: "1"
+        run: |
+          status=0
+          timeout --signal=TERM --kill-after=30s 15m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts || status=$?
+          find /tmp -type f -name 'openclaw-*.log' -print0 | xargs -0 -r rg 'startup trace:|starting channels and sidecars|gateway sidecars failed' || true
+          exit "$status"
+
+      - name: Save PR 127853 E2E dist
+        if: always() && steps.pr127853-dist-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: dist
+          key: pr127853-e2e-dist-5f8c56adb4a-node24-privateqa-v1
