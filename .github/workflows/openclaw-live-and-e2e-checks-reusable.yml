@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   focused-proof:
-    name: PR 127853 exact-head startup timeline
+    name: PR 127853 exact-head warmed Jiti proof
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -47,74 +47,28 @@ jobs:
           path: dist
           key: pr127853-e2e-dist-5f8c56adb4a-node24-privateqa-v1
 
-      - name: Run exact-head Gateway startup diagnostic
+      - name: Run exact-head warmed Jiti Gateway proof
         env:
           CI: "true"
           OPENCLAW_BUILD_PRIVATE_QA: "1"
           OPENCLAW_E2E_SKIP_BUILD: ${{ steps.pr127853-dist-cache.outputs.cache-hit == 'true' && '1' || '0' }}
           OPENCLAW_E2E_WORKERS: "1"
           OPENCLAW_GATEWAY_STARTUP_TRACE: "1"
-          OPENCLAW_DIAGNOSTICS: timeline
-          OPENCLAW_DIAGNOSTICS_TIMELINE_PATH: ${{ runner.temp }}/pr127853-timeline.jsonl
+          OPENCLAW_VITEST_FS_MODULE_CACHE_PATH: ${{ runner.temp }}/pr127853-vitest-cache
+          XDG_CACHE_HOME: ${{ runner.temp }}/pr127853-xdg-cache
         run: |
           test -z "$(git status --short)"
-          status=0
-          timeout --signal=TERM --kill-after=30s 15m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts || status=$?
-          printf 'Exact-head diagnostic exit status: `%s`\n' "$status" | tee -a "$GITHUB_STEP_SUMMARY"
-          if [[ -f "$OPENCLAW_DIAGNOSTICS_TIMELINE_PATH" ]]; then
-            node - "$OPENCLAW_DIAGNOSTICS_TIMELINE_PATH" <<'NODE'
-          const fs = require("node:fs");
-          const events = fs
-            .readFileSync(process.argv[2], "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line));
-          const startup = events.filter((event) => event.phase === "startup");
-          const completed = new Set(
-            startup
-              .filter((event) => event.type === "span.end" || event.type === "span.error")
-              .map((event) => event.spanId),
-          );
-          const unfinished = startup.filter(
-            (event) => event.type === "span.start" && !completed.has(event.spanId),
-          );
-          const longest = startup
-            .filter(
-              (event) =>
-                (event.type === "span.end" || event.type === "span.error") &&
-                typeof event.durationMs === "number",
-            )
-            .toSorted((left, right) => right.durationMs - left.durationMs)
-            .slice(0, 20);
-          process.stdout.write(`pr127853-startup-timeline ${JSON.stringify({
-            eventCount: startup.length,
-            unfinished: unfinished.map(({ name, spanId, timestamp, attributes }) => ({
-              name,
-              spanId,
-              timestamp,
-              attributes,
-            })),
-            longest: longest.map(({ type, name, spanId, timestamp, durationMs, attributes }) => ({
-              type,
-              name,
-              spanId,
-              timestamp,
-              durationMs,
-              attributes,
-            })),
-            lastEvents: startup.slice(-12).map(({ type, name, spanId, timestamp }) => ({
-              type,
-              name,
-              spanId,
-              timestamp,
-            })),
-          })}\n`);
-          NODE
-          else
-            echo 'pr127853-startup-timeline missing'
-          fi
-          exit "$status"
+          mkdir -p "$OPENCLAW_VITEST_FS_MODULE_CACHE_PATH" "$XDG_CACHE_HOME"
+
+          warmup_status=0
+          timeout --signal=TERM --kill-after=30s 15m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts || warmup_status=$?
+          printf 'Cold Jiti-cache warmup exit status: `%s`\n' "$warmup_status" | tee -a "$GITHUB_STEP_SUMMARY"
+          du -sh "$XDG_CACHE_HOME/openclaw/jiti" || true
+
+          proof_status=0
+          timeout --signal=TERM --kill-after=30s 15m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts || proof_status=$?
+          printf 'Warmed Jiti-cache exact-head proof exit status: `%s`\n' "$proof_status" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$proof_status"
 
       - name: Save PR 127853 E2E dist
         if: always() && steps.pr127853-dist-cache.outputs.cache-hit != 'true'
