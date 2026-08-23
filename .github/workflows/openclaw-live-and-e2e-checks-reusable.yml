@@ -51,12 +51,12 @@ jobs:
               'import { startGatewayServer } from "./server.js";\nimport type { GatewaySidecarStartupMode } from "./server-sidecar-startup-mode.js";',
             ],
             [
-              '  clientDisplayName?: string;\n}) {',
-              '  clientDisplayName?: string;\n  sidecarStartup?: GatewaySidecarStartupMode;\n}) {',
+              '  onEvent?: (evt: { event?: string; payload?: unknown }) => void;\n}) {',
+              '  onEvent?: (evt: { event?: string; payload?: unknown }) => void;\n  sidecarStartup?: GatewaySidecarStartupMode;\n}) {',
             ],
             [
-              '    controlUiEnabled: false,\n  });',
-              '    controlUiEnabled: false,\n    sidecarStartup: params.sidecarStartup,\n  });',
+              '      controlUiEnabled: false,\n    });',
+              '      controlUiEnabled: false,\n      sidecarStartup: params.sidecarStartup,\n    });',
             ],
           ]);
           const marker = (name) => `process.stdout.write("pr127853-diagnostic ${name}\\n");`;
