@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   focused-proof:
-    name: PR 127853 candidate deferred-sidecar preload proof
+    name: PR 127853 exact-head warmed-cache proof
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -28,111 +28,6 @@ jobs:
         shell: bash
         run: |
           test "$(git rev-parse HEAD)" = "5f8c56adb4aec2f8aa75c836e3578dedb90c8e54"
-
-      - name: Apply candidate test-harness fix and diagnostics
-        shell: bash
-        run: |
-          node <<'NODE'
-          const fs = require("node:fs");
-          function edit(file, replacements) {
-            let source = fs.readFileSync(file, "utf8");
-            for (const [from, to] of replacements) {
-              const parts = source.split(from);
-              if (parts.length !== 2) {
-                throw new Error(`${file}: candidate anchor count ${parts.length - 1}: ${from.slice(0, 80)}`);
-              }
-              source = `${parts[0]}${to}${parts[1]}`;
-            }
-            fs.writeFileSync(file, source);
-          }
-          edit("src/gateway/test-helpers.e2e.ts", [
-            [
-              'import { startGatewayServer } from "./server.js";',
-              'import { startGatewayServer } from "./server.js";\nimport type { GatewaySidecarStartupMode } from "./server-sidecar-startup-mode.js";',
-            ],
-            [
-              '  onEvent?: (evt: { event?: string; payload?: unknown }) => void;\n}) {',
-              '  onEvent?: (evt: { event?: string; payload?: unknown }) => void;\n  sidecarStartup?: GatewaySidecarStartupMode;\n}) {',
-            ],
-            [
-              '      controlUiEnabled: false,\n    });',
-              '      controlUiEnabled: false,\n      sidecarStartup: params.sidecarStartup,\n    });',
-            ],
-            [
-              '    const startedServer = await startGatewayServer(port, {',
-              '    process.stdout.write("pr127853-diagnostic start-server-start\\n");\n    const startedServer = await startGatewayServer(port, {',
-            ],
-            [
-              '    server = startedServer;\n    const client = await connectGatewayClient({',
-              '    process.stdout.write("pr127853-diagnostic start-server-complete\\n");\n    server = startedServer;\n    process.stdout.write("pr127853-diagnostic connect-client-start\\n");\n    const client = await connectGatewayClient({',
-            ],
-            [
-              '      onEvent: params.onEvent,\n    });\n\n    return {',
-              '      onEvent: params.onEvent,\n    });\n    process.stdout.write("pr127853-diagnostic connect-client-complete\\n");\n\n    return {',
-            ],
-            [
-              '  const role = params.role ?? "operator";',
-              '  process.stdout.write("pr127853-diagnostic connect-helper-enter\\n");\n  const role = params.role ?? "operator";',
-            ],
-            [
-              '      })(),\n    });\n  return await new Promise<InstanceType<typeof GatewayClient>>',
-              '      })(),\n    });\n  process.stdout.write("pr127853-diagnostic connect-identity-complete\\n");\n  return await new Promise<InstanceType<typeof GatewayClient>>',
-            ],
-            [
-              '    const client: InstanceType<typeof GatewayClient> | undefined = new GatewayClient({',
-              '    process.stdout.write("pr127853-diagnostic connect-client-construct-start\\n");\n    const client: InstanceType<typeof GatewayClient> | undefined = new GatewayClient({',
-            ],
-            [
-              '    const timer = setTimeout(\n      () => stop(new Error(params.timeoutMessage ?? "gateway connect timeout")),',
-              '    process.stdout.write("pr127853-diagnostic connect-client-construct-complete\\n");\n    const timer = setTimeout(\n      () => {\n        process.stdout.write("pr127853-diagnostic connect-helper-timeout\\n");\n        stop(new Error(params.timeoutMessage ?? "gateway connect timeout"));\n      },',
-            ],
-            [
-              '    client.start();\n  });',
-              '    process.stdout.write("pr127853-diagnostic connect-client-start-call\\n");\n    client.start();\n    process.stdout.write("pr127853-diagnostic connect-client-start-return\\n");\n  });',
-            ],
-          ]);
-          const marker = (name) => `process.stdout.write("pr127853-diagnostic ${name}\\n");`;
-          edit("test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts", [
-            [
-              'import { afterEach, beforeEach, describe, expect, it } from "vitest";',
-              'import { afterEach, beforeEach, describe, expect, it } from "vitest";\nimport "../../../../src/plugins/runtime/runtime-channel.js";',
-            ],
-            [
-              '          clientDisplayName: "vitest-gateway-runtime-only-inbound-context",\n        });',
-              '          clientDisplayName: "vitest-gateway-runtime-only-inbound-context",\n          sidecarStartup: "defer",\n        });',
-            ],
-            [
-              "        const providerAddress = providerServer.address();",
-              `        ${marker("provider-listening")}\n        const providerAddress = providerServer.address();`,
-            ],
-            [
-              "        const runtimeConfig = getRuntimeConfigSnapshot();",
-              `        ${marker("gateway-started")}\n        const runtimeConfig = getRuntimeConfigSnapshot();`,
-            ],
-            [
-              "          .toBe(\"function\");\n        const dispatch = getProofDispatch(dispatchKey);",
-              `          .toBe("function");\n        ${marker("dispatcher-ready")}\n        const dispatch = getProofDispatch(dispatchKey);`,
-            ],
-            [
-              "        await dispatch({\n          body: \"\",",
-              `        ${marker("runtime-dispatch-start")}\n        await dispatch({\n          body: "",`,
-            ],
-            [
-              "        });\n        expect(providerRequests).toHaveLength(1);",
-              `        });\n        ${marker("runtime-dispatch-complete")}\n        expect(providerRequests).toHaveLength(1);`,
-            ],
-            [
-              "        await dispatch({\n          body: visibleUserMessage,",
-              `        ${marker("visible-dispatch-start")}\n        await dispatch({\n          body: visibleUserMessage,`,
-            ],
-            [
-              "        });\n        expect(providerRequests).toHaveLength(2);",
-              `        });\n        ${marker("visible-dispatch-complete")}\n        expect(providerRequests).toHaveLength(2);`,
-            ],
-          ]);
-          NODE
-          git diff --check
-          git diff -- src/gateway/test-helpers.e2e.ts test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -152,18 +47,27 @@ jobs:
           path: dist
           key: pr127853-e2e-dist-5f8c56adb4a-node24-privateqa-v1
 
-      - name: Run candidate focused Gateway proof
+      - name: Run exact-head warmed-cache Gateway proof
         env:
           CI: "true"
           OPENCLAW_BUILD_PRIVATE_QA: "1"
           OPENCLAW_E2E_SKIP_BUILD: ${{ steps.pr127853-dist-cache.outputs.cache-hit == 'true' && '1' || '0' }}
           OPENCLAW_E2E_WORKERS: "1"
           OPENCLAW_GATEWAY_STARTUP_TRACE: "1"
+          OPENCLAW_VITEST_FS_MODULE_CACHE_PATH: ${{ runner.temp }}/pr127853-vitest-cache
         run: |
-          status=0
-          timeout --signal=TERM --kill-after=30s 15m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts || status=$?
+          test -z "$(git status --short)"
+          mkdir -p "$OPENCLAW_VITEST_FS_MODULE_CACHE_PATH"
+
+          warmup_status=0
+          timeout --signal=TERM --kill-after=30s 15m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts || warmup_status=$?
+          printf 'Cold-cache warmup exit status: `%s`\n' "$warmup_status" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          proof_status=0
+          timeout --signal=TERM --kill-after=30s 15m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts || proof_status=$?
+          printf 'Warmed-cache exact-head proof exit status: `%s`\n' "$proof_status" | tee -a "$GITHUB_STEP_SUMMARY"
           find /tmp -type f -name 'openclaw-*.log' -print0 | xargs -0 -r rg 'startup trace:|starting channels and sidecars|gateway sidecars failed' || true
-          exit "$status"
+          exit "$proof_status"
 
       - name: Save PR 127853 E2E dist
         if: always() && steps.pr127853-dist-cache.outputs.cache-hit != 'true'
