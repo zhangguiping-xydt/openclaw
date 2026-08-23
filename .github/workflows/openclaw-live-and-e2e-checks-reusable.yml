@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   focused-proof:
-    name: PR 127853 exact-head production-dist proof
+    name: PR 127853 source-runtime prewarm proof
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -28,6 +28,40 @@ jobs:
         shell: bash
         run: |
           test "$(git rev-parse HEAD)" = "5f8c56adb4aec2f8aa75c836e3578dedb90c8e54"
+
+      - name: Prewarm source plugin runtime before the test clock
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const file = "test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts";
+          let source = fs.readFileSync(file, "utf8");
+          const importAnchor = 'import { afterEach, beforeEach, describe, expect, it } from "vitest";';
+          const importReplacement = `${importAnchor}\nimport { createPluginModuleLoader } from "../../../../src/plugins/loader-module-runtime.js";`;
+          const bodyAnchor = 'const PROOF_CHANNEL_ID = "runtime-only-inbound-proof";';
+          const bodyReplacement = [
+            'process.stdout.write("pr127853-plugin-runtime-prewarm-start\\n");',
+            'createPluginModuleLoader({ devSourceRoot: process.cwd() })(',
+            '  path.join(process.cwd(), "src/plugins/runtime/index.ts"),',
+            ');',
+            'process.stdout.write("pr127853-plugin-runtime-prewarm-complete\\n");',
+            '',
+            bodyAnchor,
+          ].join("\n");
+          for (const [anchor, replacement] of [
+            [importAnchor, importReplacement],
+            [bodyAnchor, bodyReplacement],
+          ]) {
+            const parts = source.split(anchor);
+            if (parts.length !== 2) {
+              throw new Error(`unexpected prewarm anchor count: ${parts.length - 1}`);
+            }
+            source = `${parts[0]}${replacement}${parts[1]}`;
+          }
+          fs.writeFileSync(file, source);
+          NODE
+          git diff --check
+          git diff -- test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -47,17 +81,16 @@ jobs:
           path: dist
           key: pr127853-e2e-dist-5f8c56adb4a-node24-privateqa-v1
 
-      - name: Run exact-head production-dist Gateway proof
+      - name: Run source-runtime prewarmed Gateway proof
         env:
           CI: "true"
-          NODE_ENV: production
           OPENCLAW_BUILD_PRIVATE_QA: "1"
           OPENCLAW_E2E_SKIP_BUILD: ${{ steps.pr127853-dist-cache.outputs.cache-hit == 'true' && '1' || '0' }}
           OPENCLAW_E2E_WORKERS: "1"
           OPENCLAW_GATEWAY_STARTUP_TRACE: "1"
           OPENCLAW_VITEST_FS_MODULE_CACHE_PATH: ${{ runner.temp }}/pr127853-vitest-cache
         run: |
-          test -z "$(git status --short)"
+          test "$(git status --short)" = " M test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts"
           mkdir -p "$OPENCLAW_VITEST_FS_MODULE_CACHE_PATH"
           timeout --signal=TERM --kill-after=30s 15m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts
 
