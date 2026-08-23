@@ -79,12 +79,28 @@ jobs:
           const unfinished = startup.filter(
             (event) => event.type === "span.start" && !completed.has(event.spanId),
           );
+          const longest = startup
+            .filter(
+              (event) =>
+                (event.type === "span.end" || event.type === "span.error") &&
+                typeof event.durationMs === "number",
+            )
+            .toSorted((left, right) => right.durationMs - left.durationMs)
+            .slice(0, 20);
           process.stdout.write(`pr127853-startup-timeline ${JSON.stringify({
             eventCount: startup.length,
             unfinished: unfinished.map(({ name, spanId, timestamp, attributes }) => ({
               name,
               spanId,
               timestamp,
+              attributes,
+            })),
+            longest: longest.map(({ type, name, spanId, timestamp, durationMs, attributes }) => ({
+              type,
+              name,
+              spanId,
+              timestamp,
+              durationMs,
               attributes,
             })),
             lastEvents: startup.slice(-12).map(({ type, name, spanId, timestamp }) => ({
