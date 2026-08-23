@@ -58,6 +58,18 @@ jobs:
               '      controlUiEnabled: false,\n    });',
               '      controlUiEnabled: false,\n      sidecarStartup: params.sidecarStartup,\n    });',
             ],
+            [
+              '    const startedServer = await startGatewayServer(port, {',
+              '    process.stdout.write("pr127853-diagnostic start-server-start\\n");\n    const startedServer = await startGatewayServer(port, {',
+            ],
+            [
+              '    server = startedServer;\n    const client = await connectGatewayClient({',
+              '    process.stdout.write("pr127853-diagnostic start-server-complete\\n");\n    server = startedServer;\n    process.stdout.write("pr127853-diagnostic connect-client-start\\n");\n    const client = await connectGatewayClient({',
+            ],
+            [
+              '      onEvent: params.onEvent,\n    });\n\n    return {',
+              '      onEvent: params.onEvent,\n    });\n    process.stdout.write("pr127853-diagnostic connect-client-complete\\n");\n\n    return {',
+            ],
           ]);
           const marker = (name) => `process.stdout.write("pr127853-diagnostic ${name}\\n");`;
           edit("test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts", [
@@ -114,4 +126,4 @@ jobs:
           CI: "true"
           OPENCLAW_BUILD_PRIVATE_QA: "1"
           OPENCLAW_E2E_WORKERS: "1"
-        run: node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts
+        run: timeout --signal=TERM --kill-after=30s 10m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts
