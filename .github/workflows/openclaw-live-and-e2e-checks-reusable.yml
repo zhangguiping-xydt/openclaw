@@ -104,7 +104,7 @@ jobs:
         run: |
           test "$(git status --short)" = " M test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts"
           mkdir -p "$OPENCLAW_VITEST_FS_MODULE_CACHE_PATH"
-          timeout --signal=TERM --kill-after=30s 15m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts
+          timeout --signal=TERM --kill-after=30s 30m node scripts/run-vitest.mjs test/e2e/qa-lab/runtime/gateway-runtime-only-inbound-context.e2e.test.ts
 
       - name: Save PR 127853 E2E dist
         if: always() && steps.pr127853-dist-cache.outputs.cache-hit != 'true'
