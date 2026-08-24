@@ -1,41 +1,32 @@
+// Models HTTP tests cover OpenAI-compatible /v1/models behavior, read-scope
+// authorization, ordering, and disabled-surface responses.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { getFreePort, installGatewayTestHooks } from "./test-helpers.js";
+import { startOpenAiCompatGatewayServer } from "./openai-compatible-http.test-helpers.js";
+import { getGatewayTestPort, installGatewayTestHooks } from "./test-helpers.js";
+import { testState } from "./test-helpers.runtime-state.js";
 
 installGatewayTestHooks({ scope: "suite" });
 
 const READ_SCOPE_HEADER = { "x-openclaw-scopes": "operator.read" };
 
 let startGatewayServer: typeof import("./server.js").startGatewayServer;
-let enabledServer: Awaited<ReturnType<typeof startServer>>;
+let enabledServer: Awaited<ReturnType<typeof startOpenAiCompatGatewayServer>>;
 let enabledPort: number;
 
 beforeAll(async () => {
   ({ startGatewayServer } = await import("./server.js"));
-  enabledPort = await getFreePort();
-  enabledServer = await startServer(enabledPort, { openAiChatCompletionsEnabled: true });
+  enabledPort = await getGatewayTestPort();
+  enabledServer = await startOpenAiCompatGatewayServer({
+    startGatewayServer,
+    port: enabledPort,
+    auth: { mode: "none" },
+    openAiChatCompletionsEnabled: true,
+  });
 });
 
 afterAll(async () => {
   await enabledServer.close({ reason: "models http enabled suite done" });
 });
-
-async function startServer(port: number, opts?: { openAiChatCompletionsEnabled?: boolean }) {
-  return await startGatewayServer(port, {
-    host: "127.0.0.1",
-    auth: { mode: "none" },
-    controlUiEnabled: false,
-    openAiChatCompletionsEnabled: opts?.openAiChatCompletionsEnabled ?? false,
-  });
-}
-
-async function startTokenServer(port: number, opts?: { openAiChatCompletionsEnabled?: boolean }) {
-  return await startGatewayServer(port, {
-    host: "127.0.0.1",
-    auth: { mode: "token", token: "secret" },
-    controlUiEnabled: false,
-    openAiChatCompletionsEnabled: opts?.openAiChatCompletionsEnabled ?? false,
-  });
-}
 
 async function getModels(pathname: string, headers?: Record<string, string>) {
   return await fetch(`http://127.0.0.1:${enabledPort}${pathname}`, {
@@ -64,6 +55,11 @@ async function expectMissingReadScope(res: Response) {
     error: {
       type: "forbidden",
       message: "missing scope: operator.read",
+      details: {
+        code: "MISSING_SCOPE",
+        missingScope: "operator.read",
+        requiredScopes: ["operator.read"],
+      },
     },
   });
 }
@@ -100,6 +96,36 @@ describe("OpenAI-compatible models HTTP API (e2e)", () => {
     expect(json.id).toBe(firstId);
   });
 
+  it("rejects agent-specific model ids outside the configured roster", async () => {
+    const res = await getModels("/v1/models/openclaw%2Fnonexistent");
+    expect(res.status).toBe(404);
+    await expect(res.json()).resolves.toEqual({
+      error: {
+        message: "Model 'openclaw/nonexistent' not found.",
+        type: "invalid_request_error",
+      },
+    });
+  });
+
+  it("keeps generic aliases available for ownerless explicit fleets", async () => {
+    try {
+      testState.agentsConfig = {
+        ownership: "explicit",
+        entries: { main: {}, research: {} },
+      };
+      const list = await getModels("/v1/models");
+      expect(list.status).toBe(200);
+      const listJson = (await list.json()) as { data?: Array<{ id?: string }> };
+      expect(listJson.data?.map((entry) => entry.id)).toContain("openclaw/default");
+
+      const detail = await getModels("/v1/models/openclaw%2Fdefault");
+      expect(detail.status).toBe(200);
+      await expect(detail.json()).resolves.toMatchObject({ id: "openclaw/default" });
+    } finally {
+      testState.agentsConfig = undefined;
+    }
+  });
+
   it("rejects operator scopes that lack read access", async () => {
     const res = await getModels("/v1/models", { "x-openclaw-scopes": "operator.approvals" });
     await expectMissingReadScope(res);
@@ -119,8 +145,13 @@ describe("OpenAI-compatible models HTTP API (e2e)", () => {
   });
 
   it("rejects when disabled", async () => {
-    const port = await getFreePort();
-    const server = await startServer(port, { openAiChatCompletionsEnabled: false });
+    const port = await getGatewayTestPort();
+    const server = await startOpenAiCompatGatewayServer({
+      startGatewayServer,
+      port,
+      auth: { mode: "none" },
+      openAiChatCompletionsEnabled: false,
+    });
     try {
       const res = await fetch(`http://127.0.0.1:${port}/v1/models`, {
         headers: {},
@@ -132,8 +163,13 @@ describe("OpenAI-compatible models HTTP API (e2e)", () => {
   });
 
   it("treats shared-secret bearer auth as full compat operator access", async () => {
-    const port = await getFreePort();
-    const server = await startTokenServer(port, { openAiChatCompletionsEnabled: true });
+    const port = await getGatewayTestPort();
+    const server = await startOpenAiCompatGatewayServer({
+      startGatewayServer,
+      port,
+      auth: { mode: "token", token: "secret" },
+      openAiChatCompletionsEnabled: true,
+    });
     try {
       const res = await fetch(`http://127.0.0.1:${port}/v1/models`, {
         headers: {

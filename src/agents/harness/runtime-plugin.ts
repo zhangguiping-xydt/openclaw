@@ -1,144 +1,141 @@
+/** Resolves the selected native harness from a run-owned plugin registry. */
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { withActivatedPluginIds } from "../../plugins/activation-context.js";
+import type { ProviderRouteOverridePresence } from "../../plugin-sdk/provider-model-types.js";
+import type { PluginRegistry } from "../../plugins/registry-types.js";
 import {
-  resolveActivatableProviderOwnerPluginIds,
-  resolveBundledProviderCompatPluginIds,
-  resolveOwningPluginIdsForProvider,
-} from "../../plugins/providers.js";
+  pluginInstallPathMatchesRoot,
+  type PluginVerificationFailureReason,
+} from "../../plugins/runtime-degraded-state.js";
+import {
+  isDefaultAgentRuntimeId,
+  OPENCLAW_AGENT_RUNTIME_ID,
+  normalizeOptionalAgentRuntimeId,
+} from "../agent-runtime-id.js";
+import { isCliRuntimeAliasForProvider } from "../model-runtime-aliases.js";
 import { resolveAgentHarnessPolicy } from "./policy.js";
+import { resolveAgentHarnessOwnerPluginIds } from "./runtime-plugin-load-plan.js";
 
-function dedupePluginIds(values: readonly string[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const value of values) {
-    const pluginId = value.trim();
-    if (!pluginId || seen.has(pluginId)) {
-      continue;
+export { resolveAgentHarnessOwnerPluginIds } from "./runtime-plugin-load-plan.js";
+
+export type AgentHarnessRuntimeAvailability =
+  | {
+      status: "available";
+      ownerPluginIds: string[];
     }
-    seen.add(pluginId);
-    result.push(pluginId);
-  }
-  return result;
-}
+  | {
+      status: "unavailable";
+      ownerPluginIds: string[];
+      reason: "owner-plugin-not-activatable" | "owner-plugin-unverified" | "owner-plugin-degraded";
+      detail: string;
+    };
 
-function restrictiveAllowlistOmitsPlugin(config: OpenClawConfig | undefined, pluginId: string) {
-  if (config?.plugins?.bundledDiscovery === "compat") {
-    return false;
-  }
-  const allow = config?.plugins?.allow ?? [];
-  return allow.length > 0 && !allow.includes(pluginId);
-}
+type AgentHarnessRuntimePayloadFailure = {
+  pluginId: string;
+  installPath?: string;
+  reason: PluginVerificationFailureReason;
+};
 
-function resolveCodexHarnessPluginIds(params: {
+/**
+ * Resolves whether manifest-owned harness code is loadable without importing it.
+ * Callers must pass the result of a payload check performed for this invocation.
+ */
+export function resolveAgentHarnessRuntimeAvailability(params: {
+  runtime: string;
   provider: string;
   config?: OpenClawConfig;
   workspaceDir: string;
-}): string[] {
-  if (restrictiveAllowlistOmitsPlugin(params.config, "codex")) {
-    return ["codex"];
+  payloadFailures: readonly AgentHarnessRuntimePayloadFailure[];
+  payloadCheckedPluginIds: readonly string[];
+  selectedPluginRootDirs: ReadonlyMap<string, string>;
+}): AgentHarnessRuntimeAvailability {
+  const runtime = params.runtime.trim();
+  const ownerPluginIds = resolveAgentHarnessOwnerPluginIds({
+    ...params,
+    runtime,
+  });
+  if (ownerPluginIds.length === 0) {
+    return {
+      status: "unavailable",
+      ownerPluginIds,
+      reason: "owner-plugin-not-activatable",
+      detail: `No enabled plugin owns agent harness "${runtime}".`,
+    };
   }
-  const providerOwnerPluginIds = dedupePluginIds(
-    resolveOwningPluginIdsForProvider({
-      provider: params.provider,
-      config: params.config,
-      workspaceDir: params.workspaceDir,
-    }) ?? [],
+  const checkedPluginIds = new Set(params.payloadCheckedPluginIds);
+  const unverifiedOwner = ownerPluginIds.find(
+    (pluginId) => !params.selectedPluginRootDirs.has(pluginId) || !checkedPluginIds.has(pluginId),
   );
-  if (providerOwnerPluginIds.length === 0) {
-    return ["codex"];
+  if (unverifiedOwner) {
+    return {
+      status: "unavailable",
+      ownerPluginIds,
+      reason: "owner-plugin-unverified",
+      detail: `Agent harness "${runtime}" owner plugin "${unverifiedOwner}" payload was not verified.`,
+    };
   }
-  const safeProviderOwnerPluginIds = dedupePluginIds([
-    ...resolveBundledProviderCompatPluginIds({
-      config: params.config,
-      workspaceDir: params.workspaceDir,
-      onlyPluginIds: providerOwnerPluginIds,
-    }),
-    ...resolveActivatableProviderOwnerPluginIds({
-      pluginIds: providerOwnerPluginIds,
-      config: params.config,
-      workspaceDir: params.workspaceDir,
-    }),
-  ]);
-  return dedupePluginIds([
-    "codex",
-    ...providerOwnerPluginIds.filter(
-      (pluginId) => pluginId !== "codex" && safeProviderOwnerPluginIds.includes(pluginId),
-    ),
-  ]);
+  const failedOwner = params.payloadFailures.find((failure) => {
+    if (!ownerPluginIds.includes(failure.pluginId)) {
+      return false;
+    }
+    const selectedRootDir = params.selectedPluginRootDirs.get(failure.pluginId);
+    return selectedRootDir
+      ? pluginInstallPathMatchesRoot(failure.installPath, selectedRootDir)
+      : false;
+  });
+  if (failedOwner) {
+    return {
+      status: "unavailable",
+      ownerPluginIds,
+      reason: "owner-plugin-degraded",
+      detail: `Agent harness "${runtime}" owner plugin "${failedOwner.pluginId}" is unavailable (${failedOwner.reason}).`,
+    };
+  }
+  return { status: "available", ownerPluginIds };
 }
 
-function withRuntimePluginIdsAllowed(params: {
-  config?: OpenClawConfig;
-  requiredPluginId: string;
-  pluginIds: readonly string[];
-}): OpenClawConfig | undefined {
-  if (params.pluginIds.length === 0) {
-    return params.config;
-  }
-  if (restrictiveAllowlistOmitsPlugin(params.config, params.requiredPluginId)) {
-    return params.config;
-  }
-  const allow = dedupePluginIds([...(params.config?.plugins?.allow ?? []), ...params.pluginIds]);
-  return {
-    ...params.config,
-    plugins: {
-      ...params.config?.plugins,
-      allow,
-    },
-  };
-}
-
+/** Resolves the selected harness from the run-owned registry without loading or activating. */
 export async function ensureSelectedAgentHarnessPlugin(params: {
   provider: string;
   modelId: string;
   config?: OpenClawConfig;
   agentId?: string;
   sessionKey?: string;
+  agentHarnessId?: string;
   agentHarnessRuntimeOverride?: string;
+  requestTransportOverrides?: ProviderRouteOverridePresence;
   workspaceDir: string;
+  pluginRegistry: PluginRegistry | undefined;
 }): Promise<void> {
-  const runtimeOverride = params.agentHarnessRuntimeOverride?.trim();
+  const pinnedHarnessId = normalizeOptionalAgentRuntimeId(params.agentHarnessId);
+  const runtimeOverride = normalizeOptionalAgentRuntimeId(params.agentHarnessRuntimeOverride);
   const policy = resolveAgentHarnessPolicy({
     provider: params.provider,
     modelId: params.modelId,
     config: params.config,
     agentId: params.agentId,
     sessionKey: params.sessionKey,
+    requestTransportOverrides: params.requestTransportOverrides,
   });
+  const requestedRuntime = pinnedHarnessId ?? runtimeOverride;
   const runtime =
-    runtimeOverride && runtimeOverride !== "auto" && runtimeOverride !== "default"
-      ? runtimeOverride
+    requestedRuntime && !isDefaultAgentRuntimeId(requestedRuntime)
+      ? requestedRuntime
       : policy.runtime;
-  if (runtime !== "codex") {
+  if (
+    isDefaultAgentRuntimeId(runtime) ||
+    runtime === OPENCLAW_AGENT_RUNTIME_ID ||
+    isCliRuntimeAliasForProvider({
+      runtime,
+      provider: params.provider,
+      cfg: params.config,
+    })
+  ) {
     return;
   }
 
-  const { ensurePluginRegistryLoaded } =
-    await import("../../plugins/runtime/runtime-registry-loader.js");
-  const pluginIds = resolveCodexHarnessPluginIds({
-    provider: params.provider,
-    config: params.config,
-    workspaceDir: params.workspaceDir,
-  });
-  const configWithAllowedRuntimePlugins = withRuntimePluginIdsAllowed({
-    config: params.config,
-    requiredPluginId: "codex",
-    pluginIds,
-  });
-  const activatedConfig =
-    withActivatedPluginIds({
-      config: configWithAllowedRuntimePlugins,
-      pluginIds,
-    }) ?? configWithAllowedRuntimePlugins;
-  ensurePluginRegistryLoaded({
-    scope: "all",
-    ...(activatedConfig
-      ? {
-          config: activatedConfig,
-          activationSourceConfig: activatedConfig,
-        }
-      : {}),
-    workspaceDir: params.workspaceDir,
-    onlyPluginIds: pluginIds,
-  });
+  if (!params.pluginRegistry?.agentHarnesses.some((entry) => entry.harness.id === runtime)) {
+    throw new Error(
+      `Agent harness runtime "${runtime}" is unavailable because its plugin registration is missing from this prepared run. Enable or reinstall the plugin that provides this runtime, restart the Gateway, then retry.`,
+    );
+  }
 }

@@ -1,3 +1,6 @@
+// `openclaw plugins inspect`: renders plugin registry shape, capabilities, policy, diagnostics, and install records.
+import { getTerminalTableWidth, renderTable } from "../../packages/terminal-core/src/table.js";
+import { theme } from "../../packages/terminal-core/src/theme.js";
 import { getRuntimeConfig } from "../config/config.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import {
@@ -5,17 +8,27 @@ import {
   tracePluginLifecyclePhaseAsync,
 } from "../plugins/plugin-lifecycle-trace.js";
 import { defaultRuntime } from "../runtime.js";
-import { getTerminalTableWidth, renderTable } from "../terminal/table.js";
-import { theme } from "../terminal/theme.js";
 import { shortenHomeInString, shortenHomePath } from "../utils.js";
 import { formatMissingPluginMessage } from "./error-format.js";
-import { quietPluginJsonLogger } from "./plugins-command-helpers.js";
+import { formatCliJsonFailure } from "./failure-output.js";
+import { quietPluginJsonLogger } from "./plugins-json-logger.js";
+import { formatPluginBundleFormat } from "./plugins-list-format.js";
 
+/** Options accepted by `openclaw plugins inspect`. */
 export type PluginInspectOptions = {
   json?: boolean;
   all?: boolean;
   runtime?: boolean;
 };
+
+function failPluginInspect(message: string, json: boolean | undefined): void {
+  if (json) {
+    defaultRuntime.writeJson(formatCliJsonFailure(message));
+  } else {
+    defaultRuntime.error(message);
+  }
+  defaultRuntime.exit(1);
+}
 
 function formatInspectSection(title: string, lines: string[]): string[] {
   if (lines.length === 0) {
@@ -35,19 +48,10 @@ function formatCapabilityKinds(
   return capabilities.map((entry) => entry.kind).join(", ");
 }
 
-function formatHookSummary(params: {
-  usesLegacyBeforeAgentStart: boolean;
-  typedHookCount: number;
-  customHookCount: number;
-}): string {
+function formatHookSummary(params: { typedHookCount: number; customHookCount: number }): string {
   const parts: string[] = [];
-  if (params.usesLegacyBeforeAgentStart) {
-    parts.push("before_agent_start");
-  }
-  const nonLegacyTypedHookCount =
-    params.typedHookCount - (params.usesLegacyBeforeAgentStart ? 1 : 0);
-  if (nonLegacyTypedHookCount > 0) {
-    parts.push(`${nonLegacyTypedHookCount} typed`);
+  if (params.typedHookCount > 0) {
+    parts.push(`${params.typedHookCount} typed`);
   }
   if (params.customHookCount > 0) {
     parts.push(`${params.customHookCount} custom`);
@@ -111,6 +115,7 @@ function formatInstallLines(install: PluginInstallRecord | undefined): string[] 
   return lines;
 }
 
+/** Inspect one plugin or all plugins using either snapshot-only or runtime-loaded registry data. */
 export async function runPluginsInspectCommand(
   id: string | undefined,
   opts: PluginInspectOptions,
@@ -136,8 +141,8 @@ export async function runPluginsInspectCommand(
   const runtimeInspect = opts.runtime === true;
   if (opts.all) {
     if (id) {
-      defaultRuntime.error("Pass either a plugin id or --all, not both.");
-      return defaultRuntime.exit(1);
+      failPluginInspect("Pass either a plugin id or --all, not both.", opts.json);
+      return;
     }
     const report = runtimeInspect
       ? tracePluginLifecyclePhase(
@@ -193,7 +198,6 @@ export async function runPluginsInspectCommand(
           : "none",
       Bundle: inspect.bundleCapabilities.length > 0 ? inspect.bundleCapabilities.join(", ") : "-",
       Hooks: formatHookSummary({
-        usesLegacyBeforeAgentStart: inspect.usesLegacyBeforeAgentStart,
         typedHookCount: inspect.typedHooks.length,
         customHookCount: inspect.customHooks.length,
       }),
@@ -218,8 +222,8 @@ export async function runPluginsInspectCommand(
   }
 
   if (!id) {
-    defaultRuntime.error("Provide a plugin id or use --all.");
-    return defaultRuntime.exit(1);
+    failPluginInspect("Provide a plugin id or use --all.", opts.json);
+    return;
   }
 
   const snapshotReport = tracePluginLifecyclePhase(
@@ -233,8 +237,26 @@ export async function runPluginsInspectCommand(
   );
   const targetPlugin = snapshotReport.plugins.find((entry) => entry.id === id || entry.name === id);
   if (!targetPlugin) {
-    defaultRuntime.error(formatMissingPluginMessage({ id, includeSearch: true }));
-    return defaultRuntime.exit(1);
+    if (id === "skill-workshop") {
+      const { detectSkillWorkshopToolPolicyDiagnostic } =
+        await import("../skills/workshop/tool-policy-diagnostic.js");
+      const diagnostic = detectSkillWorkshopToolPolicyDiagnostic({
+        config: cfg,
+        // Invoking the legacy inspect id is explicit Workshop intent even when
+        // autonomous capture is off; report manual-tool availability too.
+        workshopEnabled: true,
+      });
+      const lines = [
+        "Skill Workshop is built into OpenClaw, not a plugin; configure it under skills.workshop.",
+      ];
+      if (diagnostic) {
+        lines.push(diagnostic.message);
+      }
+      failPluginInspect(lines.join("\n"), opts.json);
+      return;
+    }
+    failPluginInspect(formatMissingPluginMessage({ id, includeSearch: true }), opts.json);
+    return;
   }
   const report = runtimeInspect
     ? tracePluginLifecyclePhase(
@@ -255,10 +277,11 @@ export async function runPluginsInspectCommand(
     report,
   });
   if (!inspect) {
-    defaultRuntime.error(
+    failPluginInspect(
       formatMissingPluginMessage({ id, listCommand: "openclaw plugins list --json" }),
+      opts.json,
     );
-    return defaultRuntime.exit(1);
+    return;
   }
   const install = installRecords[inspect.plugin.id];
 
@@ -288,7 +311,9 @@ export async function runPluginsInspectCommand(
   }
   lines.push(`${theme.muted("Format:")} ${inspect.plugin.format ?? "openclaw"}`);
   if (inspect.plugin.bundleFormat) {
-    lines.push(`${theme.muted("Bundle format:")} ${inspect.plugin.bundleFormat}`);
+    lines.push(
+      `${theme.muted("Bundle format:")} ${formatPluginBundleFormat(inspect.plugin.bundleFormat)}`,
+    );
   }
   lines.push(`${theme.muted("Source:")} ${shortenHomeInString(inspect.plugin.source)}`);
   lines.push(`${theme.muted("Origin:")} ${inspect.plugin.origin}`);
@@ -297,9 +322,6 @@ export async function runPluginsInspectCommand(
   }
   lines.push(`${theme.muted("Shape:")} ${inspect.shape}`);
   lines.push(`${theme.muted("Capability mode:")} ${inspect.capabilityMode}`);
-  lines.push(
-    `${theme.muted("Legacy before_agent_start:")} ${inspect.usesLegacyBeforeAgentStart ? "yes" : "no"}`,
-  );
   if (inspect.bundleCapabilities.length > 0) {
     lines.push(`${theme.muted("Bundle capabilities:")} ${inspect.bundleCapabilities.join(", ")}`);
   }
@@ -348,7 +370,7 @@ export async function runPluginsInspectCommand(
     ...formatInspectSection(
       "MCP servers",
       inspect.mcpServers.map((entry) =>
-        entry.hasStdioTransport ? entry.name : `${entry.name} (unsupported transport)`,
+        entry.unsupported ? `${entry.name} (unsupported transport)` : entry.name,
       ),
     ),
   );

@@ -1,4 +1,8 @@
+// Covers outbound message send/poll orchestration, target resolution, durable
+// capability checks, gateway fallback, dry runs, and payload planning.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ChannelPlugin } from "../../channels/plugins/types.public.js";
 
 const mocks = vi.hoisted(() => ({
   getChannelPlugin: vi.fn(),
@@ -67,14 +71,12 @@ import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 
 let sendMessage: typeof import("./message.js").sendMessage;
-let resetOutboundChannelResolutionStateForTest: typeof import("./channel-resolution.js").resetOutboundChannelResolutionStateForTest;
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(`expected ${label} to be an object`);
-  }
-  return value as Record<string, unknown>;
-}
+beforeAll(async () => {
+  ({ sendMessage } = await import("./message.js"));
+});
+
+const requireRecord = createRequireRecord("record", "expected-label-object");
 
 function expectRecordFields(
   value: unknown,
@@ -128,14 +130,8 @@ function readPayloadSummary(
 }
 
 describe("sendMessage", () => {
-  beforeAll(async () => {
-    ({ sendMessage } = await import("./message.js"));
-    ({ resetOutboundChannelResolutionStateForTest } = await import("./channel-resolution.js"));
-  });
-
   beforeEach(() => {
     setActivePluginRegistry(createTestRegistry([]));
-    resetOutboundChannelResolutionStateForTest();
     mocks.getChannelPlugin.mockClear();
     mocks.resolveOutboundTarget.mockClear();
     mocks.deliverOutboundPayloads.mockClear();
@@ -143,7 +139,7 @@ describe("sendMessage", () => {
     mocks.resolveRuntimePluginRegistry.mockClear();
 
     mocks.getChannelPlugin.mockReturnValue({
-      outbound: { deliveryMode: "direct" },
+      outbound: { deliveryMode: "direct", sendText: vi.fn() },
     });
     mocks.resolveOutboundTarget.mockImplementation(({ to }: { to: string }) => ({ ok: true, to }));
     mocks.deliverOutboundPayloads.mockResolvedValue([{ channel: "forum", messageId: "m1" }]);
@@ -218,6 +214,7 @@ describe("sendMessage", () => {
       to: "123456",
       content: "hi",
       requesterSessionKey: "agent:main:directchat:group:ops",
+      conversationType: "channel",
       requesterAccountId: "work",
       requesterSenderId: "attacker",
       mirror: {
@@ -230,6 +227,8 @@ describe("sendMessage", () => {
       deliveryParams.session,
       {
         key: "agent:main:directchat:group:ops",
+        conversationType: "group",
+        conversationKind: "channel",
         requesterAccountId: "work",
         requesterSenderId: "attacker",
       },
@@ -304,6 +303,7 @@ describe("sendMessage", () => {
 
     const deliveryParams = expectDeliveryCallFields({
       queuePolicy: "required",
+      requireUnknownSendReconciliation: true,
       mediaAccess,
     });
     expectRecordFields(
@@ -334,6 +334,52 @@ describe("sendMessage", () => {
     );
   });
 
+  it("can require queue persistence without provider unknown-send reconciliation", async () => {
+    const onDeliveryIntent = vi.fn();
+    const onDeliveryResult = vi.fn();
+
+    await sendMessage({
+      cfg: {},
+      channel: "forum",
+      to: "123456",
+      content: "conversation delivery",
+      queuePolicy: "required",
+      requireUnknownSendReconciliation: false,
+      deliveryIntentId: "operation-1",
+      deliveryCompletion: {
+        kind: "conversation",
+        agentId: "main",
+        operationId: "operation-1",
+      },
+      onDeliveryIntent,
+      onDeliveryResult,
+    });
+
+    const deliveryParams = expectDeliveryCallFields({
+      queuePolicy: "required",
+      deliveryIntentId: "operation-1",
+      deliveryCompletion: {
+        kind: "conversation",
+        agentId: "main",
+        operationId: "operation-1",
+      },
+      onDeliveryResult,
+    });
+    const wrappedIntent = deliveryParams.onDeliveryIntent as
+      | ((intent: { id: string; channel: "forum"; to: string; queuePolicy: "required" }) => void)
+      | undefined;
+    wrappedIntent?.({
+      id: "queue-1",
+      channel: "forum",
+      to: "123456",
+      queuePolicy: "required",
+    });
+    expect(onDeliveryIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "queue-1", durability: "required" }),
+    );
+    expect(mocks.resolveOutboundDurableFinalDeliverySupport).not.toHaveBeenCalled();
+  });
+
   it("rejects required durable sends before enqueue when replay safety is unsupported", async () => {
     mocks.resolveOutboundDurableFinalDeliverySupport.mockResolvedValueOnce({
       ok: false,
@@ -341,16 +387,18 @@ describe("sendMessage", () => {
       capability: "reconcileUnknownSend",
     });
 
-    await expect(
-      sendMessage({
-        cfg: {},
-        channel: "forum",
-        to: "123456",
-        content: "fallback text",
-        payloads: [{ text: "prepared", channelData: { forum: { card: true } } }],
-        queuePolicy: "required",
-      }),
-    ).rejects.toThrow("missing reconcileUnknownSend");
+    const send = sendMessage({
+      cfg: {},
+      channel: "forum",
+      to: "123456",
+      content: "fallback text",
+      payloads: [{ text: "prepared", channelData: { forum: { card: true } } }],
+      queuePolicy: "required",
+    });
+
+    await expect(send).rejects.toThrow(
+      /missing reconcileUnknownSend[\s\S]*queuePolicy:"best_effort"[\s\S]*omit bestEffort:false/,
+    );
 
     expect(mocks.deliverOutboundPayloads).not.toHaveBeenCalled();
   });
@@ -454,18 +502,33 @@ describe("sendMessage", () => {
     }
   });
 
-  it("does not load registries while resolving outbound plugins", async () => {
-    const forumPlugin = {
-      outbound: { deliveryMode: "direct" },
+  it("uses a prepared plugin for channel and target resolution without registry lookup", async () => {
+    const forumPlugin: ChannelPlugin = {
+      id: "forum",
+      meta: {
+        id: "forum",
+        label: "Forum",
+        selectionLabel: "Forum",
+        docsPath: "/channels/forum",
+        blurb: "Forum test plugin.",
+      },
+      capabilities: { chatTypes: ["channel"] },
+      config: {
+        listAccountIds: () => [],
+        resolveAccount: () => ({}),
+      },
+      outbound: { deliveryMode: "direct", sendText: vi.fn() },
     };
-    mocks.getChannelPlugin
-      .mockReturnValueOnce(undefined)
-      .mockReturnValueOnce(forumPlugin)
-      .mockReturnValue(forumPlugin);
+    mocks.getChannelPlugin.mockReturnValue(undefined);
+    mocks.resolveOutboundTarget.mockImplementation(({ plugin }: { plugin?: ChannelPlugin }) => ({
+      ok: true,
+      to: plugin === forumPlugin ? "prepared:123456" : "wrong-plugin",
+    }));
 
     const result = await sendMessage({
       cfg: { channels: { forum: { token: "test-token" } } },
       channel: "forum",
+      preparedPlugin: forumPlugin,
       to: "123456",
       content: "hi",
     });
@@ -475,31 +538,79 @@ describe("sendMessage", () => {
         channel: "forum",
         to: "123456",
         via: "direct",
+        deliveryStatus: "sent",
       },
       "send message result",
     );
 
+    expect(mocks.getChannelPlugin).not.toHaveBeenCalled();
     expect(mocks.resolveRuntimePluginRegistry).not.toHaveBeenCalled();
+    expect(mocks.resolveOutboundTarget).toHaveBeenCalledTimes(1);
+    const targetParams = requireRecord(
+      getMockCallArg(mocks.resolveOutboundTarget, 0, 0, "outbound target"),
+      "outbound target params",
+    );
+    expect(targetParams.plugin).toBe(forumPlugin);
+    expectDeliveryCallFields({ to: "prepared:123456" });
   });
 
-  it("does not throw best-effort direct send failures", async () => {
+  it.each(["cancelled_by_message_sending_hook", "adapter_returned_no_identity"] as const)(
+    "preserves aggregate suppression reason %s",
+    async (reason) => {
+      mocks.deliverOutboundPayloads.mockImplementationOnce(async (params: unknown) => {
+        const callbacks = params as {
+          onPayloadDeliveryOutcome?: (outcome: unknown) => void;
+        };
+        callbacks.onPayloadDeliveryOutcome?.({
+          index: 0,
+          status: "suppressed",
+          reason,
+          hookEffect: {
+            cancelReason: "owned-by-other-agent",
+            metadata: { unsafeForJson: 1n },
+          },
+        });
+        return [];
+      });
+
+      const result = await sendMessage({
+        cfg: {},
+        channel: "forum",
+        to: "123456",
+        content: "hidden",
+      });
+
+      expect(result.deliveryStatus).toBe("suppressed");
+      expect(result).toMatchObject({ suppressionReason: reason });
+      expect(result.payloadOutcomes).toEqual([
+        {
+          index: 0,
+          status: "suppressed",
+          reason,
+        },
+      ]);
+      expect(() => JSON.stringify(result)).not.toThrow();
+    },
+  );
+
+  it("does not throw best-effort direct send failures but reports the failure", async () => {
     mocks.deliverOutboundPayloads.mockImplementationOnce(async (params: unknown) => {
       (
         params as {
           onPayloadDeliveryOutcome?: (outcome: {
             index: number;
-            payload: { text: string };
             status: "failed";
             error: Error;
-            stage: "send";
+            sentBeforeError: boolean;
+            stage: "platform_send";
           }) => void;
         }
       ).onPayloadDeliveryOutcome?.({
         index: 0,
-        payload: { text: "hi" },
         status: "failed",
         error: new Error("transport unavailable"),
-        stage: "send",
+        sentBeforeError: false,
+        stage: "platform_send",
       });
       return [];
     });
@@ -518,13 +629,76 @@ describe("sendMessage", () => {
         to: "123456",
         via: "direct",
         result: undefined,
+        deliveryStatus: "failed",
+        error: "transport unavailable",
       },
       "best-effort send message result",
     );
+    expect(result.payloadOutcomes).toEqual([
+      {
+        index: 0,
+        status: "failed",
+        error: "transport unavailable",
+        sentBeforeError: false,
+        stage: "platform_send",
+      },
+    ]);
 
     expectDeliveryCallFields({
       bestEffort: true,
       queuePolicy: "best_effort",
     });
+  });
+
+  it("reports partial delivery on best-effort direct sends instead of plain success", async () => {
+    mocks.deliverOutboundPayloads.mockImplementationOnce(async (params: unknown) => {
+      const callbacks = params as {
+        onPayloadDeliveryOutcome?: (outcome: unknown) => void;
+      };
+      callbacks.onPayloadDeliveryOutcome?.({
+        index: 0,
+        status: "sent",
+        results: [{ channel: "forum", messageId: "m1" }],
+      });
+      callbacks.onPayloadDeliveryOutcome?.({
+        index: 1,
+        status: "failed",
+        error: new Error("chunk 2 rejected"),
+        sentBeforeError: true,
+        stage: "platform_send",
+      });
+      return [{ channel: "forum", messageId: "m1" }];
+    });
+
+    const result = await sendMessage({
+      cfg: {},
+      channel: "forum",
+      to: "123456",
+      content: "hi",
+      bestEffort: true,
+    });
+    expectRecordFields(
+      result,
+      {
+        channel: "forum",
+        to: "123456",
+        via: "direct",
+        result: { channel: "forum", messageId: "m1" },
+        deliveryStatus: "partial_failed",
+        error: "chunk 2 rejected",
+        sentBeforeError: true,
+      },
+      "best-effort partial send message result",
+    );
+    expect(result.payloadOutcomes).toEqual([
+      { index: 0, status: "sent", resultCount: 1 },
+      {
+        index: 1,
+        status: "failed",
+        error: "chunk 2 rejected",
+        sentBeforeError: true,
+        stage: "platform_send",
+      },
+    ]);
   });
 });

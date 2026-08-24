@@ -1,25 +1,15 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+// Codex tests cover transport stdio plugin behavior.
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexAppServerStartOptions } from "./config.js";
-import {
-  resolveCodexAppServerSpawnEnv,
-  resolveCodexAppServerSpawnInvocation,
-} from "./transport-stdio.js";
+import { resolveCodexAppServerRuntimeOptions } from "./config.js";
+import { createStdioTransport, resolveCodexAppServerSpawnEnv } from "./transport-stdio.js";
 
-const tempDirs: string[] = [];
+const spawnMock = vi.hoisted(() => vi.fn(() => ({ pid: 1234 })));
 
-async function createTempDir(): Promise<string> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "openclaw-codex-spawn-"));
-  tempDirs.push(dir);
-  return dir;
-}
+vi.mock("node:child_process", () => ({ spawn: spawnMock }));
 
-afterEach(async () => {
-  for (const dir of tempDirs.splice(0)) {
-    await rm(dir, { recursive: true, force: true });
-  }
+beforeEach(() => {
+  spawnMock.mockClear();
 });
 
 function startOptions(command: string): CodexAppServerStartOptions {
@@ -31,62 +21,41 @@ function startOptions(command: string): CodexAppServerStartOptions {
   };
 }
 
-describe("resolveCodexAppServerSpawnInvocation", () => {
-  it("keeps non-Windows Codex app-server invocation unchanged", () => {
-    const resolved = resolveCodexAppServerSpawnInvocation(startOptions("codex"), {
-      platform: "darwin",
-      env: {},
-      execPath: "/usr/local/bin/node",
+describe("createStdioTransport", () => {
+  it("spawns a compatibility endpoint in its configured working directory", () => {
+    createStdioTransport({
+      ...startOptions("codex"),
+      cwd: "/srv/codex-project",
     });
 
-    expect(resolved).toEqual({
-      command: "codex",
-      args: ["app-server", "--listen", "stdio://"],
-      shell: undefined,
-      windowsHide: undefined,
-    });
-  });
-
-  it("requires managed Codex commands to be resolved before spawn", () => {
-    expect(() =>
-      resolveCodexAppServerSpawnInvocation(
-        {
-          ...startOptions("codex"),
-          commandSource: "managed",
-        },
-        {
-          platform: "darwin",
-          env: {},
-          execPath: "/usr/local/bin/node",
-        },
-      ),
-    ).toThrow("must be resolved before spawn");
-  });
-
-  it("resolves Windows npm .cmd Codex shims through Node instead of raw spawn", async () => {
-    const binDir = await createTempDir();
-    const entryPath = path.join(binDir, "node_modules", "@openai", "codex", "bin", "codex.js");
-    const shimPath = path.join(binDir, "codex.cmd");
-    await mkdir(path.dirname(entryPath), { recursive: true });
-    await writeFile(entryPath, "console.log('codex')\n", "utf8");
-    await writeFile(
-      shimPath,
-      '@ECHO off\r\n"%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n',
-      "utf8",
+    expect(spawnMock).toHaveBeenCalledWith(
+      "codex",
+      ["app-server", "--listen", "stdio://"],
+      expect.objectContaining({ cwd: "/srv/codex-project" }),
     );
+  });
 
-    const resolved = resolveCodexAppServerSpawnInvocation(startOptions("codex"), {
-      platform: "win32",
-      env: { PATH: binDir, PATHEXT: ".CMD;.EXE;.BAT" },
-      execPath: "C:\\node\\node.exe",
+  it("passes native context and auto-compaction arguments to Codex unchanged", () => {
+    const args = [
+      "app-server",
+      "--listen",
+      "stdio://",
+      "-c",
+      "model_context_window=1000000",
+      "-c",
+      "model_auto_compact_token_limit=700000",
+      "-c",
+      "model_auto_compact_token_limit_scope=total",
+    ];
+    const runtime = resolveCodexAppServerRuntimeOptions({
+      pluginConfig: { appServer: { command: "codex", args } },
+      env: {},
+      requirementsToml: null,
     });
 
-    expect(resolved).toEqual({
-      command: "C:\\node\\node.exe",
-      args: [entryPath, "app-server", "--listen", "stdio://"],
-      shell: undefined,
-      windowsHide: true,
-    });
+    createStdioTransport(runtime.start);
+
+    expect(spawnMock).toHaveBeenCalledWith("codex", args, expect.any(Object));
   });
 });
 
@@ -132,6 +101,24 @@ describe("resolveCodexAppServerSpawnEnv", () => {
       KEEP: "parent",
       Other: "configured",
     });
+  });
+
+  it("strips inherited runtime loader injection before spawn", () => {
+    expect({
+      ...resolveCodexAppServerSpawnEnv(
+        {
+          env: {
+            NODE_PATH: "/configured/node_modules",
+            DYLD_INSERT_LIBRARIES: "/configured/inject.dylib",
+          },
+        },
+        {
+          NODE_PATH: "/ambient/node_modules",
+          LD_PRELOAD: "/ambient/inject.so",
+          KEEP: "safe",
+        },
+      ),
+    }).toEqual({ KEEP: "safe" });
   });
 
   it("uses a null-prototype env map and ignores prototype-polluting keys", () => {

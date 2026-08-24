@@ -1,8 +1,9 @@
+// Feishu tests cover monitor.reaction plugin behavior.
 import {
   createInboundDebouncer,
   resolveInboundDebounceMs,
 } from "openclaw/plugin-sdk/channel-inbound-debounce";
-import { hasControlCommand } from "openclaw/plugin-sdk/command-detection";
+import { hasControlCommand, isControlCommandMessage } from "openclaw/plugin-sdk/command-detection";
 import { createNonExitingRuntimeEnv } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClawdbotConfig, PluginRuntime } from "../runtime-api.js";
@@ -232,9 +233,21 @@ function expectParsedFirstDispatchedEvent(botOpenId = "ou_bot") {
   };
 }
 
+function createClaimedFeishuDedupeResult() {
+  return {
+    kind: "claimed" as const,
+    handle: {
+      keys: ["test"] as const,
+      commit: async () => true,
+      release: () => undefined,
+    },
+  };
+}
+
 function setDedupPassThroughMocks(): void {
-  vi.spyOn(dedup, "tryBeginFeishuMessageProcessing").mockReturnValue(true);
-  vi.spyOn(dedup, "recordProcessedFeishuMessage").mockResolvedValue(true);
+  vi.spyOn(dedup, "claimUnprocessedFeishuMessage").mockResolvedValue(
+    createClaimedFeishuDedupeResult(),
+  );
   vi.spyOn(dedup, "hasProcessedFeishuMessage").mockResolvedValue(false);
 }
 
@@ -255,10 +268,14 @@ function mentionOpenIds(event: FeishuMessageEvent): string[] {
 function createFeishuMonitorRuntime(params?: {
   createInboundDebouncer?: PluginRuntime["channel"]["debounce"]["createInboundDebouncer"];
   resolveInboundDebounceMs?: PluginRuntime["channel"]["debounce"]["resolveInboundDebounceMs"];
+  isControlCommandMessage?: PluginRuntime["channel"]["commands"]["isControlCommandMessage"];
   hasControlCommand?: PluginRuntime["channel"]["text"]["hasControlCommand"];
 }): PluginRuntime {
   return {
     channel: {
+      commands: {
+        isControlCommandMessage: params?.isControlCommandMessage ?? isControlCommandMessage,
+      },
       debounce: {
         createInboundDebouncer: params?.createInboundDebouncer ?? createInboundDebouncer,
         resolveInboundDebounceMs: params?.resolveInboundDebounceMs ?? resolveInboundDebounceMs,
@@ -360,7 +377,56 @@ describe("resolveReactionSyntheticEvent", () => {
       uuid: () => "fixed-uuid",
     });
     expect(result?.message.message_id).toBe("om_msg1:reaction:THUMBSUP:fixed-uuid");
+    expect(result?.message.typing_target_message_id).toBe("om_msg1");
   });
+
+  it("preserves reaction actors when Feishu supplies user_id without open_id", async () => {
+    const result = await resolveReactionSyntheticEvent({
+      cfg,
+      accountId: "default",
+      event: makeReactionEvent({ user_id: { user_id: "u_actor_only" } }),
+      botOpenId: "ou_bot",
+      fetchMessage: async () => createFetchedReactionMessage("oc_group_from_lookup", "group"),
+      uuid: () => "fixed-uuid",
+    });
+
+    expect(result?.sender.sender_id).toEqual({ user_id: "u_actor_only" });
+    expect(parseFeishuMessageEvent(result!, "ou_bot").senderOpenId).toBe("u_actor_only");
+  });
+
+  it.each(["created", "deleted"] as const)(
+    "preserves the real reply anchor and topic ownership for %s reactions",
+    async (action) => {
+      const result = await resolveReactionSyntheticEvent({
+        cfg,
+        accountId: "default",
+        event: makeReactionEvent(),
+        botOpenId: "ou_bot",
+        action,
+        fetchMessage: async () => ({
+          ...createFetchedReactionMessage("oc_topic_group", "group"),
+          rootId: "om_topic_root",
+          threadId: "omt_topic",
+        }),
+        uuid: () => "fixed-uuid",
+      });
+
+      expect(result?.message).toEqual(
+        expect.objectContaining({
+          reply_target_message_id: "om_msg1",
+          root_id: "om_topic_root",
+          thread_id: "omt_topic",
+        }),
+      );
+      expect(parseFeishuMessageEvent(result!, "ou_bot")).toEqual(
+        expect.objectContaining({
+          replyTargetMessageId: "om_msg1",
+          rootId: "om_topic_root",
+          threadId: "omt_topic",
+        }),
+      );
+    },
+  );
 
   it("drops unverified reactions when sender verification times out", async () => {
     const event = makeReactionEvent();
@@ -394,6 +460,8 @@ describe("resolveReactionSyntheticEvent", () => {
       },
       message: {
         message_id: "om_msg1:reaction:THUMBSUP:fixed-uuid",
+        reply_target_message_id: "om_msg1",
+        typing_target_message_id: "om_msg1",
         chat_id: "oc_group_from_event",
         chat_type: "group",
         message_type: "text",
@@ -533,6 +601,32 @@ describe("Feishu inbound debounce regressions", () => {
     vi.restoreAllMocks();
   });
 
+  it("releases pending text before a bare abort trigger instead of debouncing it", async () => {
+    setDedupPassThroughMocks();
+    const onMessage = await setupDebounceMonitor();
+
+    await enqueueDebouncedMessage(onMessage, createTextEvent({ messageId: "om_1", text: "first" }));
+    expect(handleFeishuMessageMock).not.toHaveBeenCalled();
+
+    await enqueueDebouncedMessage(
+      onMessage,
+      createTextEvent({ messageId: "om_stop", text: "stop" }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(handleFeishuMessageMock).toHaveBeenCalledTimes(2);
+    const first = getFirstDispatchedEvent();
+    const secondCall = mockCallAt(handleFeishuMessageMock, 1, "Feishu stop dispatch")[0] as
+      | { event?: FeishuMessageEvent }
+      | undefined;
+    const second = secondCall?.event;
+    expect(JSON.parse(first.message.content)).toEqual({ text: "first" });
+    expect(second?.message.message_id).toBe("om_stop");
+    expect(JSON.parse(second?.message.content ?? "{}")).toEqual({ text: "stop" });
+  });
+
   it("keeps bot mention when per-message mention keys collide across non-forward messages", async () => {
     setDedupPassThroughMocks();
     const onMessage = await setupDebounceMonitor();
@@ -562,8 +656,9 @@ describe("Feishu inbound debounce regressions", () => {
   });
 
   it("passes prefetched botName through to handleFeishuMessage", async () => {
-    vi.spyOn(dedup, "tryBeginFeishuMessageProcessing").mockReturnValue(true);
-    vi.spyOn(dedup, "recordProcessedFeishuMessage").mockResolvedValue(true);
+    vi.spyOn(dedup, "claimUnprocessedFeishuMessage").mockResolvedValue(
+      createClaimedFeishuDedupeResult(),
+    );
     vi.spyOn(dedup, "hasProcessedFeishuMessage").mockResolvedValue(false);
     const onMessage = await setupDebounceMonitor({ botName: "OpenClaw Bot" });
 
@@ -645,8 +740,9 @@ describe("Feishu inbound debounce regressions", () => {
   });
 
   it("excludes previously processed retries from combined debounce text", async () => {
-    vi.spyOn(dedup, "tryBeginFeishuMessageProcessing").mockReturnValue(true);
-    vi.spyOn(dedup, "recordProcessedFeishuMessage").mockResolvedValue(true);
+    vi.spyOn(dedup, "claimUnprocessedFeishuMessage").mockResolvedValue(
+      createClaimedFeishuDedupeResult(),
+    );
     setStaleRetryMocks();
     const onMessage = await setupDebounceMonitor();
 
@@ -671,8 +767,15 @@ describe("Feishu inbound debounce regressions", () => {
   });
 
   it("uses latest fresh message id when debounce batch ends with stale retry", async () => {
-    vi.spyOn(dedup, "tryBeginFeishuMessageProcessing").mockReturnValue(true);
-    const recordSpy = vi.spyOn(dedup, "recordProcessedFeishuMessage").mockResolvedValue(true);
+    const staleCommit = vi.fn(async () => true);
+    vi.spyOn(dedup, "claimUnprocessedFeishuMessage").mockImplementation(async ({ messageId }) => ({
+      kind: "claimed",
+      handle: {
+        keys: [messageId ?? "test"],
+        commit: messageId === "om_old_latest_fresh" ? staleCommit : async () => true,
+        release: () => undefined,
+      },
+    }));
     setStaleRetryMocks("om_old_latest_fresh");
     const onMessage = await setupDebounceMonitor();
 
@@ -688,15 +791,7 @@ describe("Feishu inbound debounce regressions", () => {
     expect(dispatched.message.message_id).toBe("om_new_latest_fresh");
     const combined = JSON.parse(dispatched.message.content) as { text?: string };
     expect(combined.text).toBe("fresh");
-    expect(recordSpy).toHaveBeenCalledTimes(1);
-    const [recordedMessageId, recordedNamespace, recordedLogger] = mockCallAt(
-      recordSpy,
-      0,
-      "Feishu processed-message record",
-    );
-    expect(recordedMessageId).toBe("om_old_latest_fresh");
-    expect(recordedNamespace).toBe("default");
-    expect(typeof recordedLogger).toBe("function");
+    expect(staleCommit).toHaveBeenCalledTimes(1);
   });
 
   it("releases early event dedupe when debounced dispatch fails", async () => {
@@ -711,6 +806,7 @@ describe("Feishu inbound debounce regressions", () => {
           },
           flushKey: async () => {},
           cancelKey: () => false,
+          drain: async () => {},
         }),
       }),
     );
@@ -735,5 +831,68 @@ describe("Feishu inbound debounce regressions", () => {
     await vi.advanceTimersByTimeAsync(25);
 
     expect(handleFeishuMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  describe("monitorSingleAccount channelRuntime guard", () => {
+    it("falls back to local runtime when channelRuntime is partial (no inbound)", async () => {
+      setFeishuRuntime(createFeishuMonitorRuntime());
+      const register = vi.fn();
+      createEventDispatcherMock.mockReturnValue({ register });
+
+      await expect(
+        monitorSingleAccount({
+          cfg: buildDebounceConfig(),
+          account: buildDebounceAccount(),
+          runtime: createNonExitingRuntimeEnv(),
+          channelRuntime: { runtimeContexts: {} } as unknown as PluginRuntime["channel"],
+          botOpenIdSource: { kind: "prefetched", botOpenId: "ou_bot" },
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(register).toHaveBeenCalled();
+    });
+
+    it("uses provided channelRuntime when it has inbound", async () => {
+      setFeishuRuntime(createFeishuMonitorRuntime());
+      const register = vi.fn();
+      createEventDispatcherMock.mockReturnValue({ register });
+
+      await expect(
+        monitorSingleAccount({
+          cfg: buildDebounceConfig(),
+          account: buildDebounceAccount(),
+          runtime: createNonExitingRuntimeEnv(),
+          channelRuntime: {
+            runtimeContexts: {} as never,
+            inbound: { run: vi.fn() },
+            debounce: {
+              resolveInboundDebounceMs: vi.fn().mockReturnValue(2000),
+              createInboundDebouncer: vi.fn(),
+            },
+          } as unknown as PluginRuntime["channel"],
+          botOpenIdSource: { kind: "prefetched", botOpenId: "ou_bot" },
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(register).toHaveBeenCalled();
+    });
+
+    it("falls back to local runtime when channelRuntime is undefined", async () => {
+      setFeishuRuntime(createFeishuMonitorRuntime());
+      const register = vi.fn();
+      createEventDispatcherMock.mockReturnValue({ register });
+
+      await expect(
+        monitorSingleAccount({
+          cfg: buildDebounceConfig(),
+          account: buildDebounceAccount(),
+          runtime: createNonExitingRuntimeEnv(),
+          channelRuntime: undefined,
+          botOpenIdSource: { kind: "prefetched", botOpenId: "ou_bot" },
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(register).toHaveBeenCalled();
+    });
   });
 });

@@ -1,8 +1,14 @@
-import { assertOkOrThrowProviderError } from "openclaw/plugin-sdk/provider-http";
+// Minimax plugin module implements tts behavior.
+import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import {
+  assertOkOrThrowProviderError,
+  readProviderJsonResponse,
+} from "openclaw/plugin-sdk/provider-http";
 import {
   fetchWithSsrFGuard,
   ssrfPolicyFromHttpBaseUrlAllowedHostname,
 } from "openclaw/plugin-sdk/ssrf-runtime";
+import { assertMinimaxBaseResp, normalizeMinimaxHexAudio } from "./media-provider-runtime.js";
 
 export const DEFAULT_MINIMAX_TTS_BASE_URL = "https://api.minimax.io";
 
@@ -15,7 +21,6 @@ export const MINIMAX_TTS_MODELS = [
   "speech-02-turbo",
   "speech-01-hd",
   "speech-01-turbo",
-  "speech-01-240228",
 ] as const;
 
 export const MINIMAX_TTS_VOICES = [
@@ -57,16 +62,17 @@ export async function minimaxTTS(params: {
     baseUrl,
     model,
     voiceId,
-    speed = 1.0,
-    vol = 1.0,
+    speed = 1,
+    vol = 1,
     pitch = 0,
     format = "mp3",
     sampleRate = 32000,
     timeoutMs,
   } = params;
+  const safeTimeoutMs = resolveTimerTimeoutMs(timeoutMs, 1);
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), safeTimeoutMs);
 
   try {
     const { response, release } = await fetchWithSsrFGuard({
@@ -80,6 +86,8 @@ export async function minimaxTTS(params: {
         body: JSON.stringify({
           model,
           text,
+          stream: false,
+          output_format: "hex",
           voice_setting: {
             voice_id: voiceId,
             speed,
@@ -93,20 +101,25 @@ export async function minimaxTTS(params: {
         }),
         signal: controller.signal,
       },
-      timeoutMs,
+      timeoutMs: safeTimeoutMs,
       policy: ssrfPolicyFromHttpBaseUrlAllowedHostname(baseUrl),
       auditContext: "minimax.tts",
     });
     try {
       await assertOkOrThrowProviderError(response, "MiniMax TTS API error");
 
-      const body = (await response.json()) as { data?: { audio?: string } };
+      const body = await readProviderJsonResponse<{
+        data?: { audio?: string };
+        base_resp?: { status_code?: number; status_msg?: string };
+      }>(response, "minimax.tts");
+
+      assertMinimaxBaseResp(body.base_resp, "MiniMax TTS API error");
       const hexAudio = body?.data?.audio;
       if (!hexAudio) {
         throw new Error("MiniMax TTS API returned no audio data");
       }
 
-      return Buffer.from(hexAudio, "hex");
+      return Buffer.from(normalizeMinimaxHexAudio(hexAudio, "MiniMax TTS API"), "hex");
     } finally {
       await release();
     }

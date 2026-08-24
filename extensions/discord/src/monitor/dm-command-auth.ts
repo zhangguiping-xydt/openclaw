@@ -1,6 +1,8 @@
+// Discord plugin module implements dm command auth behavior.
 import {
   type AccessGroupMembershipFact,
   type ChannelIngressEventInput,
+  type ChannelIngressContextBinding,
   type ChannelIngressIdentifierKind,
   createChannelIngressResolver,
   defineStableChannelIngressIdentity,
@@ -179,6 +181,10 @@ export async function resolveDiscordDmCommandAccess(params: {
   rest?: RequestClient;
   readStoreAllowFrom?: ResolveChannelMessageIngressParams["readStoreAllowFrom"];
   eventKind?: ChannelIngressEventInput["kind"];
+  conversationId?: string;
+  conversationParentId?: string;
+  conversationThreadId?: string;
+  contextBinding?: ChannelIngressContextBinding;
 }) {
   return await createDiscordIngressResolver({
     accountId: params.accountId,
@@ -191,8 +197,11 @@ export async function resolveDiscordDmCommandAccess(params: {
     subject: createDiscordDmIngressSubject(params.sender),
     conversation: {
       kind: "direct",
-      id: params.sender.id,
+      id: params.conversationId ?? params.sender.id,
+      parentId: params.conversationParentId,
+      threadId: params.conversationThreadId,
     },
+    ...(params.contextBinding ? { contextBinding: params.contextBinding } : {}),
     event: {
       kind: params.eventKind ?? "native-command",
       authMode: "inbound",
@@ -223,6 +232,10 @@ export async function resolveDiscordTextCommandAccess(params: {
   cfg?: OpenClawConfig;
   token?: string;
   rest?: RequestClient;
+  conversationId?: string;
+  conversationParentId?: string;
+  conversationThreadId?: string;
+  contextBinding?: ChannelIngressContextBinding;
 }) {
   const ownerAllowFrom = (params.ownerAllowFrom ?? []).filter((entry) => entry.trim() !== "*");
   const memberAccessGroup = "discord-member-access";
@@ -238,9 +251,12 @@ export async function resolveDiscordTextCommandAccess(params: {
   }).command({
     subject: createDiscordDmIngressSubject(params.sender),
     conversation: {
-      kind: "group",
-      id: "discord-command",
+      kind: "channel",
+      id: params.conversationId ?? "discord-command",
+      parentId: params.conversationParentId,
+      threadId: params.conversationThreadId,
     },
+    ...(params.contextBinding ? { contextBinding: params.contextBinding } : {}),
     accessGroupMembership,
     dmPolicy: "allowlist",
     groupPolicy: "allowlist",
@@ -255,5 +271,5 @@ export async function resolveDiscordTextCommandAccess(params: {
       modeWhenAccessGroupsOff: "configured",
     },
   });
-  return result.commandAccess;
+  return result;
 }

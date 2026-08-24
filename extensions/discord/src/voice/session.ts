@@ -1,11 +1,14 @@
+// Discord plugin module implements session behavior.
+import type { DiscordAccountConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
+import type { TranscriptUtterance } from "openclaw/plugin-sdk/transcripts";
 import { ChannelType } from "../internal/discord.js";
 import type { VoiceCaptureState } from "./capture-state.js";
 import type { VoiceReceiveRecoveryState } from "./receive-recovery.js";
 
 export const MIN_SEGMENT_SECONDS = 0.35;
-export const CAPTURE_FINALIZE_GRACE_MS = 2_500;
+export const CAPTURE_FINALIZE_GRACE_MS = 2_000;
 export const VOICE_CONNECT_READY_TIMEOUT_MS = 30_000;
 export const VOICE_RECONNECT_GRACE_MS = 15_000;
 export const PLAYBACK_READY_TIMEOUT_MS = 60_000;
@@ -24,6 +27,33 @@ export type VoiceOperationResult = {
   channelId?: string;
   guildId?: string;
 };
+
+export type VoiceJoinOptions = {
+  preserveFollowState?: boolean;
+  autoJoinWhenOccupied?: boolean;
+  transcripts?: VoiceSessionEntry["transcripts"];
+};
+
+export type VoiceSessionGeneration = {
+  generation: number;
+  isCurrent: () => boolean;
+};
+
+export type DiscordVoiceMode = "stt-tts" | "agent-proxy" | "bidi";
+
+export function resolveDiscordVoiceMode(voice: DiscordAccountConfig["voice"]): DiscordVoiceMode {
+  const mode = voice?.mode;
+  if (mode === "stt-tts" || mode === "bidi") {
+    return mode;
+  }
+  return "agent-proxy";
+}
+
+export function isDiscordRealtimeVoiceMode(
+  mode: DiscordVoiceMode,
+): mode is Exclude<DiscordVoiceMode, "stt-tts"> {
+  return mode === "agent-proxy" || mode === "bidi";
+}
 
 export type VoiceRealtimeSpeakerContext = {
   extraSystemPrompt?: string;
@@ -54,7 +84,16 @@ export type VoiceRealtimeSession = {
   isBargeInEnabled: () => boolean;
 };
 
+type VoiceRealtimeLifecycle =
+  | { status: "inactive"; generation: number }
+  | { status: "starting"; generation: number; instance: VoiceRealtimeSession }
+  | { status: "active"; generation: number; instance: VoiceRealtimeSession }
+  | { status: "stopped"; generation: number; reason: string };
+
 export type VoiceSessionEntry = {
+  generation: number;
+  autoJoinWhenOccupied: boolean;
+  sessionLifecycle: { status: "active" } | { status: "stopped"; reason: string };
   guildId: string;
   guildName?: string;
   channelId: string;
@@ -66,10 +105,15 @@ export type VoiceSessionEntry = {
   player: import("@discordjs/voice").AudioPlayer;
   playbackQueue: Promise<void>;
   processingQueue: Promise<void>;
+  ttsStreamFallbackWarned: boolean;
   capture: VoiceCaptureState;
-  realtime?: VoiceRealtimeSession;
+  realtimeLifecycle: VoiceRealtimeLifecycle;
+  transcripts?: {
+    sessionId: string;
+    onUtterance: (utterance: TranscriptUtterance) => void | Promise<void>;
+  };
   receiveRecovery: VoiceReceiveRecoveryState;
-  stop: () => void;
+  stop: (reason?: string) => void;
 };
 
 export function logVoiceVerbose(message: string): void {

@@ -1,126 +1,85 @@
+/** Coordinates admission and reuse for Claude CLI live processes. */
 import crypto from "node:crypto";
-import type { ReplyBackendHandle } from "../../auto-reply/reply/reply-run-registry.js";
-import type { CliBackendConfig } from "../../config/types.js";
 import {
-  createCliJsonlStreamingParser,
-  extractCliErrorMessage,
-  parseCliOutput,
-  type CliOutput,
-  type CliStreamingDelta,
-} from "../cli-output.js";
-import { FailoverError, resolveFailoverStatus } from "../failover-error.js";
-import { classifyFailoverReason } from "../pi-embedded-helpers.js";
+  splitSystemPromptCacheBoundary,
+  stripSystemPromptCacheBoundary,
+} from "@openclaw/ai/internal/shared";
+import type { ReplyBackendHandle } from "../../auto-reply/reply/reply-run-registry.js";
+import { createAbortError as createNamedAbortError } from "../../infra/abort-signal.js";
+import { sha256Hex } from "../../infra/crypto-digest.js";
+import { formatErrorMessage } from "../../infra/errors.js";
+import type { CliBackendConfig } from "../../plugins/cli-backend.types.js";
+import type {
+  CliStreamingDelta,
+  CliThinkingDelta,
+  CliThinkingProgress,
+  CliToolResultDelta,
+  CliToolUseStartDelta,
+  CliUsage,
+} from "../cli-output-contracts.js";
+import { isTimeoutError, FailoverError, resolveFailoverStatus } from "../failover-error.js";
+import {
+  abortClaudeTurn,
+  beginClaudeTurn,
+  createClaudeUserInputMessage,
+  refreshClaudePrompt,
+  resolveClaudeLiveExecPermission,
+  spawnClaudeProcess,
+  writeClaudeInput,
+  type ClaudeLiveProcess,
+} from "./claude-live-process.js";
+import {
+  buildClaudeLiveKey,
+  beginClaudeSessionCreate,
+  enqueueClaudeTurn,
+  ensureClaudeSessionCapacity,
+  finishClaudeSessionCreate,
+  getClaudeSession,
+  registerClaudeSession,
+  removeClaudeSession,
+} from "./claude-live-registry.js";
+import type { ClaudeLiveToolTerminalOutcome } from "./claude-live-turn.js";
 import { cliBackendLog } from "./log.js";
 import type { PreparedCliRunContext } from "./types.js";
 
 type ProcessSupervisor = ReturnType<
   typeof import("../../process/supervisor/index.js").getProcessSupervisor
 >;
-type ManagedRun = Awaited<ReturnType<ProcessSupervisor["spawn"]>>;
-type ClaudeLiveTurn = {
-  backend: CliBackendConfig;
-  outputLimits: ClaudeLiveOutputLimits;
-  startedAtMs: number;
-  rawLines: string[];
-  rawChars: number;
-  sessionId?: string;
-  noOutputTimer: NodeJS.Timeout | null;
-  timeoutTimer: NodeJS.Timeout | null;
-  streamingParser: ReturnType<typeof createCliJsonlStreamingParser>;
-  resolve: (output: CliOutput) => void;
-  reject: (error: unknown) => void;
-};
-type ClaudeLiveSession = {
-  key: string;
-  fingerprint: string;
-  managedRun: ManagedRun;
-  providerId: string;
-  modelId: string;
-  noOutputTimeoutMs: number;
-  stderr: string;
-  stdoutBuffer: string;
-  currentTurn: ClaudeLiveTurn | null;
-  drainTimer: NodeJS.Timeout | null;
-  drainingAbortedTurn: boolean;
-  idleTimer: NodeJS.Timeout | null;
-  cleanup: () => Promise<void>;
-  cleanupDone: boolean;
-  closing: boolean;
-};
+
 type ClaudeLiveRunResult = {
-  output: CliOutput;
-};
-type ClaudeLiveOutputLimits = {
-  maxTurnRawChars: number;
-  maxPendingLineChars: number;
-  maxTurnLines: number;
+  output: import("../cli-output-contracts.js").CliOutput;
 };
 
-const CLAUDE_LIVE_IDLE_TIMEOUT_MS = 10 * 60 * 1_000;
-const CLAUDE_LIVE_MAX_SESSIONS = 16;
-const CLAUDE_LIVE_MAX_STDERR_CHARS = 64 * 1024;
-const CLAUDE_LIVE_DEFAULT_MAX_TURN_RAW_CHARS = 8 * 1024 * 1024;
-const CLAUDE_LIVE_MIN_TURN_RAW_CHARS = 1_024;
-const CLAUDE_LIVE_MAX_CONFIGURABLE_TURN_RAW_CHARS = 64 * 1024 * 1024;
-const CLAUDE_LIVE_DEFAULT_MAX_TURN_LINES = 20_000;
-const CLAUDE_LIVE_MIN_TURN_LINES = 100;
-const CLAUDE_LIVE_MAX_CONFIGURABLE_TURN_LINES = 100_000;
-const CLAUDE_LIVE_CLOSE_WAIT_TIMEOUT_MS = 5_000;
-const liveSessions = new Map<string, ClaudeLiveSession>();
-const liveSessionCreates = new Map<string, Promise<ClaudeLiveSession>>();
-
-function sha256(value: string): string {
-  return crypto.createHash("sha256").update(value).digest("hex");
-}
-
-export function resetClaudeLiveSessionsForTest(): void {
-  for (const session of liveSessions.values()) {
-    closeLiveSession(session, "restart");
-  }
-  liveSessions.clear();
-  liveSessionCreates.clear();
-}
-
-async function waitForManagedRunExit(managedRun: ManagedRun): Promise<void> {
-  let timeout: NodeJS.Timeout | null = null;
-  try {
-    await Promise.race([
-      managedRun.wait().then(
-        () => undefined,
-        () => undefined,
-      ),
-      new Promise<void>((resolve) => {
-        timeout = setTimeout(resolve, CLAUDE_LIVE_CLOSE_WAIT_TIMEOUT_MS);
-        timeout.unref?.();
-      }),
-    ]);
-  } finally {
-    if (timeout) {
-      clearTimeout(timeout);
-    }
-  }
-}
-
-export async function closeClaudeLiveSessionForContext(
-  context: PreparedCliRunContext,
-): Promise<void> {
-  const key = buildClaudeLiveKey(context);
-  const session = liveSessions.get(key);
-  if (session) {
-    closeLiveSession(session, "restart");
-    await waitForManagedRunExit(session.managedRun);
-  }
-  liveSessionCreates.delete(key);
-}
-
-export function shouldUseClaudeLiveSession(context: PreparedCliRunContext): boolean {
-  return (
-    context.backendResolved.id === "claude-cli" &&
-    context.preparedBackend.backend.liveSession === "claude-stdio" &&
-    context.preparedBackend.backend.output === "jsonl" &&
-    context.preparedBackend.backend.input === "stdin"
-  );
-}
+type RunClaudeTurnParams = {
+  context: PreparedCliRunContext;
+  args: string[];
+  executableCommand?: string;
+  executableLeadingArgv?: readonly string[];
+  env: Record<string, string>;
+  prompt: string;
+  useResume: boolean;
+  forceNewSession?: boolean;
+  requiredSessionGeneration?: string;
+  noOutputTimeoutMs: number;
+  getProcessSupervisor: () => ProcessSupervisor;
+  onAssistantDelta: (delta: CliStreamingDelta) => void;
+  onThinkingDelta?: (delta: CliThinkingDelta) => void;
+  onThinkingProgress?: (progress: CliThinkingProgress) => void;
+  onToolUseStart?: (delta: CliToolUseStartDelta) => void;
+  onToolResult?: (delta: CliToolResultDelta) => void;
+  resolveToolResultTerminalOutcome?: (
+    delta: CliToolResultDelta,
+  ) => ClaudeLiveToolTerminalOutcome | undefined;
+  onCommentaryText?: (text: string) => void;
+  onMcpCaptureReady?: (captureKey: string) => void;
+  onSessionId?: (sessionId: string) => void;
+  onAssistantMessage?: (message: unknown) => void;
+  onUsage?: (usage: CliUsage, terminal: boolean) => void;
+  onCliOutput?: (chunk: string, stream: "stderr" | "stdout") => void;
+  onRequestPayload?: (payload: string) => void;
+  onPhase?: (phase: "send" | "resolve") => void;
+  cleanup: () => Promise<void>;
+};
 
 function upsertArgValue(args: string[], flag: string, value: string): string[] {
   const normalized: string[] = [];
@@ -150,7 +109,6 @@ function stripLiveProcessArgs(
 ): string[] {
   const liveProcessFlags = new Set(
     [
-      backend.sessionArg,
       "--session-id",
       stripSystemPrompt ? backend.systemPromptArg : undefined,
       stripSystemPrompt ? backend.systemPromptFileArg : undefined,
@@ -171,17 +129,22 @@ function stripLiveProcessArgs(
   return stripped;
 }
 
-export function buildClaudeLiveArgs(params: {
+function buildClaudeLiveArgs(params: {
   args: string[];
   backend: CliBackendConfig;
   systemPrompt: string;
   useResume: boolean;
+  permissionMode?: string;
 }): string[] {
-  return appendArg(
+  const liveArgs = appendArg(
     upsertArgValue(
       upsertArgValue(
         upsertArgValue(
-          stripLiveProcessArgs(params.args, params.backend, params.useResume),
+          stripLiveProcessArgs(
+            params.args,
+            params.backend,
+            params.useResume && params.backend.systemPromptWhen !== "always",
+          ),
           "--input-format",
           "stream-json",
         ),
@@ -193,18 +156,9 @@ export function buildClaudeLiveArgs(params: {
     ),
     "--replay-user-messages",
   );
-}
-
-function buildClaudeLiveKey(context: PreparedCliRunContext): string {
-  return `${context.backendResolved.id}:${sha256(
-    JSON.stringify({
-      agentAccountId: context.params.agentAccountId,
-      agentId: context.params.agentId,
-      authProfileId: context.effectiveAuthProfileId,
-      sessionId: context.params.sessionId,
-      sessionKey: context.params.sessionKey,
-    }),
-  )}`;
+  return params.permissionMode
+    ? upsertArgValue(liveArgs, "--permission-mode", params.permissionMode)
+    : liveArgs;
 }
 
 function buildClaudeLiveFingerprint(params: {
@@ -212,12 +166,20 @@ function buildClaudeLiveFingerprint(params: {
   argv: string[];
   env: Record<string, string>;
 }): string {
+  const managedMcpGrant = params.context.preparedBackend.mcpClientGrantCapture;
+  const normalizeMcpGrantToken =
+    managedMcpGrant !== undefined &&
+    params.env.OPENCLAW_MCP_TOKEN === managedMcpGrant.transportToken;
+  const stableSystemPrompt =
+    (params.context.preparedBackend.backend.systemPromptWhen === "always"
+      ? splitSystemPromptCacheBoundary(params.context.systemPrompt)?.stablePrefix
+      : undefined) ?? params.context.systemPrompt;
   const normalizeMcpConfigPath = Boolean(params.context.preparedBackend.mcpConfigHash);
   const skillSnapshot = params.context.params.skillsSnapshot;
   const skillsFingerprint = skillSnapshot
-    ? sha256(
+    ? sha256Hex(
         JSON.stringify({
-          promptHash: sha256(skillSnapshot.prompt),
+          promptHash: sha256Hex(skillSnapshot.prompt),
           skillFilter: skillSnapshot.skillFilter,
           skills: skillSnapshot.skills,
           resolvedSkills: (skillSnapshot.resolvedSkills ?? []).map((skill) => ({
@@ -230,7 +192,6 @@ function buildClaudeLiveFingerprint(params: {
         }),
       )
     : undefined;
-  const normalizePluginDir = Boolean(skillsFingerprint);
   const omittedValueFlags = new Set(
     [
       params.context.preparedBackend.backend.systemPromptArg,
@@ -241,10 +202,9 @@ function buildClaudeLiveFingerprint(params: {
   );
   const unstableValueFlags = new Set(
     [
-      params.context.preparedBackend.backend.sessionArg,
       "--session-id",
       normalizeMcpConfigPath ? "--mcp-config" : undefined,
-      normalizePluginDir ? "--plugin-dir" : undefined,
+      skillsFingerprint ? "--plugin-dir" : undefined,
     ].filter((entry): entry is string => typeof entry === "string" && entry.length > 0),
   );
   const stableArgv: string[] = [];
@@ -269,588 +229,176 @@ function buildClaudeLiveFingerprint(params: {
     stableArgv.push(entry);
   }
   return JSON.stringify({
-    command: params.context.preparedBackend.backend.command,
-    workspaceDirHash: sha256(params.context.workspaceDir),
+    command: params.argv[0],
+    workspaceDirHash: sha256Hex(params.context.workspaceDir),
+    cwdHash: params.context.cwdHash ?? sha256Hex(params.context.cwd ?? params.context.workspaceDir),
     provider: params.context.params.provider,
     model: params.context.normalizedModel,
-    systemPromptHash: sha256(params.context.systemPrompt),
+    systemPromptHash: sha256Hex(stableSystemPrompt),
     authProfileIdHash: params.context.effectiveAuthProfileId
-      ? sha256(params.context.effectiveAuthProfileId)
+      ? sha256Hex(params.context.effectiveAuthProfileId)
       : undefined,
-    authEpochHash: params.context.authEpoch ? sha256(params.context.authEpoch) : undefined,
+    authEpochHash: params.context.authEpoch ? sha256Hex(params.context.authEpoch) : undefined,
     extraSystemPromptHash: params.context.extraSystemPromptHash,
     promptToolNamesHash: params.context.promptToolNamesHash,
-    mcpConfigHash: params.context.preparedBackend.mcpConfigHash,
+    // A warm child carries the canonical MCP topology across turns. Per-turn
+    // authority rotates through the capture grant without restarting it.
+    mcpResumeHash:
+      params.context.preparedBackend.mcpResumeHash ?? params.context.preparedBackend.mcpConfigHash,
+    credentialFingerprint: params.context.preparedBackend.secretInput?.fingerprint,
     skillsFingerprint,
     argv: stableArgv,
+    // This is the canonical compatibility check for all spawn-time inputs.
+    // Claude reads MAX_THINKING_TOKENS only when the child starts, so a changed
+    // thinking environment invalidates a warm process without a second reuse gate.
     env: Object.keys(params.env)
       .toSorted()
-      .map((key) => [key, params.env[key] ? sha256(params.env[key]) : ""]),
+      .map((key) => [
+        key,
+        key === "OPENCLAW_MCP_TOKEN" && normalizeMcpGrantToken
+          ? "<managed-mcp-grant>"
+          : params.env[key]
+            ? sha256Hex(params.env[key])
+            : "",
+      ]),
   });
 }
 
-function createAbortError(): Error {
-  const error = new Error("CLI run aborted");
+function adoptClaudeLiveProcessMcpGrant(params: {
+  session: ClaudeLiveProcess;
+  context: PreparedCliRunContext;
+}): boolean {
+  const turnGrant = params.context.preparedBackend.mcpClientGrantCapture;
+  if (!turnGrant && !params.session.mcpGrantToken) {
+    return true;
+  }
+  if (!turnGrant || !params.session.mcpGrantToken) {
+    return false;
+  }
+  turnGrant.adoptProcessToken(params.session.mcpGrantToken);
+  return true;
+}
+
+function createAbortError(reason?: unknown): Error {
+  if (reason instanceof Error && isTimeoutError(reason)) {
+    return reason;
+  }
+  if (reason === undefined) {
+    return createNamedAbortError("CLI run aborted");
+  }
+  const error = new Error(
+    reason instanceof Error
+      ? reason.message
+      : typeof reason === "string"
+        ? reason
+        : "CLI run aborted",
+    reason instanceof Error ? { cause: reason } : undefined,
+  );
   error.name = "AbortError";
   return error;
 }
 
-function clearTurnTimers(turn: ClaudeLiveTurn): void {
-  if (turn.noOutputTimer) {
-    clearTimeout(turn.noOutputTimer);
-    turn.noOutputTimer = null;
-  }
-  if (turn.timeoutTimer) {
-    clearTimeout(turn.timeoutTimer);
-    turn.timeoutTimer = null;
-  }
-}
-
-function clearDrainTimer(session: ClaudeLiveSession): void {
-  if (session.drainTimer) {
-    clearTimeout(session.drainTimer);
-    session.drainTimer = null;
-  }
-}
-
-function finishTurn(session: ClaudeLiveSession, output: CliOutput): void {
-  const turn = session.currentTurn;
-  if (!turn) {
-    return;
-  }
-  cliBackendLog.info(
-    `claude live session turn: provider=${session.providerId} model=${session.modelId} durationMs=${Date.now() - turn.startedAtMs} rawLines=${turn.rawLines.length}`,
-  );
-  clearTurnTimers(turn);
-  turn.streamingParser.finish();
-  session.currentTurn = null;
-  turn.resolve(output);
-  scheduleIdleClose(session);
-}
-
-function failTurn(session: ClaudeLiveSession, error: unknown): void {
-  const turn = session.currentTurn;
-  if (!turn) {
-    return;
-  }
-  const errorKind = error instanceof Error ? error.name : typeof error;
-  cliBackendLog.warn(
-    `claude live session turn failed: provider=${session.providerId} model=${session.modelId} durationMs=${Date.now() - turn.startedAtMs} error=${errorKind}`,
-  );
-  clearTurnTimers(turn);
-  turn.streamingParser.finish();
-  session.currentTurn = null;
-  turn.reject(error);
-}
-
-function abortTurn(session: ClaudeLiveSession, error: Error): void {
-  const turn = session.currentTurn;
-  if (!turn) {
-    return;
-  }
-  closeLiveSession(session, "abort", error);
-}
-
-function cleanupLiveSession(session: ClaudeLiveSession): void {
-  if (session.cleanupDone) {
-    return;
-  }
-  session.cleanupDone = true;
-  void session.cleanup();
-}
-
-function closeLiveSession(
-  session: ClaudeLiveSession,
-  reason: "idle" | "restart" | "abort",
-  error?: unknown,
-): void {
-  if (session.closing) {
-    return;
-  }
-  cliBackendLog.info(
-    `claude live session close: provider=${session.providerId} model=${session.modelId} reason=${reason}`,
-  );
-  session.closing = true;
-  if (session.idleTimer) {
-    clearTimeout(session.idleTimer);
-    session.idleTimer = null;
-  }
-  clearDrainTimer(session);
-  if (liveSessions.get(session.key) === session) {
-    liveSessions.delete(session.key);
-  }
-  if (error) {
-    failTurn(session, error);
-  }
-  session.managedRun.cancel("manual-cancel");
-  cleanupLiveSession(session);
-}
-
-function scheduleIdleClose(session: ClaudeLiveSession): void {
-  if (session.idleTimer) {
-    clearTimeout(session.idleTimer);
-  }
-  session.idleTimer = setTimeout(() => {
-    if (!session.currentTurn) {
-      closeLiveSession(session, "idle");
-    }
-  }, CLAUDE_LIVE_IDLE_TIMEOUT_MS);
-}
-
-function createTimeoutError(session: ClaudeLiveSession, message: string): FailoverError {
-  return new FailoverError(message, {
-    reason: "timeout",
-    provider: session.providerId,
-    model: session.modelId,
-    status: resolveFailoverStatus("timeout"),
+function createRequiredLiveSessionError(params: {
+  context: PreparedCliRunContext;
+  code: "cli_live_session_changed" | "cli_live_session_missing";
+  cause?: unknown;
+}): FailoverError {
+  return new FailoverError("Managed Claude live session is no longer reusable.", {
+    reason: "session_expired",
+    provider: params.context.params.provider,
+    model: params.context.modelId,
+    status: resolveFailoverStatus("session_expired"),
+    code: params.code,
+    cause: params.cause,
   });
 }
 
-function createOutputLimitError(session: ClaudeLiveSession, message: string): FailoverError {
-  return new FailoverError(message, {
-    reason: "format",
-    provider: session.providerId,
-    model: session.modelId,
-    status: resolveFailoverStatus("format"),
-  });
-}
-
-function resetNoOutputTimer(session: ClaudeLiveSession): void {
-  const turn = session.currentTurn;
-  if (!turn) {
-    return;
-  }
-  if (turn.noOutputTimer) {
-    clearTimeout(turn.noOutputTimer);
-  }
-  turn.noOutputTimer = setTimeout(() => {
-    closeLiveSession(
-      session,
-      "abort",
-      createTimeoutError(
-        session,
-        `CLI produced no output for ${Math.round(session.noOutputTimeoutMs / 1000)}s and was terminated.`,
-      ),
-    );
-  }, session.noOutputTimeoutMs);
-}
-
-function parseSessionId(parsed: Record<string, unknown>): string | undefined {
-  const sessionId =
-    typeof parsed.session_id === "string"
-      ? parsed.session_id.trim()
-      : typeof parsed.sessionId === "string"
-        ? parsed.sessionId.trim()
-        : "";
-  return sessionId || undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
-function normalizePositiveInt(
-  value: number | undefined,
-  fallback: number,
-  min: number,
-  max: number,
-): number {
-  if (typeof value !== "number" || !Number.isInteger(value)) {
-    return fallback;
-  }
-  return Math.min(Math.max(value, min), max);
-}
-
-function resolveClaudeLiveOutputLimits(backend: CliBackendConfig): ClaudeLiveOutputLimits {
-  const configured = backend.reliability?.outputLimits;
-  const maxTurnRawChars = normalizePositiveInt(
-    configured?.maxTurnRawChars,
-    CLAUDE_LIVE_DEFAULT_MAX_TURN_RAW_CHARS,
-    CLAUDE_LIVE_MIN_TURN_RAW_CHARS,
-    CLAUDE_LIVE_MAX_CONFIGURABLE_TURN_RAW_CHARS,
-  );
-  return {
-    maxTurnRawChars,
-    maxPendingLineChars: maxTurnRawChars,
-    maxTurnLines: normalizePositiveInt(
-      configured?.maxTurnLines,
-      CLAUDE_LIVE_DEFAULT_MAX_TURN_LINES,
-      CLAUDE_LIVE_MIN_TURN_LINES,
-      CLAUDE_LIVE_MAX_CONFIGURABLE_TURN_LINES,
-    ),
-  };
-}
-
-function parseClaudeLiveJsonLine(
-  session: ClaudeLiveSession,
-  trimmed: string,
-): Record<string, unknown> | null {
-  const maxPendingLineChars =
-    session.currentTurn?.outputLimits.maxPendingLineChars ?? CLAUDE_LIVE_DEFAULT_MAX_TURN_RAW_CHARS;
-  if (trimmed.length > maxPendingLineChars) {
-    closeLiveSession(
-      session,
-      "abort",
-      createOutputLimitError(session, "Claude CLI JSONL line exceeded output limit."),
-    );
-    return null;
-  }
-  let parsed: unknown;
+async function abortTurnBeforeStart(
+  cleanup: () => Promise<void>,
+  abortError: Error,
+): Promise<never> {
   try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    return null;
+    await cleanup();
+  } catch (cleanupError) {
+    throw new Error("Claude live turn aborted before start and cleanup failed", {
+      cause: cleanupError,
+    });
   }
-  return isRecord(parsed) ? parsed : null;
+  throw abortError;
 }
 
-function createResultError(
-  session: ClaudeLiveSession,
-  parsed: Record<string, unknown>,
-  raw: string,
-): FailoverError {
-  const result = typeof parsed.result === "string" ? parsed.result.trim() : "";
-  const message = extractCliErrorMessage(raw) ?? (result || "Claude CLI failed.");
-  const reason = classifyFailoverReason(message, { provider: session.providerId }) ?? "unknown";
-  return new FailoverError(message, {
-    reason,
-    provider: session.providerId,
-    model: session.modelId,
-    status: resolveFailoverStatus(reason),
-  });
-}
-
-function handleClaudeLiveLine(session: ClaudeLiveSession, line: string): void {
-  const turn = session.currentTurn;
-  const trimmed = line.trim();
-  if (!trimmed) {
-    return;
+/** Runs one prompt through a reusable Claude CLI live session. */
+export function runClaudeTurn(params: RunClaudeTurnParams): Promise<ClaudeLiveRunResult> {
+  const key = buildClaudeLiveKey(params.context);
+  let cleanupPromise: Promise<void> | undefined;
+  const cleanup = () => (cleanupPromise ??= Promise.resolve().then(params.cleanup));
+  const abortSignal = params.context.params.abortSignal;
+  if (!abortSignal) {
+    return enqueueClaudeTurn(key, () => runSerializedClaudeTurn(params, key, cleanup));
   }
-  const parsed = parseClaudeLiveJsonLine(session, trimmed);
-  if (!parsed) {
-    return;
+  if (abortSignal.aborted) {
+    return abortTurnBeforeStart(cleanup, createAbortError(abortSignal.reason));
   }
-  if (session.drainingAbortedTurn) {
-    if (parsed.type === "result") {
-      const turnToClear = session.currentTurn;
-      if (turnToClear) {
-        clearTurnTimers(turnToClear);
-        session.currentTurn = null;
-      }
-      session.drainingAbortedTurn = false;
-      clearDrainTimer(session);
-      scheduleIdleClose(session);
-    }
-    return;
-  }
-  if (!turn) {
-    return;
-  }
-  turn.rawChars += trimmed.length + 1;
-  if (
-    turn.rawChars > turn.outputLimits.maxTurnRawChars ||
-    turn.rawLines.length >= turn.outputLimits.maxTurnLines
-  ) {
-    closeLiveSession(
-      session,
-      "abort",
-      createOutputLimitError(session, "Claude CLI turn output exceeded limit."),
-    );
-    return;
-  }
-  turn.rawLines.push(trimmed);
-  turn.streamingParser.push(`${trimmed}\n`);
-  turn.sessionId = parseSessionId(parsed) ?? turn.sessionId;
-  if (parsed.type !== "result") {
-    return;
-  }
-  const raw = turn.rawLines.join("\n");
-  if (parsed.is_error === true) {
-    failTurn(session, createResultError(session, parsed, raw));
-    scheduleIdleClose(session);
-    return;
-  }
-  finishTurn(
-    session,
-    parseCliOutput({
-      raw,
-      backend: turn.backend,
-      providerId: session.providerId,
-      outputMode: "jsonl",
-      fallbackSessionId: turn.sessionId,
-    }),
-  );
-}
-
-function handleClaudeStdout(session: ClaudeLiveSession, chunk: string) {
-  resetNoOutputTimer(session);
-  session.stdoutBuffer += chunk;
-  const maxPendingLineChars =
-    session.currentTurn?.outputLimits.maxPendingLineChars ?? CLAUDE_LIVE_DEFAULT_MAX_TURN_RAW_CHARS;
-  if (session.stdoutBuffer.length > maxPendingLineChars) {
-    closeLiveSession(
-      session,
-      "abort",
-      createOutputLimitError(session, "Claude CLI JSONL line exceeded output limit."),
-    );
-    return;
-  }
-  const lines = session.stdoutBuffer.split(/\r?\n/g);
-  session.stdoutBuffer = lines.pop() ?? "";
-  try {
-    for (const line of lines) {
-      handleClaudeLiveLine(session, line);
-    }
-  } catch (error) {
-    closeLiveSession(session, "abort", error);
-  }
-}
-
-function handleClaudeExit(session: ClaudeLiveSession, exitCode: number | null): void {
-  session.closing = true;
-  if (session.idleTimer) {
-    clearTimeout(session.idleTimer);
-    session.idleTimer = null;
-  }
-  clearDrainTimer(session);
-  if (liveSessions.get(session.key) === session) {
-    liveSessions.delete(session.key);
-  }
-  cleanupLiveSession(session);
-  if (!session.currentTurn) {
-    return;
-  }
-  if (session.stdoutBuffer.trim()) {
-    try {
-      handleClaudeLiveLine(session, session.stdoutBuffer);
-    } catch (error) {
-      session.stdoutBuffer = "";
-      failTurn(session, error);
-      return;
-    }
-    session.stdoutBuffer = "";
-  }
-  if (!session.currentTurn) {
-    return;
-  }
-  const stderr = session.stderr.trim();
-  const fallbackMessage =
-    exitCode === 0 ? "Claude CLI exited before completing the turn." : "Claude CLI failed.";
-  const message = extractCliErrorMessage(stderr) ?? (stderr || fallbackMessage);
-  if (exitCode === 0) {
-    failTurn(session, new Error(message));
-    return;
-  }
-  const reason = classifyFailoverReason(message, { provider: session.providerId }) ?? "unknown";
-  failTurn(
-    session,
-    new FailoverError(message, {
-      reason,
-      provider: session.providerId,
-      model: session.modelId,
-      status: resolveFailoverStatus(reason),
-    }),
-  );
-}
-
-function createClaudeUserInputMessage(content: string): string {
-  return `${JSON.stringify({
-    type: "user",
-    session_id: "",
-    parent_tool_use_id: null,
-    message: {
-      role: "user",
-      content,
-    },
-  })}\n`;
-}
-
-async function writeTurnInput(session: ClaudeLiveSession, prompt: string): Promise<void> {
-  const stdin = session.managedRun.stdin;
-  if (!stdin) {
-    throw new Error("Claude CLI live session stdin is unavailable");
-  }
-  await new Promise<void>((resolve, reject) => {
-    stdin.write(createClaudeUserInputMessage(prompt), (error) => {
-      if (error) {
-        reject(error);
+  return new Promise<ClaudeLiveRunResult>((resolve, reject) => {
+    let started = false;
+    let settled = false;
+    const settle = (
+      outcome: { kind: "resolve"; value: ClaudeLiveRunResult } | { kind: "reject"; error: unknown },
+    ) => {
+      if (settled) {
         return;
       }
-      resolve();
+      settled = true;
+      abortSignal.removeEventListener("abort", onAbort);
+      if (outcome.kind === "resolve") {
+        resolve(outcome.value);
+      } else {
+        reject(
+          outcome.error instanceof Error
+            ? outcome.error
+            : new Error(formatErrorMessage(outcome.error)),
+        );
+      }
+    };
+    const onAbort = () => {
+      if (!started) {
+        void abortTurnBeforeStart(cleanup, createAbortError(abortSignal.reason)).catch(
+          (error: unknown) => settle({ kind: "reject", error }),
+        );
+      }
+    };
+    abortSignal.addEventListener("abort", onAbort, { once: true });
+    const queued = enqueueClaudeTurn(key, async () => {
+      started = true;
+      abortSignal.removeEventListener("abort", onAbort);
+      if (abortSignal.aborted) {
+        return await abortTurnBeforeStart(cleanup, createAbortError(abortSignal.reason));
+      }
+      return await runSerializedClaudeTurn(params, key, cleanup);
     });
-  });
-}
-
-async function createClaudeLiveSession(params: {
-  context: PreparedCliRunContext;
-  argv: string[];
-  env: Record<string, string>;
-  fingerprint: string;
-  key: string;
-  noOutputTimeoutMs: number;
-  supervisor: ProcessSupervisor;
-  cleanup: () => Promise<void>;
-}): Promise<ClaudeLiveSession> {
-  let session: ClaudeLiveSession | null = null;
-  const managedRun = await params.supervisor.spawn({
-    sessionId: params.context.params.sessionId,
-    backendId: params.context.backendResolved.id,
-    scopeKey: `claude-live:${params.key}`,
-    replaceExistingScope: true,
-    mode: "child",
-    argv: params.argv,
-    cwd: params.context.workspaceDir,
-    env: params.env,
-    stdinMode: "pipe-open",
-    captureOutput: false,
-    onStdout: (chunk) => {
-      if (session) {
-        handleClaudeStdout(session, chunk);
-      }
-    },
-    onStderr: (chunk) => {
-      if (session) {
-        session.stderr += chunk;
-        if (session.stderr.length > CLAUDE_LIVE_MAX_STDERR_CHARS) {
-          closeLiveSession(
-            session,
-            "abort",
-            createOutputLimitError(session, "Claude CLI stderr exceeded limit."),
-          );
-          return;
-        }
-        resetNoOutputTimer(session);
-      }
-    },
-  });
-  session = {
-    key: params.key,
-    fingerprint: params.fingerprint,
-    managedRun,
-    providerId: params.context.params.provider,
-    modelId: params.context.modelId,
-    noOutputTimeoutMs: params.noOutputTimeoutMs,
-    stderr: "",
-    stdoutBuffer: "",
-    currentTurn: null,
-    drainTimer: null,
-    drainingAbortedTurn: false,
-    idleTimer: null,
-    cleanup: params.cleanup,
-    cleanupDone: false,
-    closing: false,
-  };
-  void managedRun.wait().then(
-    (exit) => handleClaudeExit(session, exit.exitCode),
-    (error) => {
-      if (session) {
-        closeLiveSession(session, "abort", error);
-      }
-    },
-  );
-  liveSessions.set(params.key, session);
-  cliBackendLog.info(
-    `claude live session start: provider=${session.providerId} model=${session.modelId} activeSessions=${liveSessions.size}`,
-  );
-  return session;
-}
-
-function createTurn(params: {
-  context: PreparedCliRunContext;
-  noOutputTimeoutMs: number;
-  onAssistantDelta: (delta: CliStreamingDelta) => void;
-  session: ClaudeLiveSession;
-  resolve: (output: CliOutput) => void;
-  reject: (error: unknown) => void;
-}): ClaudeLiveTurn {
-  const turn: ClaudeLiveTurn = {
-    backend: params.context.preparedBackend.backend,
-    outputLimits: resolveClaudeLiveOutputLimits(params.context.preparedBackend.backend),
-    startedAtMs: Date.now(),
-    rawLines: [],
-    rawChars: 0,
-    noOutputTimer: null,
-    timeoutTimer: null,
-    streamingParser: createCliJsonlStreamingParser({
-      backend: params.context.preparedBackend.backend,
-      providerId: params.context.backendResolved.id,
-      onAssistantDelta: params.onAssistantDelta,
-    }),
-    resolve: params.resolve,
-    reject: params.reject,
-  };
-  turn.noOutputTimer = setTimeout(() => {
-    closeLiveSession(
-      params.session,
-      "abort",
-      createTimeoutError(
-        params.session,
-        `CLI produced no output for ${Math.round(params.noOutputTimeoutMs / 1000)}s and was terminated.`,
-      ),
+    void queued.then(
+      (value) => settle({ kind: "resolve", value }),
+      (error: unknown) => settle({ kind: "reject", error }),
     );
-  }, params.noOutputTimeoutMs);
-  turn.timeoutTimer = setTimeout(() => {
-    closeLiveSession(
-      params.session,
-      "abort",
-      createTimeoutError(
-        params.session,
-        `CLI exceeded timeout (${Math.round(params.context.params.timeoutMs / 1000)}s) and was terminated.`,
-      ),
-    );
-  }, params.context.params.timeoutMs);
-  return turn;
-}
-
-function closeOldestIdleSession(): boolean {
-  for (const session of liveSessions.values()) {
-    if (!session.currentTurn && !session.drainingAbortedTurn) {
-      closeLiveSession(session, "idle");
-      return true;
-    }
-  }
-  return false;
-}
-
-function ensureLiveSessionCapacity(key: string, context: PreparedCliRunContext): void {
-  if (
-    liveSessions.has(key) ||
-    liveSessionCreates.has(key) ||
-    liveSessions.size + liveSessionCreates.size < CLAUDE_LIVE_MAX_SESSIONS
-  ) {
-    return;
-  }
-  if (closeOldestIdleSession()) {
-    return;
-  }
-  throw new FailoverError("Too many Claude CLI live sessions are active.", {
-    reason: "rate_limit",
-    provider: context.params.provider,
-    model: context.modelId,
-    status: resolveFailoverStatus("rate_limit"),
   });
 }
 
-export async function runClaudeLiveSessionTurn(params: {
-  context: PreparedCliRunContext;
-  args: string[];
-  env: Record<string, string>;
-  prompt: string;
-  useResume: boolean;
-  noOutputTimeoutMs: number;
-  getProcessSupervisor: () => ProcessSupervisor;
-  onAssistantDelta: (delta: CliStreamingDelta) => void;
-  cleanup: () => Promise<void>;
-}): Promise<ClaudeLiveRunResult> {
-  const key = buildClaudeLiveKey(params.context);
+async function runSerializedClaudeTurn(
+  params: RunClaudeTurnParams,
+  key: string,
+  cleanup: () => Promise<void>,
+): Promise<ClaudeLiveRunResult> {
   const resumeCapable = Boolean(params.context.preparedBackend.backend.resumeArgs?.length);
+  const execPermission = resolveClaudeLiveExecPermission(params.context);
   const argv = [
-    params.context.preparedBackend.backend.command,
+    params.executableCommand ?? params.context.preparedBackend.backend.command,
+    ...(params.executableLeadingArgv ?? []),
     ...buildClaudeLiveArgs({
       args: params.args,
       backend: params.context.preparedBackend.backend,
       systemPrompt: params.context.systemPrompt,
       useResume: params.useResume,
+      permissionMode: execPermission.permissionMode,
     }),
   ];
   const fingerprint = buildClaudeLiveFingerprint({
@@ -858,111 +406,203 @@ export async function runClaudeLiveSessionTurn(params: {
     argv,
     env: params.env,
   });
-  let cleanupDone = false;
-  const cleanup = async () => {
-    if (cleanupDone) {
-      return;
-    }
-    cleanupDone = true;
-    await params.cleanup();
-  };
-  let session = liveSessions.get(key) ?? null;
+  const systemPromptHash = sha256Hex(stripSystemPromptCacheBoundary(params.context.systemPrompt));
+  let session = getClaudeSession(key) as ClaudeLiveProcess | undefined;
+  if (
+    session &&
+    params.requiredSessionGeneration &&
+    session.generation !== params.requiredSessionGeneration
+  ) {
+    await cleanup();
+    throw createRequiredLiveSessionError({
+      context: params.context,
+      code: "cli_live_session_changed",
+    });
+  }
+  if (session && params.forceNewSession) {
+    session.close("restart");
+    session = undefined;
+  }
   if (session && resumeCapable && !params.useResume) {
-    closeLiveSession(session, "restart");
-    session = null;
+    session.close("restart");
+    session = undefined;
   }
   if (session && session.fingerprint !== fingerprint) {
-    closeLiveSession(session, "restart");
-    session = null;
+    if (params.requiredSessionGeneration) {
+      await cleanup();
+      throw createRequiredLiveSessionError({
+        context: params.context,
+        code: "cli_live_session_changed",
+      });
+    }
+    session.close("restart");
+    session = undefined;
   }
-  let cleanupTurnArtifacts = Boolean(session);
+  if (
+    session &&
+    !(await refreshClaudePrompt({ session, context: params.context, systemPromptHash }))
+  ) {
+    if (params.requiredSessionGeneration) {
+      await cleanup();
+      throw createRequiredLiveSessionError({
+        context: params.context,
+        code: "cli_live_session_changed",
+      });
+    }
+    session = undefined;
+  }
+  if (!session && params.requiredSessionGeneration) {
+    await cleanup();
+    throw createRequiredLiveSessionError({
+      context: params.context,
+      code: "cli_live_session_missing",
+    });
+  }
+  if (session) {
+    const reusableSession = session;
+    try {
+      if (!adoptClaudeLiveProcessMcpGrant({ session: reusableSession, context: params.context })) {
+        reusableSession.close("restart");
+        session = undefined;
+      }
+    } catch (error) {
+      reusableSession.close("restart", error);
+      session = undefined;
+      if (params.requiredSessionGeneration) {
+        await cleanup();
+        throw createRequiredLiveSessionError({
+          context: params.context,
+          code: "cli_live_session_changed",
+          cause: error,
+        });
+      }
+    }
+  }
+  if (!session && params.requiredSessionGeneration) {
+    await cleanup();
+    throw createRequiredLiveSessionError({
+      context: params.context,
+      code: "cli_live_session_changed",
+    });
+  }
+  const cleanupTurnArtifacts = Boolean(session);
+  let notifiedMcpCaptureKey: string | undefined;
+  const notifyMcpCaptureReady = (captureKey: string | undefined) => {
+    if (!captureKey || notifiedMcpCaptureKey === captureKey) {
+      return;
+    }
+    params.onMcpCaptureReady?.(captureKey);
+    notifiedMcpCaptureKey = captureKey;
+  };
   try {
-    ensureLiveSessionCapacity(key, params.context);
+    ensureClaudeSessionCapacity(key, params.context);
   } catch (error) {
     await cleanup();
     throw error;
   }
   if (!session) {
-    const pendingSession = liveSessionCreates.get(key);
-    if (pendingSession) {
+    // The owner queue stays held until creation completes, so a same-key turn
+    // cannot observe the pending promise. Pending records serve generation queries and capacity.
+    if (params.requiredSessionGeneration) {
+      await cleanup();
+      throw createRequiredLiveSessionError({
+        context: params.context,
+        code: "cli_live_session_missing",
+      });
+    }
+    const generation = crypto.randomUUID();
+    // Capture keys are child env/MCP-header state and cannot rotate without a
+    // new process. Bind one key to this process; grant activate/deactivate is
+    // the per-turn admission fence. Drain timeout still kills the child.
+    const mcpCaptureKey = params.context.mcpDeliveryCapture ? crypto.randomUUID() : undefined;
+    if (mcpCaptureKey) {
       try {
-        session = await pendingSession;
+        notifyMcpCaptureReady(mcpCaptureKey);
       } catch (error) {
         await cleanup();
         throw error;
-      }
-      if (session.fingerprint !== fingerprint) {
-        closeLiveSession(session, "restart");
-        session = null;
-      } else if (resumeCapable && !params.useResume) {
-        closeLiveSession(session, "restart");
-        session = null;
-      } else {
-        cleanupTurnArtifacts = true;
       }
     }
-    if (!session) {
-      const createSession = createClaudeLiveSession({
-        context: params.context,
-        argv,
-        env: params.env,
-        fingerprint,
-        key,
-        noOutputTimeoutMs: params.noOutputTimeoutMs,
-        supervisor: params.getProcessSupervisor(),
-        cleanup,
-      }).finally(() => {
-        if (liveSessionCreates.get(key) === createSession) {
-          liveSessionCreates.delete(key);
-        }
-      });
-      liveSessionCreates.set(key, createSession);
-      try {
-        session = await createSession;
-      } catch (error) {
-        await cleanup();
-        throw error;
-      }
+    const pendingCreate = beginClaudeSessionCreate(key, generation);
+    const createSession: Promise<ClaudeLiveProcess> = spawnClaudeProcess({
+      context: params.context,
+      argv,
+      env: params.env,
+      generation,
+      fingerprint,
+      systemPromptHash,
+      key,
+      mcpCaptureKey,
+      noOutputTimeoutMs: params.noOutputTimeoutMs,
+      supervisor: params.getProcessSupervisor(),
+      cleanup,
+      onSpawned: (spawned) => registerClaudeSession(spawned, pendingCreate),
+      onClosed: removeClaudeSession,
+    }).finally(() => finishClaudeSessionCreate(key, pendingCreate));
+    try {
+      session = await createSession;
+    } catch (error) {
+      await cleanup();
+      throw error;
     }
   }
-  if (cleanupTurnArtifacts && session) {
-    await cleanup();
+  if (cleanupTurnArtifacts) {
     if (session.idleTimer) {
       clearTimeout(session.idleTimer);
       session.idleTimer = null;
     }
+    await cleanup();
     cliBackendLog.info(
       `claude live session reuse: provider=${session.providerId} model=${session.modelId}`,
     );
   }
-  if (session.closing) {
+  if (session.closing || getClaudeSession(key) !== session) {
     await cleanup();
+    if (params.requiredSessionGeneration) {
+      throw createRequiredLiveSessionError({
+        context: params.context,
+        code: "cli_live_session_missing",
+      });
+    }
     throw new Error("Claude CLI live session closed before handling the turn");
   }
-  if (session.currentTurn || session.drainingAbortedTurn) {
+  if (session.currentTurn) {
     throw new Error("Claude CLI live session is already handling a turn");
   }
-  const liveSession = session;
-  liveSession.noOutputTimeoutMs = params.noOutputTimeoutMs;
-  liveSession.stderr = "";
-
-  const outputPromise = new Promise<CliOutput>((resolve, reject) => {
-    liveSession.currentTurn = createTurn({
-      context: params.context,
-      noOutputTimeoutMs: params.noOutputTimeoutMs,
-      onAssistantDelta: params.onAssistantDelta,
-      session: liveSession,
-      resolve,
-      reject,
-    });
+  if (session.sessionId) {
+    params.onSessionId?.(session.sessionId);
+  }
+  notifyMcpCaptureReady(session.mcpCaptureKey);
+  session.noOutputTimeoutMs = params.noOutputTimeoutMs;
+  session.stderr = "";
+  const inputUuid = crypto.randomUUID();
+  const outputPromise = beginClaudeTurn(session, {
+    context: params.context,
+    inputUuid,
+    useResume: params.useResume,
+    execPermission,
+    onAssistantDelta: params.onAssistantDelta,
+    onThinkingDelta: params.onThinkingDelta,
+    onThinkingProgress: params.onThinkingProgress,
+    onToolUseStart: params.onToolUseStart,
+    onToolResult: params.onToolResult,
+    resolveToolResultTerminalOutcome: params.resolveToolResultTerminalOutcome,
+    onCommentaryText: params.onCommentaryText,
+    onSessionId: params.onSessionId,
+    onAssistantMessage: params.onAssistantMessage,
+    onUsage: params.onUsage,
+    onCliOutput: params.onCliOutput,
+    onPhase: params.onPhase,
   });
-  const abort = () => abortTurn(liveSession, createAbortError());
-  let replyBackendCompleted = false;
+  void outputPromise.catch(() => undefined);
+  const abort = () =>
+    abortClaudeTurn(session, createAbortError(params.context.params.abortSignal?.reason));
   const replyBackendHandle: ReplyBackendHandle | undefined = params.context.params.replyOperation
     ? {
         kind: "cli",
+        runId: params.context.params.runId,
+        toolAuthorityFingerprint: params.context.params.toolAuthorityFingerprint,
         cancel: abort,
-        isStreaming: () => !replyBackendCompleted,
       }
     : undefined;
   params.context.params.abortSignal?.addEventListener("abort", abort, { once: true });
@@ -974,14 +614,15 @@ export async function runClaudeLiveSessionTurn(params: {
       abort();
     } else {
       try {
-        await writeTurnInput(liveSession, params.prompt);
+        const requestPayload = createClaudeUserInputMessage(params.prompt, inputUuid);
+        params.onRequestPayload?.(requestPayload);
+        await Promise.race([writeClaudeInput(session, requestPayload), outputPromise]);
       } catch (error) {
-        closeLiveSession(liveSession, "abort", error);
+        session.close("abort", error);
       }
     }
     return { output: await outputPromise };
   } finally {
-    replyBackendCompleted = true;
     params.context.params.abortSignal?.removeEventListener("abort", abort);
     if (replyBackendHandle) {
       params.context.params.replyOperation?.detachBackend(replyBackendHandle);

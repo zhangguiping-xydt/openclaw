@@ -1,13 +1,11 @@
-import type { SubagentRunRecord } from "../../agents/subagent-registry.types.js";
+// Dispatches subagent command actions after parsing the subcommand target.
+import type { SubagentRunRecord } from "../../agents/subagents/registry/subagent-registry.types.js";
 import type { HandleCommandsParams } from "./commands-types.js";
 
 export {
-  COMMAND,
-  COMMAND_KILL,
   resolveHandledPrefix,
   resolveRequesterSessionKey,
   resolveSubagentsAction,
-  stopWithText,
 } from "./commands-subagents/shared.js";
 
 export type SubagentsCommandContext = {

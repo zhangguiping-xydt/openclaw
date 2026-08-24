@@ -1,16 +1,20 @@
+/**
+ * tts built-in tool.
+ *
+ * Converts explicit speech requests into generated audio and safe transcript content.
+ */
 import { Type } from "typebox";
 import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { textToSpeech } from "../../tts/tts.js";
-import type { GatewayMessageChannel } from "../../utils/message-channel.js";
 import type { AnyAgentTool } from "./common.js";
-import { ToolInputError, readNumberParam, readStringParam } from "./common.js";
+import { readPositiveIntegerParam, readToolStringParam } from "./common.js";
 
 const TtsToolSchema = Type.Object({
   text: Type.String({ description: "Text to speak." }),
   channel: Type.Optional(Type.String({ description: "Channel id; output-format hint." })),
   timeoutMs: Type.Optional(
-    Type.Number({
+    Type.Integer({
       description: "Provider timeout ms.",
       minimum: 1,
     }),
@@ -18,33 +22,20 @@ const TtsToolSchema = Type.Object({
 });
 
 function readTtsTimeoutMs(args: Record<string, unknown>): number | undefined {
-  const timeoutMs = readNumberParam(args, "timeoutMs", {
-    integer: true,
-    strict: true,
+  return readPositiveIntegerParam(args, "timeoutMs", {
+    message: "timeoutMs must be a positive integer in milliseconds.",
   });
-  if (timeoutMs === undefined) {
-    return undefined;
-  }
-  if (timeoutMs <= 0) {
-    throw new ToolInputError("timeoutMs must be a positive integer in milliseconds.");
-  }
-  return timeoutMs;
 }
 
 /**
  * Defuse reply-directive tokens inside spoken transcripts before they flow
- * through tool-result content. When verbose tool output is enabled,
- * `emitToolOutput` passes the content through `parseReplyDirectives`
- * (`src/media/parse.ts` / `src/utils/directive-tags.ts`), and unfiltered
- * `MEDIA:` or `[[audio_as_voice]]`-shaped tokens in the transcript would be
- * rewritten into actual media URLs and audio-as-voice flags. Insert a
- * zero-width word joiner so the regex patterns stop matching without
- * changing the visible text.
+ * through tool-result content. Insert a zero-width word joiner so transcript
+ * text cannot be mistaken for assistant control tags if it is reused later.
  */
 function sanitizeTranscriptForToolContent(text: string): string {
   return text
-    .replace(/^([^\S\r\n]*)MEDIA:/gim, "$1\u2060MEDIA:")
     .replace(/\[\[/g, "[\u2060[")
+    .replace(/^(\s*)(MEDIA:)/gim, "$1\u2060$2")
     .replace(/^([ \t]*)(`{3,})/gm, (_match, indent: string, fence: string) => {
       const [first = "", ...rest] = fence;
       return `${indent}${first}\u2060${rest.join("")}`;
@@ -53,7 +44,7 @@ function sanitizeTranscriptForToolContent(text: string): string {
 
 export function createTtsTool(opts?: {
   config?: OpenClawConfig;
-  agentChannel?: GatewayMessageChannel;
+  agentChannel?: string;
   agentId?: string;
   agentAccountId?: string;
 }): AnyAgentTool {
@@ -62,12 +53,12 @@ export function createTtsTool(opts?: {
     name: "tts",
     displaySummary: "Text to speech audio.",
     description:
-      "Use only for explicit audio intent (voice/speech/TTS) or active TTS config. Never use for ordinary text replies. Audio auto-delivered from tool result; after success follow reply instructions, no duplicate text/audio.",
+      "Convert text to spoken audio (TTS) with the configured voice provider. Only explicit voice/speech/TTS intent or active TTS config; never ordinary text reply. Audio auto-delivered. After success follow reply instructions; no duplicate text/audio.",
     parameters: TtsToolSchema,
     execute: async (_toolCallId, args) => {
       const params = args as Record<string, unknown>;
-      const text = readStringParam(params, "text", { required: true });
-      const channel = readStringParam(params, "channel");
+      const text = readToolStringParam(params, "text", { required: true });
+      const channel = readToolStringParam(params, "channel");
       const timeoutMs = readTtsTimeoutMs(params);
       const cfg = opts?.config ?? getRuntimeConfig();
       const result = await textToSpeech({

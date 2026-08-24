@@ -1,3 +1,4 @@
+// Slack tests cover assistant plugin behavior.
 import type { App } from "@slack/bolt";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SlackMonitorContext } from "../context.js";
@@ -14,7 +15,7 @@ function createHarness(overrides?: {
   const handlers: Record<string, Handler> = {};
   const getSlackAssistantThreadContext = vi.fn(() => overrides?.existingContext);
   const saveSlackAssistantThreadContext = vi.fn();
-  const setSlackAssistantSuggestedPrompts = vi.fn(async () => true);
+  const setSlackSuggestedPrompts = vi.fn(async () => true);
   const replies = overrides?.replies ?? vi.fn(async () => ({ messages: [] }));
   const update = overrides?.update ?? vi.fn(async () => ({}));
   const trackEvent = vi.fn();
@@ -34,14 +35,14 @@ function createHarness(overrides?: {
     shouldDropMismatchedSlackEvent: () => overrides?.shouldDrop === true,
     getSlackAssistantThreadContext,
     saveSlackAssistantThreadContext,
-    setSlackAssistantSuggestedPrompts,
+    setSlackSuggestedPrompts,
   } as unknown as SlackMonitorContext;
   registerSlackAssistantEvents({ ctx, trackEvent });
   return {
     handlers,
     getSlackAssistantThreadContext,
     saveSlackAssistantThreadContext,
-    setSlackAssistantSuggestedPrompts,
+    setSlackSuggestedPrompts,
     replies,
     update,
     trackEvent,
@@ -102,7 +103,7 @@ describe("registerSlackAssistantEvents", () => {
       teamId: "T789",
       enterpriseId: "E123",
     });
-    expect(harness.setSlackAssistantSuggestedPrompts).toHaveBeenCalledWith({
+    expect(harness.setSlackSuggestedPrompts).toHaveBeenCalledWith({
       channelId: "D123",
       threadTs: "1729999327.187299",
       title: "Try asking",
@@ -127,7 +128,7 @@ describe("registerSlackAssistantEvents", () => {
 
     expect(harness.trackEvent).toHaveBeenCalledTimes(1);
     expect(harness.saveSlackAssistantThreadContext).toHaveBeenCalledTimes(1);
-    expect(harness.setSlackAssistantSuggestedPrompts).not.toHaveBeenCalled();
+    expect(harness.setSlackSuggestedPrompts).not.toHaveBeenCalled();
   });
 
   it("persists changed assistant thread context onto the first bot message", async () => {
@@ -274,6 +275,6 @@ describe("registerSlackAssistantEvents", () => {
 
     expect(harness.trackEvent).not.toHaveBeenCalled();
     expect(harness.saveSlackAssistantThreadContext).not.toHaveBeenCalled();
-    expect(harness.setSlackAssistantSuggestedPrompts).not.toHaveBeenCalled();
+    expect(harness.setSlackSuggestedPrompts).not.toHaveBeenCalled();
   });
 });

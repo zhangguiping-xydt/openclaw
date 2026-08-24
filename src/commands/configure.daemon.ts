@@ -1,10 +1,11 @@
+// Configure wizard service install/restart helper for the Gateway daemon.
+import { note } from "../../packages/terminal-core/src/note.js";
 import { withProgress } from "../cli/progress.js";
 import { getRuntimeConfig } from "../config/config.js";
 import { describeGatewayServiceRestart, resolveGatewayService } from "../daemon/service.js";
 import { isNonFatalSystemdInstallProbeError } from "../daemon/systemd.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import type { RuntimeEnv } from "../runtime.js";
-import { note } from "../terminal/note.js";
 import { confirm, select } from "./configure.shared.js";
 import { buildGatewayInstallPlan, gatewayInstallErrorHint } from "./daemon-install-helpers.js";
 import {
@@ -16,13 +17,16 @@ import { resolveGatewayInstallToken } from "./gateway-install-token.js";
 import { guardCancel } from "./onboard-helpers.js";
 import { ensureSystemdUserLingerInteractive } from "./systemd-linger.js";
 
+export type DaemonSetupOutcome = "succeeded" | "failed" | "skipped";
+
+/** Prompt to install, reinstall, restart, or skip the local Gateway service. */
 export async function maybeInstallDaemon(params: {
   runtime: RuntimeEnv;
   port: number;
   daemonRuntime?: GatewayDaemonRuntime;
-}) {
+}): Promise<DaemonSetupOutcome> {
   const service = resolveGatewayService();
-  let loaded = false;
+  let loaded;
   try {
     loaded = await service.isLoaded({ env: process.env });
   } catch (error) {
@@ -45,6 +49,7 @@ export async function maybeInstallDaemon(params: {
         ],
       }),
       params.runtime,
+      1,
     );
     if (action === "restart") {
       await withProgress(
@@ -64,7 +69,7 @@ export async function maybeInstallDaemon(params: {
       shouldInstall = false;
     }
     if (action === "skip") {
-      return;
+      return "skipped";
     }
     if (action === "reinstall") {
       await withProgress(
@@ -91,6 +96,7 @@ export async function maybeInstallDaemon(params: {
             initialValue: DEFAULT_GATEWAY_DAEMON_RUNTIME,
           }),
           params.runtime,
+          1,
         ) as GatewayDaemonRuntime;
       }
     }
@@ -143,9 +149,9 @@ export async function maybeInstallDaemon(params: {
       },
     );
     if (installError) {
-      note("Gateway service install failed: " + installError, "Gateway");
+      note("Gateway service install failed: ".concat(installError), "Gateway");
       note(gatewayInstallErrorHint(), "Gateway");
-      return;
+      return "failed";
     }
     shouldCheckLinger = true;
   }
@@ -154,7 +160,7 @@ export async function maybeInstallDaemon(params: {
     await ensureSystemdUserLingerInteractive({
       runtime: params.runtime,
       prompter: {
-        confirm: async (p) => guardCancel(await confirm(p), params.runtime),
+        confirm: async (p) => guardCancel(await confirm(p), params.runtime, 1),
         note,
       },
       reason:
@@ -162,4 +168,5 @@ export async function maybeInstallDaemon(params: {
       requireConfirm: true,
     });
   }
+  return "succeeded";
 }

@@ -48,6 +48,10 @@ public enum OpenClawChatEventText {
             return self.trimmed(text)
         }
         guard let object = self.dictionary(from: value) else { return nil }
+        guard ChatMessageVisibleText.isVisibleContentType(
+            self.stringValue(object["type"]),
+            role: "assistant")
+        else { return nil }
         return self.trimmed(self.stringValue(object["text"]) ?? "")
     }
 
@@ -62,9 +66,7 @@ public enum OpenClawChatEventText {
     }
 
     private static func stringValue(_ value: Any?) -> String? {
-        if let string = value as? String {
-            return string
-        }
+        if let string = value as? String { return string }
         if let wrapped = value as? AnyCodable {
             return self.stringValue(wrapped.value)
         }

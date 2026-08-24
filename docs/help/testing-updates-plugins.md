@@ -8,17 +8,14 @@ title: "Testing: updates and plugins"
 sidebarTitle: "Update and plugin tests"
 ---
 
-This is the dedicated checklist for update and plugin validation. The goal is
-simple: prove the installable package can update real user state, repair stale
-legacy state through `doctor`, and still install, load, update, and uninstall
-plugins from the supported sources.
+Checklist for update and plugin validation: prove the installable package can
+update real user state, repair stale legacy state through `doctor`, and still
+install, load, update, and uninstall plugins from every supported source.
 
 For the broader test runner map, see [Testing](/help/testing). For live provider
 keys and network-touching suites, see [Testing live](/help/testing-live).
 
 ## What we protect
-
-Update and plugin tests protect these contracts:
 
 - A package tarball is complete, has a valid `dist/postinstall-inventory.json`,
   and does not depend on unpacked repo files.
@@ -30,10 +27,10 @@ Update and plugin tests protect these contracts:
   plugin state.
 - Plugin installs work from local directories, git repos, npm packages, and the
   ClawHub registry path.
-- Plugin npm dependencies are installed in the managed npm root, scanned before
-  trust, and removed through npm during uninstall so hoisted dependencies do not
-  linger.
-- Plugin update is stable when nothing changed: install records, resolved
+- Plugin npm dependencies install in one managed npm project per plugin,
+  get scanned before trust, and get removed through `npm uninstall` during
+  plugin uninstall so hoisted dependencies do not linger.
+- Plugin update is a no-op when nothing changed: install records, resolved
   source, installed dependency layout, and enabled state stay intact.
 
 ## Local proof during development
@@ -59,10 +56,23 @@ Before any package Docker lane consumes a tarball, prove the package artifact:
 pnpm release:check
 ```
 
-`release:check` runs config/docs/API drift checks, writes the package dist
-inventory, runs `npm pack --dry-run`, rejects forbidden packed files, installs
-the tarball into a temp prefix, runs postinstall, and smokes bundled channel
-entrypoints.
+`release:check` runs generated config/docs and plugin checks (config schema,
+config docs baseline, plugin SDK exports and surface budget, plugin
+versions/inventory), writes the package dist inventory, runs
+`npm pack --dry-run`, rejects forbidden packed files, installs the tarball into
+a temp prefix, runs postinstall, and smokes bundled channel entrypoints.
+
+For a Plugin SDK change, compare the exact commits separately:
+
+```bash
+base_sha=$(git merge-base origin/main HEAD)
+head_sha=$(git rev-parse HEAD)
+pnpm plugin-sdk:api:diff -- --base "$base_sha" --head "$head_sha"
+```
+
+Release npm preflight uses the same readable diff against the prior published
+dist-tag and prints the 8-character acknowledgement digest required when that
+release changes the Plugin SDK API.
 
 ## Docker lanes
 
@@ -84,7 +94,7 @@ pnpm test:docker:update-migration
 
 Important lanes:
 
-- `test:docker:plugins` validates plugin install smoke, local folder installs,
+- `test:docker:plugins` covers plugin install smoke, local folder installs,
   local folder update skip behavior, local folders with preinstalled
   dependencies, `file:` package installs, git installs with CLI execution, git
   moving-ref updates, npm registry installs with hoisted transitive
@@ -95,7 +105,7 @@ Important lanes:
 - `test:docker:plugin-lifecycle-matrix` installs the candidate package in a bare
   container, runs an npm plugin through install, inspect, disable, enable,
   explicit upgrade, explicit downgrade, and uninstall after deleting the plugin
-  code. It logs RSS and CPU metrics for each phase.
+  code. It logs RSS and CPU metrics per phase.
 - `test:docker:plugin-update` validates that an unchanged installed plugin does
   not reinstall or lose install metadata during `openclaw plugins update`.
 - `test:docker:upgrade-survivor` installs the candidate tarball over a dirty
@@ -126,13 +136,31 @@ pnpm test:docker:published-upgrade-survivor
 OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPEC=openclaw@latest \
 OPENCLAW_UPGRADE_SURVIVOR_SCENARIO=bootstrap-persona \
 pnpm test:docker:published-upgrade-survivor
+
+OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPEC=openclaw@2026.7.1-2 \
+OPENCLAW_UPGRADE_SURVIVOR_SCENARIO=sqlite-volume \
+pnpm test:docker:published-upgrade-survivor
 ```
 
-Available scenarios are `base`, `feishu-channel`, `bootstrap-persona`,
-`plugin-deps-cleanup`, `configured-plugin-installs`,
-`stale-source-plugin-shadow`, `tilde-log-path`, and `versioned-runtime-deps`. In aggregate runs,
-`OPENCLAW_UPGRADE_SURVIVOR_SCENARIOS=reported-issues` expands to all reported
-issue-shaped scenarios, including the configured-plugin install migration.
+Available scenarios: `base`, `acpx-openclaw-tools-bridge`, `feishu-channel`,
+`bootstrap-persona`, `channel-post-core-restore`, `plugin-deps-cleanup`,
+`configured-plugin-installs`, `stale-source-plugin-shadow`, `tilde-log-path`,
+`meeting-transcripts-sqlite`, `versioned-runtime-deps`, `cron-scheduled-authority`,
+and `sqlite-volume`. In aggregate runs,
+`OPENCLAW_UPGRADE_SURVIVOR_SCENARIOS=reported-issues` expands the release-soak
+fixtures but excludes the expensive `sqlite-volume` scenario. Use
+`OPENCLAW_UPGRADE_SURVIVOR_SCENARIOS=far-reaching` to include it.
+
+The `sqlite-volume` scenario combines configured Matrix, Discord, and Telegram
+plugin/channel state with 4,800 sessions, 23,890 transcript events, and 2,200
+cron crawl jobs by default. It verifies exact JSONL-to-SQLite and cron migration,
+legacy archival, database integrity, a second idempotent Doctor run, and Gateway
+startup. Scale it with `OPENCLAW_UPGRADE_SURVIVOR_VOLUME_SESSIONS`,
+`OPENCLAW_UPGRADE_SURVIVOR_VOLUME_EVENTS_PER_SESSION`, and
+`OPENCLAW_UPGRADE_SURVIVOR_VOLUME_CRON_JOBS`. The default Doctor budgets are 120
+seconds for migration and 60 seconds for the idempotent pass; override them with
+`OPENCLAW_UPGRADE_SURVIVOR_VOLUME_MIGRATION_BUDGET_SECONDS` and
+`OPENCLAW_UPGRADE_SURVIVOR_VOLUME_IDEMPOTENCE_BUDGET_SECONDS` on slower hosts.
 
 Full update migration is intentionally separate from Full Release CI. Use the
 manual `Update Migration` workflow when the release question is "can every
@@ -158,25 +186,34 @@ older trusted releases.
 
 Candidate sources:
 
-- `source=npm`: validate `openclaw@beta`, `openclaw@latest`, or an exact
-  published version.
+- `source=npm`: validate `openclaw@extended-stable`, `openclaw@beta`,
+  `openclaw@latest`, or an exact published version.
 - `source=ref`: pack a trusted branch, tag, or commit with the selected current
   harness.
-- `source=url`: validate an HTTPS tarball with required `package_sha256`.
+- `source=url`: validate a public HTTPS tarball with required `package_sha256`.
+  This path rejects URL credentials, non-default HTTPS ports, private/internal
+  hostnames or DNS/IP results, special-use IP space, and unsafe redirects.
+- `source=trusted-url`: validate an HTTPS tarball with required
+  `package_sha256` and `trusted_source_id` against the maintainer-owned policy
+  in `.github/package-trusted-sources.json`. Use this for enterprise/private
+  mirrors instead of weakening `source=url` with an input-level allow-private
+  switch. Bearer auth, when configured by policy, uses the fixed
+  `OPENCLAW_TRUSTED_PACKAGE_TOKEN` secret.
 - `source=artifact`: reuse a tarball uploaded by another Actions run.
 
 Full Release Validation uses `source=artifact` by default, built from the
 resolved release SHA. For post-publish proof, pass
-`package_acceptance_package_spec=openclaw@YYYY.M.D` so the same upgrade matrix
+`package_acceptance_package_spec=openclaw@YYYY.M.PATCH` so the same upgrade matrix
 targets the shipped npm package instead.
 
 Release checks call Package Acceptance with the package/update/restart/plugin set:
 
 ```text
-doctor-switch update-channel-switch update-corrupt-plugin upgrade-survivor published-upgrade-survivor update-restart-auth plugins-offline plugin-update
+doctor-switch update-channel-switch skill-install update-corrupt-plugin upgrade-survivor published-upgrade-survivor root-managed-vps-upgrade update-restart-auth plugins-offline plugin-update plugin-binding-command-escape
 ```
 
-When release soak is enabled, they also pass:
+When release soak is enabled (forced on for `release_profile=stable` and
+`full`), they also pass:
 
 ```text
 published_upgrade_survivor_baselines=last-stable-4 2026.4.23 2026.5.2 2026.4.15
@@ -218,6 +255,10 @@ gh workflow run package-acceptance.yml \
   -f published_upgrade_survivor_scenarios=reported-issues \
   -f telegram_mode=mock-openai
 ```
+
+For a published extended-stable canary, set
+`package_spec=openclaw@extended-stable`. Package Acceptance resolves that
+selector into an exact tarball before the Docker lanes run.
 
 Use `suite_profile=product` when the release question includes MCP channels,
 cron/subagent cleanup, OpenAI web search, or OpenWebUI. Use `suite_profile=full`
@@ -268,9 +309,9 @@ can fail for the right reason:
 - Registry/package source behavior: `test:docker:plugins` fixture or ClawHub
   fixture server.
 - Dependency layout or cleanup behavior: assert both runtime execution and the
-  filesystem boundary. npm dependencies may be hoisted under the managed npm
-  root, so tests should prove the root is scanned/cleaned instead of assuming a
-  package-local `node_modules` tree.
+  filesystem boundary. npm dependencies may be hoisted inside the plugin's
+  managed npm project, so tests should prove that project is scanned/cleaned
+  instead of assuming only the plugin package-local `node_modules` tree.
 
 Keep new Docker fixtures hermetic by default. Use local fixture registries and
 fake packages unless the point of the test is live registry behavior.
@@ -285,7 +326,7 @@ Start with the artifact identity:
   `failures.json`, lane logs, and rerun commands.
 - Upgrade survivor summary: `.artifacts/upgrade-survivor/summary.json`,
   including baseline version, candidate version, scenario, phase timings, and
-  recipe steps.
+  config recipe coverage.
 
 Prefer rerunning the failed exact lane with the same package artifact over
 rerunning the whole release umbrella.

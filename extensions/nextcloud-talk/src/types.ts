@@ -1,9 +1,13 @@
-import type { MessageReceipt } from "openclaw/plugin-sdk/channel-message";
+// Nextcloud Talk type declarations define plugin contracts.
 import type {
-  BlockStreamingCoalesceConfig,
+  ChannelDeliveryStreamingConfig,
+  MessageReceipt,
+} from "openclaw/plugin-sdk/channel-outbound";
+import type {
   DmConfig,
   DmPolicy,
   GroupPolicy,
+  OpenClawConfig,
   SecretInput,
 } from "../runtime-api.js";
 
@@ -69,12 +73,8 @@ export type NextcloudTalkAccountConfig = {
   dms?: Record<string, DmConfig>;
   /** Outbound text chunk size (chars). Default: 4000. */
   textChunkLimit?: number;
-  /** Chunking mode: "length" (default) splits by size; "newline" splits on every newline. */
-  chunkMode?: "length" | "newline";
-  /** Disable block streaming for this account. */
-  blockStreaming?: boolean;
-  /** Merge streamed block replies before sending. */
-  blockStreamingCoalesce?: BlockStreamingCoalesceConfig;
+  /** Delivery streaming config: chunk mode plus block streaming controls. */
+  streaming?: ChannelDeliveryStreamingConfig;
   /** Outbound response prefix override for this channel/account. */
   responsePrefix?: string;
   /** Media upload max size in MB. */
@@ -94,6 +94,7 @@ export type CoreConfig = {
   channels?: {
     "nextcloud-talk"?: NextcloudTalkConfig;
   };
+  gateway?: OpenClawConfig["gateway"];
   [key: string]: unknown;
 };
 
@@ -185,11 +186,9 @@ export type NextcloudTalkWebhookServerOptions = {
   };
   readBody?: (req: import("node:http").IncomingMessage, maxBodyBytes: number) => Promise<string>;
   isBackendAllowed?: (backend: string) => boolean;
-  shouldProcessMessage?: (message: NextcloudTalkInboundMessage) => boolean | Promise<boolean>;
-  processMessage?: (
-    message: NextcloudTalkInboundMessage,
-  ) => void | "processed" | "duplicate" | Promise<void | "processed" | "duplicate">;
-  onMessage: (message: NextcloudTalkInboundMessage) => void | Promise<void>;
+  trustedProxies?: string[];
+  allowRealIpFallback?: boolean;
+  onWebhook: (rawBody: string) => Promise<"accepted" | "ignored">;
   onError?: (error: Error) => void;
   abortSignal?: AbortSignal;
 };

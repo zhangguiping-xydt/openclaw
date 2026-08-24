@@ -1,3 +1,4 @@
+// Matrix API module exposes the plugin public contract.
 export {
   DEFAULT_ACCOUNT_ID,
   normalizeAccountId,
@@ -7,12 +8,13 @@ export {
   createActionGate,
   jsonResult,
   readNumberParam,
+  readPositiveIntegerParam,
   readReactionParams,
   readStringArrayParam,
   readStringParam,
   ToolAuthorizationError,
 } from "openclaw/plugin-sdk/channel-actions";
-export { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-primitives";
+export { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
 export type { ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 export type {
   BaseProbeResult,
@@ -31,8 +33,9 @@ export {
   formatLocationText,
   toLocationContext,
   type NormalizedLocation,
-} from "openclaw/plugin-sdk/channel-location";
-export { logInboundDrop, logTypingFailure } from "openclaw/plugin-sdk/channel-logging";
+} from "openclaw/plugin-sdk/channel-inbound";
+export { logInboundDrop } from "openclaw/plugin-sdk/channel-inbound";
+export { logTypingFailure } from "openclaw/plugin-sdk/channel-outbound";
 export { resolveAckReaction } from "openclaw/plugin-sdk/channel-feedback";
 export type { ChannelSetupInput } from "openclaw/plugin-sdk/setup";
 export type {
@@ -68,11 +71,9 @@ export {
   isPrivateOrLoopbackHost,
   resolvePinnedHostnameWithPolicy,
   ssrfPolicyFromDangerouslyAllowPrivateNetwork,
-  ssrfPolicyFromAllowPrivateNetwork,
   type LookupFn,
   type SsrFPolicy,
 } from "openclaw/plugin-sdk/ssrf-runtime";
-export { dispatchReplyFromConfigWithSettledDispatcher } from "openclaw/plugin-sdk/inbound-reply-dispatch";
 export {
   ensureConfiguredAcpBindingReady,
   resolveConfiguredAcpBindingRecord,
@@ -87,10 +88,10 @@ export {
   resolveThreadBindingIdleTimeoutMsForChannel,
   resolveThreadBindingMaxAgeMsForChannel,
 } from "openclaw/plugin-sdk/conversation-runtime";
-export { resolveOutboundSendDep } from "openclaw/plugin-sdk/outbound-send-deps";
+export { resolveOutboundSendDep } from "openclaw/plugin-sdk/channel-outbound";
 export { resolveAgentIdFromSessionKey } from "openclaw/plugin-sdk/routing";
 export { chunkTextForOutbound } from "openclaw/plugin-sdk/text-chunking";
-export { createChannelMessageReplyPipeline } from "openclaw/plugin-sdk/channel-message";
+export { createChannelMessageReplyPipeline } from "openclaw/plugin-sdk/channel-outbound";
 export { loadOutboundMediaFromUrl } from "openclaw/plugin-sdk/outbound-media";
 export { normalizePollInput, type PollInput } from "openclaw/plugin-sdk/poll-runtime";
 export { writeJsonFileAtomically } from "openclaw/plugin-sdk/json-store";

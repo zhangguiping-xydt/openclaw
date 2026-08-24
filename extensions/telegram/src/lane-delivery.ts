@@ -1,11 +1,12 @@
-export {
-  isPotentialTruncatedFinal,
-  selectLongerFinalText,
-} from "openclaw/plugin-sdk/channel-streaming";
+// Telegram plugin module implements lane delivery behavior.
 export {
   createLaneTextDeliverer,
+  type LaneTextDeliverer,
   type DraftLaneState,
   type LaneDeliveryResult,
   type LaneName,
 } from "./lane-delivery-text-deliverer.js";
-export { createLaneDeliveryStateTracker } from "./lane-delivery-state.js";
+export {
+  createLaneDeliveryStateTracker,
+  type LaneDeliveryStateTracker,
+} from "./lane-delivery-state.js";

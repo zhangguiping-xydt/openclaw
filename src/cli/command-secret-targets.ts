@@ -1,5 +1,11 @@
+// Command-specific secret target policy. Each exported helper returns the config secret IDs
+// a command may inspect, with optional concrete-path filters for selected providers/accounts.
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { sortUniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
 import { listReadOnlyChannelPluginsForConfig } from "../channels/plugins/read-only.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resolveSecretInputRef } from "../config/types.secrets.js";
 import type {
   PluginWebFetchProviderEntry,
   PluginWebSearchProviderEntry,
@@ -14,7 +20,6 @@ import {
   discoverConfigSecretTargetsByIds,
   listSecretTargetRegistryEntries,
 } from "../secrets/target-registry.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
 
 const STATIC_QR_REMOTE_TARGET_IDS = ["gateway.remote.token", "gateway.remote.password"] as const;
 const STATIC_MODEL_TARGET_IDS = [
@@ -34,34 +39,34 @@ const STATIC_MODEL_TARGET_IDS = [
 ] as const;
 const STATIC_AGENT_RUNTIME_BASE_TARGET_IDS = [
   ...STATIC_MODEL_TARGET_IDS,
-  "agents.defaults.memorySearch.remote.apiKey",
-  "agents.list[].memorySearch.remote.apiKey",
-  "agents.list[].tts.providers.*.apiKey",
-  "messages.tts.providers.*.apiKey",
+  "memory.search.remote.apiKey",
+  "agents.entries.*.memory.search.remote.apiKey",
+  "agents.entries.*.tts.providers.*.apiKey",
+  "tts.providers.*.apiKey",
   "skills.entries.*.apiKey",
-  "tools.web.search.apiKey",
-  "tools.web.fetch.firecrawl.apiKey",
 ] as const;
 const STATIC_MEMORY_EMBEDDING_TARGET_IDS = [
   ...STATIC_MODEL_TARGET_IDS,
-  "agents.defaults.memorySearch.remote.apiKey",
-  "agents.list[].memorySearch.remote.apiKey",
+  "memory.search.remote.apiKey",
+  "agents.entries.*.memory.search.remote.apiKey",
 ] as const;
 const STATIC_TTS_TARGET_IDS = [
   ...STATIC_MODEL_TARGET_IDS,
-  "agents.list[].tts.providers.*.apiKey",
-  "messages.tts.providers.*.apiKey",
+  "agents.entries.*.tts.providers.*.apiKey",
+  "tts.providers.*.apiKey",
 ] as const;
-const STATIC_STATUS_TARGET_IDS = [
-  "agents.defaults.memorySearch.remote.apiKey",
-  "agents.list[].memorySearch.remote.apiKey",
-] as const;
-const STATIC_SECURITY_AUDIT_TARGET_IDS = [
+const STATIC_GATEWAY_AUTH_TARGET_IDS = [
   "gateway.auth.token",
   "gateway.auth.password",
   "gateway.remote.token",
   "gateway.remote.password",
 ] as const;
+const STATIC_STATUS_TARGET_IDS = [
+  ...STATIC_GATEWAY_AUTH_TARGET_IDS,
+  "memory.search.remote.apiKey",
+  "agents.entries.*.memory.search.remote.apiKey",
+] as const;
+const STATIC_SECURITY_AUDIT_TARGET_IDS = [...STATIC_GATEWAY_AUTH_TARGET_IDS] as const;
 
 function idsByPrefix(prefixes: readonly string[]): string[] {
   return listSecretTargetRegistryEntries()
@@ -90,12 +95,6 @@ type SelectedProviderTargetIds = {
   fallbackTargetIds: string[];
   fallbackPaths: string[];
 };
-
-const STATIC_CAPABILITY_WEB_SEARCH_TARGET_IDS = [
-  "tools.web.search.apiKey",
-  "tools.web.search.*.apiKey",
-] as const;
-const STATIC_CAPABILITY_WEB_FETCH_TARGET_IDS = ["tools.web.fetch.firecrawl.apiKey"] as const;
 
 let cachedCommandSecretTargets: CommandSecretTargets | undefined;
 let cachedAgentRuntimeBaseTargetIds: string[] | undefined;
@@ -134,26 +133,20 @@ function isPluginWebFetchCredentialTargetId(id: string): boolean {
 }
 
 function getCapabilityWebSearchTargetIds(): string[] {
-  cachedCapabilityWebSearchTargetIds ??= [
-    ...new Set([
-      ...STATIC_CAPABILITY_WEB_SEARCH_TARGET_IDS,
-      ...listSecretTargetRegistryEntries()
-        .map((entry) => entry.id)
-        .filter(isPluginWebSearchCredentialTargetId),
-    ]),
-  ].toSorted();
+  cachedCapabilityWebSearchTargetIds ??= sortUniqueStrings(
+    listSecretTargetRegistryEntries()
+      .map((entry) => entry.id)
+      .filter(isPluginWebSearchCredentialTargetId),
+  );
   return cachedCapabilityWebSearchTargetIds;
 }
 
 function getCapabilityWebFetchTargetIds(): string[] {
-  cachedCapabilityWebFetchTargetIds ??= [
-    ...new Set([
-      ...STATIC_CAPABILITY_WEB_FETCH_TARGET_IDS,
-      ...listSecretTargetRegistryEntries()
-        .map((entry) => entry.id)
-        .filter(isPluginWebFetchCredentialTargetId),
-    ]),
-  ].toSorted();
+  cachedCapabilityWebFetchTargetIds ??= sortUniqueStrings(
+    listSecretTargetRegistryEntries()
+      .map((entry) => entry.id)
+      .filter(isPluginWebFetchCredentialTargetId),
+  );
   return cachedCapabilityWebFetchTargetIds;
 }
 
@@ -176,10 +169,6 @@ function resolveSearchConfig(config: OpenClawConfig): Record<string, unknown> | 
   return search && typeof search === "object" && !Array.isArray(search)
     ? (search as Record<string, unknown>)
     : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function pathPatternMatchesConcretePath(pathPattern: string, path: string): boolean {
@@ -210,6 +199,7 @@ function pathPatternMatchesConcretePath(pathPattern: string, path: string): bool
   return pathIndex === pathSegments.length;
 }
 
+// Registry entries use wildcard path patterns; command inputs often identify one concrete config path.
 function targetIdsForConfigPath(path: string): string[] {
   return listSecretTargetRegistryEntries()
     .filter((entry) => pathPatternMatchesConcretePath(entry.pathPattern ?? entry.id, path))
@@ -354,83 +344,128 @@ function hasConfiguredFetchCredential(params: {
   provider: PluginWebFetchProviderEntry;
   config: OpenClawConfig;
 }): boolean {
-  return (
-    isConfiguredSecretCandidate(params.provider.getConfiguredCredentialValue?.(params.config)) ||
-    isConfiguredSecretCandidate(
-      params.provider.getCredentialValue(resolveFetchConfig(params.config)),
-    )
-  );
+  return isConfiguredSecretCandidate(params.provider.getConfiguredCredentialValue?.(params.config));
 }
 
 function hasConfiguredSearchCredential(params: {
   provider: PluginWebSearchProviderEntry;
   config: OpenClawConfig;
 }): boolean {
-  return (
-    isConfiguredSecretCandidate(params.provider.getConfiguredCredentialValue?.(params.config)) ||
-    isConfiguredSecretCandidate(
-      params.provider.getCredentialValue(resolveSearchConfig(params.config)),
-    )
-  );
+  return isConfiguredSecretCandidate(params.provider.getConfiguredCredentialValue?.(params.config));
 }
 
-function addConfiguredSearchCredentialTargetIds(params: {
-  config: OpenClawConfig;
-  provider: PluginWebSearchProviderEntry;
+type ConfigPathTargetParams = {
+  path: string;
   targetIds: Set<string>;
   targetPaths: Set<string>;
   allowedPaths: Set<string>;
-}): void {
-  const searchConfig = resolveSearchConfig(params.config);
-  if (!searchConfig) {
-    return;
-  }
-  const configuredCredential = params.provider.getCredentialValue(searchConfig);
-  if (!isConfiguredSecretCandidate(configuredCredential)) {
-    return;
-  }
-  const pluginCredential = params.provider.getConfiguredCredentialValue?.(params.config);
-  if (isConfiguredSecretCandidate(pluginCredential) && configuredCredential !== pluginCredential) {
-    return;
-  }
-  if (configuredCredential === searchConfig.apiKey) {
-    addConfigPathTargets({ ...params, path: "tools.web.search.apiKey" });
-  }
-  const scopedConfig = searchConfig[params.provider.id];
-  if (isRecord(scopedConfig) && configuredCredential === scopedConfig.apiKey) {
-    addConfigPathTargets({
-      ...params,
-      path: `tools.web.search.${params.provider.id}.apiKey`,
-    });
-  }
-}
+};
 
-function addConfiguredFetchCredentialTargetIds(params: {
-  config: OpenClawConfig;
-  provider: PluginWebFetchProviderEntry;
+type SelectedProviderTargetState = {
   targetIds: Set<string>;
   targetPaths: Set<string>;
   allowedPaths: Set<string>;
-}): void {
-  const fetchConfig = resolveFetchConfig(params.config);
-  if (!fetchConfig) {
-    return;
+  fallbackTargetIds: Set<string>;
+  fallbackPaths: Set<string>;
+};
+
+function emptySelectedProviderTargetIds(): SelectedProviderTargetIds {
+  return {
+    matchedProvider: false,
+    targetIds: [],
+    targetPaths: [],
+    allowedPaths: [],
+    fallbackTargetIds: [],
+    fallbackPaths: [],
+  };
+}
+
+function createSelectedProviderTargetState(): SelectedProviderTargetState {
+  return {
+    targetIds: new Set<string>(),
+    targetPaths: new Set<string>(),
+    allowedPaths: new Set<string>(),
+    fallbackTargetIds: new Set<string>(),
+    fallbackPaths: new Set<string>(),
+  };
+}
+
+function toSelectedProviderTargetIds(params: {
+  matchedProvider: boolean;
+  state: SelectedProviderTargetState;
+}): SelectedProviderTargetIds {
+  return {
+    matchedProvider: params.matchedProvider,
+    targetIds: [...params.state.targetIds].toSorted(),
+    targetPaths: [...params.state.targetPaths].toSorted(),
+    allowedPaths: [...params.state.allowedPaths].toSorted(),
+    fallbackTargetIds: [...params.state.fallbackTargetIds].toSorted(),
+    fallbackPaths: [...params.state.fallbackPaths].toSorted(),
+  };
+}
+
+type CapabilityWebCredentialProvider = PluginWebFetchProviderEntry | PluginWebSearchProviderEntry;
+
+function addFallbackPathTargets(
+  params: ConfigPathTargetParams & {
+    fallbackTargetIds: Set<string>;
+    fallbackPaths: Set<string>;
+    addTargets: (targetParams: ConfigPathTargetParams) => boolean;
+  },
+): void {
+  const targetParams = {
+    path: params.path,
+    targetIds: params.targetIds,
+    targetPaths: params.targetPaths,
+    allowedPaths: params.allowedPaths,
+  };
+  const before = new Set(params.targetIds);
+  const added = params.addTargets(targetParams);
+  for (const targetId of params.targetIds) {
+    if (!before.has(targetId)) {
+      params.fallbackTargetIds.add(targetId);
+    }
   }
-  const configuredCredential = params.provider.getCredentialValue(fetchConfig);
-  if (!isConfiguredSecretCandidate(configuredCredential)) {
-    return;
+  if (added) {
+    params.fallbackPaths.add(params.path);
   }
-  const pluginCredential = params.provider.getConfiguredCredentialValue?.(params.config);
-  if (isConfiguredSecretCandidate(pluginCredential) && configuredCredential !== pluginCredential) {
-    return;
-  }
-  const scopedConfig = fetchConfig[params.provider.id];
-  if (isRecord(scopedConfig) && configuredCredential === scopedConfig.apiKey) {
+}
+
+function addSelectedProviderCredentialTargets<
+  Provider extends CapabilityWebCredentialProvider,
+>(params: {
+  config: OpenClawConfig;
+  provider: Provider;
+  state: SelectedProviderTargetState;
+  hasConfiguredCredential: (provider: Provider) => boolean;
+}): boolean {
+  // Selected providers own one canonical plugin-scoped credential path.
+  if (params.provider.credentialPath.trim()) {
     addConfigPathTargets({
-      ...params,
-      path: `tools.web.fetch.${params.provider.id}.apiKey`,
+      path: params.provider.credentialPath,
+      targetIds: params.state.targetIds,
+      targetPaths: params.state.targetPaths,
+      allowedPaths: params.state.allowedPaths,
     });
   }
+  if (params.hasConfiguredCredential(params.provider)) {
+    return true;
+  }
+  const fallbackPath = params.provider
+    .getConfiguredCredentialFallback?.(params.config)
+    ?.path?.trim();
+  if (fallbackPath) {
+    addFallbackPathTargets({
+      path: fallbackPath,
+      targetIds: params.state.targetIds,
+      targetPaths: params.state.targetPaths,
+      allowedPaths: params.state.allowedPaths,
+      fallbackTargetIds: params.state.fallbackTargetIds,
+      fallbackPaths: params.state.fallbackPaths,
+      addTargets: addConfigPathTargets,
+    });
+  }
+  return false;
 }
 
 function getCapabilityWebSearchSelectedProviderTargetIds(
@@ -439,20 +474,9 @@ function getCapabilityWebSearchSelectedProviderTargetIds(
 ): SelectedProviderTargetIds {
   const selectedProviderId = resolveSelectedWebSearchProviderId(config, providerId);
   if (!selectedProviderId) {
-    return {
-      matchedProvider: false,
-      targetIds: [],
-      targetPaths: [],
-      allowedPaths: [],
-      fallbackTargetIds: [],
-      fallbackPaths: [],
-    };
+    return emptySelectedProviderTargetIds();
   }
-  const targetIds = new Set<string>();
-  const targetPaths = new Set<string>();
-  const allowedPaths = new Set<string>();
-  const fallbackTargetIds = new Set<string>();
-  const fallbackPaths = new Set<string>();
+  const state = createSelectedProviderTargetState();
   const providerDiscoveryConfig = withSelectedWebProviderForDiscovery(
     config,
     "search",
@@ -460,74 +484,34 @@ function getCapabilityWebSearchSelectedProviderTargetIds(
   );
   const providers = resolvePluginWebSearchProviders({
     config: providerDiscoveryConfig,
-    bundledAllowlistCompat: true,
   }).filter((provider) => provider.id === selectedProviderId);
   for (const provider of providers) {
-    if (provider.credentialPath.trim()) {
-      addConfigPathTargets({
-        path: provider.credentialPath,
-        targetIds,
-        targetPaths,
-        allowedPaths,
-      });
-    }
-    addConfiguredSearchCredentialTargetIds({
-      config,
-      provider,
-      targetIds,
-      targetPaths,
-      allowedPaths,
-    });
-    if (hasConfiguredSearchCredential({ provider, config })) {
+    if (
+      addSelectedProviderCredentialTargets({
+        config,
+        provider,
+        state,
+        hasConfiguredCredential: (entry) =>
+          hasConfiguredSearchCredential({ provider: entry, config }),
+      })
+    ) {
       continue;
-    }
-    const fallbackPath = provider.getConfiguredCredentialFallback?.(config)?.path?.trim();
-    if (fallbackPath) {
-      const before = new Set(targetIds);
-      const added = addConfigPathTargets({
-        path: fallbackPath,
-        targetIds,
-        targetPaths,
-        allowedPaths,
-      });
-      for (const targetId of targetIds) {
-        if (!before.has(targetId)) {
-          fallbackTargetIds.add(targetId);
-        }
-      }
-      if (added) {
-        fallbackPaths.add(fallbackPath);
-      }
     }
     const modelFallbackPath =
       modelProviderCredentialFallbackPathForWebSearchProvider(selectedProviderId);
-    if (modelFallbackPath && !fallbackPaths.has(modelFallbackPath)) {
-      const before = new Set(targetIds);
-      const added = addConfiguredConfigPathTargets({
-        config,
+    if (modelFallbackPath && !state.fallbackPaths.has(modelFallbackPath)) {
+      addFallbackPathTargets({
         path: modelFallbackPath,
-        targetIds,
-        targetPaths,
-        allowedPaths,
+        targetIds: state.targetIds,
+        targetPaths: state.targetPaths,
+        allowedPaths: state.allowedPaths,
+        fallbackTargetIds: state.fallbackTargetIds,
+        fallbackPaths: state.fallbackPaths,
+        addTargets: (targetParams) => addConfiguredConfigPathTargets({ config, ...targetParams }),
       });
-      for (const targetId of targetIds) {
-        if (!before.has(targetId)) {
-          fallbackTargetIds.add(targetId);
-        }
-      }
-      if (added) {
-        fallbackPaths.add(modelFallbackPath);
-      }
     }
   }
-  return {
-    matchedProvider: providers.length > 0,
-    targetIds: [...targetIds].toSorted(),
-    targetPaths: [...targetPaths].toSorted(),
-    allowedPaths: [...allowedPaths].toSorted(),
-    fallbackTargetIds: [...fallbackTargetIds].toSorted(),
-    fallbackPaths: [...fallbackPaths].toSorted(),
-  };
+  return toSelectedProviderTargetIds({ matchedProvider: providers.length > 0, state });
 }
 
 function getCapabilityWebFetchSelectedProviderTargetIds(
@@ -536,20 +520,9 @@ function getCapabilityWebFetchSelectedProviderTargetIds(
 ): SelectedProviderTargetIds {
   const selectedProviderId = resolveSelectedWebFetchProviderId(config, providerId);
   if (!selectedProviderId) {
-    return {
-      matchedProvider: false,
-      targetIds: [],
-      targetPaths: [],
-      allowedPaths: [],
-      fallbackTargetIds: [],
-      fallbackPaths: [],
-    };
+    return emptySelectedProviderTargetIds();
   }
-  const targetIds = new Set<string>();
-  const targetPaths = new Set<string>();
-  const allowedPaths = new Set<string>();
-  const fallbackTargetIds = new Set<string>();
-  const fallbackPaths = new Set<string>();
+  const state = createSelectedProviderTargetState();
   const providerDiscoveryConfig = withSelectedWebProviderForDiscovery(
     config,
     "fetch",
@@ -557,140 +530,91 @@ function getCapabilityWebFetchSelectedProviderTargetIds(
   );
   const providers = resolvePluginWebFetchProviders({
     config: providerDiscoveryConfig,
-    bundledAllowlistCompat: true,
   }).filter((provider) => provider.id === selectedProviderId);
   for (const provider of providers) {
-    if (provider.credentialPath.trim()) {
-      addConfigPathTargets({
-        path: provider.credentialPath,
-        targetIds,
-        targetPaths,
-        allowedPaths,
-      });
-    }
-    addConfiguredFetchCredentialTargetIds({
+    addSelectedProviderCredentialTargets({
       config,
       provider,
-      targetIds,
-      targetPaths,
-      allowedPaths,
+      state,
+      hasConfiguredCredential: (entry) => hasConfiguredFetchCredential({ provider: entry, config }),
     });
-    if (hasConfiguredFetchCredential({ provider, config })) {
+  }
+  return toSelectedProviderTargetIds({ matchedProvider: providers.length > 0, state });
+}
+
+function getCapabilityWebProviderAutoDetectTargets<
+  Provider extends CapabilityWebCredentialProvider,
+>(params: {
+  config: OpenClawConfig;
+  baseTargetIds: ReadonlySet<string>;
+  providers: readonly Provider[];
+  hasConfiguredCredential: (provider: Provider) => boolean;
+}): CommandSecretTargetScope {
+  const targetIds = new Set(params.baseTargetIds);
+  const fallbackTargetIds = new Set<string>();
+  const fallbackPaths = new Set<string>();
+  for (const provider of params.providers) {
+    if (params.hasConfiguredCredential(provider)) {
+      break;
+    }
+    const fallback = provider.getConfiguredCredentialFallback?.(params.config);
+    const fallbackPath = fallback?.path?.trim();
+    if (!fallbackPath || !isConfiguredSecretCandidate(fallback?.value)) {
       continue;
     }
-    const fallbackPath = provider.getConfiguredCredentialFallback?.(config)?.path?.trim();
-    if (fallbackPath) {
-      const before = new Set(targetIds);
-      const added = addConfigPathTargets({
-        path: fallbackPath,
-        targetIds,
-        targetPaths,
-        allowedPaths,
-      });
-      for (const targetId of targetIds) {
-        if (!before.has(targetId)) {
-          fallbackTargetIds.add(targetId);
-        }
-      }
-      if (added) {
-        fallbackPaths.add(fallbackPath);
-      }
+    for (const targetId of targetIdsForConfigPath(fallbackPath)) {
+      targetIds.add(targetId);
+      fallbackTargetIds.add(targetId);
     }
+    fallbackPaths.add(fallbackPath);
+    break;
   }
+  if (fallbackTargetIds.size === 0) {
+    return { targetIds };
+  }
+  // Fallback credentials are optional unless their concrete path is already configured;
+  // this prevents auto-detect from forcing unrelated provider credentials active.
+  const allowedPaths = mergeConfiguredAllowedPaths({
+    config: params.config,
+    baseTargetIds: params.baseTargetIds,
+    concreteFallbackPaths: fallbackPaths,
+  });
+  const optionalActivePaths = discoverForcedActivePaths(
+    params.config,
+    fallbackTargetIds,
+    allowedPaths,
+  );
   return {
-    matchedProvider: providers.length > 0,
-    targetIds: [...targetIds].toSorted(),
-    targetPaths: [...targetPaths].toSorted(),
-    allowedPaths: [...allowedPaths].toSorted(),
-    fallbackTargetIds: [...fallbackTargetIds].toSorted(),
-    fallbackPaths: [...fallbackPaths].toSorted(),
+    targetIds,
+    ...(allowedPaths ? { allowedPaths } : {}),
+    ...(optionalActivePaths ? { optionalActivePaths } : {}),
   };
 }
 
 function getCapabilityWebSearchAutoDetectTargets(config: OpenClawConfig): CommandSecretTargetScope {
-  const baseTargetIds = getCapabilityWebSearchCommandSecretTargetIds();
-  const targetIds = new Set(baseTargetIds);
-  const fallbackTargetIds = new Set<string>();
-  const fallbackPaths = new Set<string>();
-  const providers = sortWebSearchProvidersForAutoDetect(
-    resolvePluginWebSearchProviders({
-      config,
-      bundledAllowlistCompat: true,
-    }),
-  );
-  for (const provider of providers) {
-    if (hasConfiguredSearchCredential({ provider, config })) {
-      break;
-    }
-    const fallback = provider.getConfiguredCredentialFallback?.(config);
-    const fallbackPath = fallback?.path?.trim();
-    if (!fallbackPath || !isConfiguredSecretCandidate(fallback?.value)) {
-      continue;
-    }
-    for (const targetId of targetIdsForConfigPath(fallbackPath)) {
-      targetIds.add(targetId);
-      fallbackTargetIds.add(targetId);
-    }
-    fallbackPaths.add(fallbackPath);
-    break;
-  }
-  if (fallbackTargetIds.size === 0) {
-    return { targetIds };
-  }
-  const allowedPaths = mergeConfiguredAllowedPaths({
+  return getCapabilityWebProviderAutoDetectTargets({
     config,
-    baseTargetIds,
-    concreteFallbackPaths: fallbackPaths,
+    baseTargetIds: getCapabilityWebSearchCommandSecretTargetIds(),
+    providers: sortWebSearchProvidersForAutoDetect(
+      resolvePluginWebSearchProviders({
+        config,
+      }),
+    ),
+    hasConfiguredCredential: (provider) => hasConfiguredSearchCredential({ provider, config }),
   });
-  const optionalActivePaths = discoverForcedActivePaths(config, fallbackTargetIds, allowedPaths);
-  return {
-    targetIds,
-    ...(allowedPaths ? { allowedPaths } : {}),
-    ...(optionalActivePaths ? { optionalActivePaths } : {}),
-  };
 }
 
 function getCapabilityWebFetchAutoDetectTargets(config: OpenClawConfig): CommandSecretTargetScope {
-  const baseTargetIds = getCapabilityWebFetchCommandSecretTargetIds();
-  const targetIds = new Set(baseTargetIds);
-  const fallbackTargetIds = new Set<string>();
-  const fallbackPaths = new Set<string>();
-  const providers = sortWebFetchProvidersForAutoDetect(
-    resolvePluginWebFetchProviders({
-      config,
-      bundledAllowlistCompat: true,
-    }),
-  );
-  for (const provider of providers) {
-    if (hasConfiguredFetchCredential({ provider, config })) {
-      break;
-    }
-    const fallback = provider.getConfiguredCredentialFallback?.(config);
-    const fallbackPath = fallback?.path?.trim();
-    if (!fallbackPath || !isConfiguredSecretCandidate(fallback?.value)) {
-      continue;
-    }
-    for (const targetId of targetIdsForConfigPath(fallbackPath)) {
-      targetIds.add(targetId);
-      fallbackTargetIds.add(targetId);
-    }
-    fallbackPaths.add(fallbackPath);
-    break;
-  }
-  if (fallbackTargetIds.size === 0) {
-    return { targetIds };
-  }
-  const allowedPaths = mergeConfiguredAllowedPaths({
+  return getCapabilityWebProviderAutoDetectTargets({
     config,
-    baseTargetIds,
-    concreteFallbackPaths: fallbackPaths,
+    baseTargetIds: getCapabilityWebFetchCommandSecretTargetIds(),
+    providers: sortWebFetchProvidersForAutoDetect(
+      resolvePluginWebFetchProviders({
+        config,
+      }),
+    ),
+    hasConfiguredCredential: (provider) => hasConfiguredFetchCredential({ provider, config }),
   });
-  const optionalActivePaths = discoverForcedActivePaths(config, fallbackTargetIds, allowedPaths);
-  return {
-    targetIds,
-    ...(allowedPaths ? { allowedPaths } : {}),
-    ...(optionalActivePaths ? { optionalActivePaths } : {}),
-  };
 }
 
 function getAgentRuntimeBaseTargetIds(): string[] {
@@ -801,32 +725,63 @@ function pathTargetsScopedChannelAccount(params: {
   if (accountRoot !== "accounts") {
     return true;
   }
-  return accountId === params.accountId;
+  return normalizeOptionalAccountId(accountId) === params.accountId;
 }
 
+/** Return channel secret targets, optionally narrowed to one channel account subtree. */
 export function getScopedChannelsCommandSecretTargets(params: {
   config: OpenClawConfig;
   channel?: string | null;
+  channels?: readonly string[];
   accountId?: string | null;
+  defaultAccountWhenMissing?: boolean;
 }): {
   targetIds: Set<string>;
   allowedPaths?: Set<string>;
 } {
   const channel = normalizeOptionalString(params.channel);
-  const targetIds = selectChannelTargetIds(channel);
-  const normalizedAccountId = normalizeOptionalAccountId(params.accountId);
-  if (!channel || !normalizedAccountId) {
+  const channels =
+    params.channels === undefined
+      ? undefined
+      : sortUniqueStrings(
+          params.channels.flatMap((candidate) => {
+            const normalized = normalizeOptionalString(candidate);
+            return normalized ? [normalized] : [];
+          }),
+        );
+  const targetIds =
+    channels === undefined
+      ? selectChannelTargetIds(channel)
+      : new Set(channels.flatMap((candidate) => [...selectChannelTargetIds(candidate)]));
+  const explicitAccountId = normalizeOptionalAccountId(params.accountId);
+  const channelPlugin =
+    channel && !explicitAccountId && params.defaultAccountWhenMissing
+      ? listReadOnlyChannelPluginsForConfig(params.config, {
+          includePersistedAuthState: false,
+        }).find((plugin) => plugin.id === channel)
+      : undefined;
+  const normalizedAccountId =
+    explicitAccountId ??
+    (channelPlugin
+      ? normalizeOptionalAccountId(
+          resolveChannelDefaultAccountId({ plugin: channelPlugin, cfg: params.config }),
+        )
+      : undefined);
+  const scopedChannels = channels ?? (channel ? [channel] : []);
+  if (scopedChannels.length === 0 || !normalizedAccountId) {
     return { targetIds };
   }
 
   const allowedPaths = new Set<string>();
   for (const target of discoverConfigSecretTargetsByIds(params.config, targetIds)) {
     if (
-      pathTargetsScopedChannelAccount({
-        pathSegments: target.pathSegments,
-        channel,
-        accountId: normalizedAccountId,
-      })
+      scopedChannels.some((scopedChannel) =>
+        pathTargetsScopedChannelAccount({
+          pathSegments: target.pathSegments,
+          channel: scopedChannel,
+          accountId: normalizedAccountId,
+        }),
+      )
     ) {
       allowedPaths.add(target.path);
     }
@@ -834,14 +789,17 @@ export function getScopedChannelsCommandSecretTargets(params: {
   return { targetIds, allowedPaths };
 }
 
+/** Secret targets needed by QR remote pairing flows. */
 export function getQrRemoteCommandSecretTargetIds(): Set<string> {
   return toTargetIdSet(STATIC_QR_REMOTE_TARGET_IDS);
 }
 
+/** All registered channel secret targets, regardless of current config. */
 export function getChannelsCommandSecretTargetIds(): Set<string> {
   return toTargetIdSet(getCommandSecretTargets().channels);
 }
 
+/** Channel secret targets contributed by channels currently present in config/read-only plugins. */
 export function getConfiguredChannelsCommandSecretTargetIds(
   config: OpenClawConfig,
   env?: NodeJS.ProcessEnv,
@@ -849,18 +807,22 @@ export function getConfiguredChannelsCommandSecretTargetIds(
   return toTargetIdSet(getConfiguredChannelSecretTargetIds(config, env));
 }
 
+/** Model-provider credential targets used by commands that can touch provider config. */
 export function getModelsCommandSecretTargetIds(): Set<string> {
   return toTargetIdSet(STATIC_MODEL_TARGET_IDS);
 }
 
+/** Credential targets required by memory embedding flows. */
 export function getMemoryEmbeddingCommandSecretTargetIds(): Set<string> {
   return toTargetIdSet(STATIC_MEMORY_EMBEDDING_TARGET_IDS);
 }
 
+/** Credential targets required by text-to-speech flows. */
 export function getTtsCommandSecretTargetIds(): Set<string> {
   return toTargetIdSet(STATIC_TTS_TARGET_IDS);
 }
 
+/** Agent runtime credential targets, optionally including all channel credential targets. */
 export function getAgentRuntimeCommandSecretTargetIds(params?: {
   includeChannelTargets?: boolean;
 }): Set<string> {
@@ -870,98 +832,141 @@ export function getAgentRuntimeCommandSecretTargetIds(params?: {
   return toTargetIdSet(getCommandSecretTargets().agentRuntime);
 }
 
+/**
+ * Web credentials are needed only if the model invokes the corresponding tool.
+ * Keep them materializable for agent runs without making tool-owner outages block turn startup.
+ */
+export function getAgentRuntimeOptionalCommandSecretPaths(config: OpenClawConfig): Set<string> {
+  const targetIds = new Set([
+    ...getCapabilityWebSearchTargetIds(),
+    ...getCapabilityWebFetchTargetIds(),
+  ]);
+  const defaults = config.secrets?.defaults;
+  return new Set(
+    discoverConfigSecretTargetsByIds(config, targetIds)
+      .filter((target) =>
+        Boolean(
+          resolveSecretInputRef({
+            value: target.value,
+            refValue: target.refValue,
+            defaults,
+          }).ref,
+        ),
+      )
+      .map((target) => target.path),
+  );
+}
+
+/** Static web-fetch capability targets plus plugin-provided web-fetch credential targets. */
 export function getCapabilityWebFetchCommandSecretTargetIds(): Set<string> {
   return toTargetIdSet(getCapabilityWebFetchTargetIds());
 }
 
+type CapabilityWebCommandSecretTargetParams = {
+  config: OpenClawConfig;
+  providerId?: string | null;
+  disabled: boolean;
+  baseTargetIds: () => Set<string>;
+  resolveSelectedProviderId: (
+    config: OpenClawConfig,
+    providerId?: string | null,
+  ) => string | undefined;
+  autoDetectTargets: (config: OpenClawConfig) => CommandSecretTargetScope;
+  selectedProviderTargetIds: (
+    config: OpenClawConfig,
+    providerId?: string | null,
+  ) => SelectedProviderTargetIds;
+};
+
+function getCapabilityWebCommandSecretTargets(
+  params: CapabilityWebCommandSecretTargetParams,
+): CommandSecretTargetScope {
+  if (params.disabled) {
+    return { targetIds: params.baseTargetIds() };
+  }
+  const selectedProviderId = params.resolveSelectedProviderId(params.config, params.providerId);
+  if (!selectedProviderId) {
+    return params.autoDetectTargets(params.config);
+  }
+  const selectedTargets = params.selectedProviderTargetIds(params.config, selectedProviderId);
+  if (!selectedTargets.matchedProvider && !params.providerId) {
+    return params.autoDetectTargets(params.config);
+  }
+  const targetIds = toTargetIdSet(selectedTargets.targetIds);
+  const allowedPaths =
+    selectedTargets.allowedPaths.length > 0 ? new Set(selectedTargets.targetPaths) : undefined;
+  const forcedActivePaths = discoverForcedActivePaths(
+    params.config,
+    toTargetIdSet(
+      params.providerId ? selectedTargets.targetIds : selectedTargets.fallbackTargetIds,
+    ),
+    allowedPaths,
+  );
+  return {
+    targetIds,
+    ...(allowedPaths ? { allowedPaths } : {}),
+    ...(forcedActivePaths ? { forcedActivePaths } : {}),
+  };
+}
+
+/** Web-fetch target scope for selected/auto-detected providers and configured fallback paths. */
 export function getCapabilityWebFetchCommandSecretTargets(
   config: OpenClawConfig,
   options?: {
     providerId?: string | null;
   },
 ): CommandSecretTargetScope {
-  if (resolveFetchConfig(config)?.enabled === false) {
-    return { targetIds: getCapabilityWebFetchCommandSecretTargetIds() };
-  }
-  const selectedProviderId = resolveSelectedWebFetchProviderId(config, options?.providerId);
-  if (!selectedProviderId) {
-    return getCapabilityWebFetchAutoDetectTargets(config);
-  }
-  const selectedTargets = getCapabilityWebFetchSelectedProviderTargetIds(
+  return getCapabilityWebCommandSecretTargets({
     config,
-    selectedProviderId,
-  );
-  if (!selectedTargets.matchedProvider && !options?.providerId) {
-    return getCapabilityWebFetchAutoDetectTargets(config);
-  }
-  const targetIds = toTargetIdSet(selectedTargets.targetIds);
-  const allowedPaths =
-    selectedTargets.allowedPaths.length > 0 ? new Set(selectedTargets.targetPaths) : undefined;
-  const forcedActivePaths = discoverForcedActivePaths(
-    config,
-    toTargetIdSet(
-      options?.providerId ? selectedTargets.targetIds : selectedTargets.fallbackTargetIds,
-    ),
-    allowedPaths,
-  );
-  return {
-    targetIds,
-    ...(allowedPaths ? { allowedPaths } : {}),
-    ...(forcedActivePaths ? { forcedActivePaths } : {}),
-  };
+    providerId: options?.providerId,
+    disabled: resolveFetchConfig(config)?.enabled === false,
+    baseTargetIds: getCapabilityWebFetchCommandSecretTargetIds,
+    resolveSelectedProviderId: resolveSelectedWebFetchProviderId,
+    autoDetectTargets: getCapabilityWebFetchAutoDetectTargets,
+    selectedProviderTargetIds: getCapabilityWebFetchSelectedProviderTargetIds,
+  });
 }
 
+/** Static web-search capability targets plus plugin-provided web-search credential targets. */
 export function getCapabilityWebSearchCommandSecretTargetIds(): Set<string> {
   return toTargetIdSet(getCapabilityWebSearchTargetIds());
 }
 
+/** Web-search target scope for selected/auto-detected providers and configured fallback paths. */
 export function getCapabilityWebSearchCommandSecretTargets(
   config: OpenClawConfig,
   options?: {
     providerId?: string | null;
   },
 ): CommandSecretTargetScope {
-  if (resolveSearchConfig(config)?.enabled === false) {
-    return { targetIds: getCapabilityWebSearchCommandSecretTargetIds() };
-  }
-  const selectedProviderId = resolveSelectedWebSearchProviderId(config, options?.providerId);
-  if (!selectedProviderId) {
-    return getCapabilityWebSearchAutoDetectTargets(config);
-  }
-  const selectedTargets = getCapabilityWebSearchSelectedProviderTargetIds(
+  return getCapabilityWebCommandSecretTargets({
     config,
-    selectedProviderId,
-  );
-  if (!selectedTargets.matchedProvider && !options?.providerId) {
-    return getCapabilityWebSearchAutoDetectTargets(config);
-  }
-  const targetIds = toTargetIdSet(selectedTargets.targetIds);
-  const allowedPaths =
-    selectedTargets.allowedPaths.length > 0 ? new Set(selectedTargets.targetPaths) : undefined;
-  const forcedActivePaths = discoverForcedActivePaths(
-    config,
-    toTargetIdSet(
-      options?.providerId ? selectedTargets.targetIds : selectedTargets.fallbackTargetIds,
-    ),
-    allowedPaths,
-  );
-  return {
-    targetIds,
-    ...(allowedPaths ? { allowedPaths } : {}),
-    ...(forcedActivePaths ? { forcedActivePaths } : {}),
-  };
+    providerId: options?.providerId,
+    disabled: resolveSearchConfig(config)?.enabled === false,
+    baseTargetIds: getCapabilityWebSearchCommandSecretTargetIds,
+    resolveSelectedProviderId: resolveSelectedWebSearchProviderId,
+    autoDetectTargets: getCapabilityWebSearchAutoDetectTargets,
+    selectedProviderTargetIds: getCapabilityWebSearchSelectedProviderTargetIds,
+  });
 }
 
+/** Status command targets; channel targets can be limited to configured channel plugins. */
 export function getStatusCommandSecretTargetIds(
   config?: OpenClawConfig,
   env?: NodeJS.ProcessEnv,
+  options?: { includeChannelTargets?: boolean },
 ): Set<string> {
-  const channelTargetIds = config
-    ? getConfiguredChannelSecretTargetIds(config, env)
-    : getChannelSecretTargetIds();
+  const channelTargetIds =
+    options?.includeChannelTargets === false
+      ? []
+      : config
+        ? getConfiguredChannelSecretTargetIds(config, env)
+        : getChannelSecretTargetIds();
   return toTargetIdSet([...STATIC_STATUS_TARGET_IDS, ...channelTargetIds]);
 }
 
+/** Secret targets that the security audit command is allowed to inspect. */
 export function getSecurityAuditCommandSecretTargetIds(): Set<string> {
   return toTargetIdSet(getCommandSecretTargets().securityAudit);
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -23,9 +23,11 @@
 // Pattern for valid uppercase env var names: starts with letter or underscore,
 // followed by letters, numbers, or underscores (all uppercase)
 import { isPlainObject } from "../utils.js";
+import { parseEnvTemplateSecretRef } from "./types.secrets.js";
 
 const ENV_VAR_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 
+/** Error thrown when a config value references a missing or empty environment variable. */
 export class MissingEnvVarError extends Error {
   constructor(
     public readonly varName: string,
@@ -50,6 +52,7 @@ function parseEnvTokenAt(value: string, index: number): EnvToken | null {
 
   // Escaped: $${VAR} -> ${VAR}
   if (next === "$" && afterNext === "{") {
+    // Parse escaped placeholders before substitutions so "$${VAR}" never resolves from env.
     const start = index + 3;
     const end = value.indexOf("}", start);
     if (end !== -1) {
@@ -75,6 +78,7 @@ function parseEnvTokenAt(value: string, index: number): EnvToken | null {
   return null;
 }
 
+/** Missing environment variable warning emitted when substitution is configured to continue. */
 export type EnvSubstitutionWarning = {
   varName: string;
   configPath: string;
@@ -83,6 +87,8 @@ export type EnvSubstitutionWarning = {
 type SubstituteOptions = {
   /** When set, missing vars call this instead of throwing and the original placeholder is preserved. */
   onMissing?: (warning: EnvSubstitutionWarning) => void;
+  /** Records exact env SecretRef shorthand that substitution did not materialize. */
+  onPendingEnvSecretRef?: (id: string, configPath: string) => void;
 };
 
 function substituteString(
@@ -95,10 +101,14 @@ function substituteString(
     return value;
   }
 
+  const authoredRef = parseEnvTemplateSecretRef(value);
+  if (authoredRef && !containsEnvVarReference(value)) {
+    opts?.onPendingEnvSecretRef?.(authoredRef.id, configPath);
+  }
   const chunks: string[] = [];
 
   for (let i = 0; i < value.length; i += 1) {
-    const char = value[i];
+    const char = value.charAt(i);
     if (char !== "$") {
       chunks.push(char);
       continue;
@@ -115,6 +125,9 @@ function substituteString(
       if (envValue === undefined || envValue === "") {
         if (opts?.onMissing) {
           opts.onMissing({ varName: token.name, configPath });
+          if (authoredRef?.id === token.name) {
+            opts.onPendingEnvSecretRef?.(token.name, configPath);
+          }
           // Preserve the original placeholder so the value is visibly unresolved.
           chunks.push(`\${${token.name}}`);
           i = token.end;
@@ -134,6 +147,7 @@ function substituteString(
   return chunks.join("");
 }
 
+/** Detects unescaped `${VAR}` references without treating escaped `$${VAR}` as references. */
 export function containsEnvVarReference(value: string): boolean {
   if (!value.includes("$")) {
     return false;

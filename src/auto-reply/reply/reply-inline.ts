@@ -1,5 +1,11 @@
-import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
-import { collapseInlineHorizontalWhitespace } from "./reply-inline-whitespace.js";
+// Resolves inline reply directives that alter a single reply turn.
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+
+const INLINE_HORIZONTAL_WHITESPACE_RE = /[^\S\n]+/g;
+
+function collapseInlineHorizontalWhitespace(value: string): string {
+  return value.replace(INLINE_HORIZONTAL_WHITESPACE_RE, " ");
+}
 
 const INLINE_SIMPLE_COMMAND_ALIASES = new Map<string, string>([
   ["/help", "/help"],

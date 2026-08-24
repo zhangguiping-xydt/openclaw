@@ -17,43 +17,13 @@ LIVE_IMAGE_NAME="${OPENCLAW_LIVE_IMAGE:-${IMAGE_NAME}-live}"
 CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$HOME/.openclaw/workspace}"
 PROFILE_FILE="$(openclaw_live_default_profile_file)"
-DOCKER_USER="${OPENCLAW_DOCKER_USER:-node}"
-DOCKER_HOME_MOUNT=()
 DOCKER_EXTRA_ENV_FILES=()
 DOCKER_TRUSTED_HARNESS_CONTAINER_DIR="/trusted-harness"
 DOCKER_TRUSTED_HARNESS_MOUNT=(-v "$TRUSTED_HARNESS_DIR":"$DOCKER_TRUSTED_HARNESS_CONTAINER_DIR":ro)
-TEMP_DIRS=()
-
-cleanup_temp_dirs() {
-  if ((${#TEMP_DIRS[@]} > 0)); then
-    rm -rf "${TEMP_DIRS[@]}"
-  fi
-}
-trap cleanup_temp_dirs EXIT
-
-if [[ -n "${OPENCLAW_DOCKER_CACHE_HOME_DIR:-}" ]]; then
-  CACHE_HOME_DIR="${OPENCLAW_DOCKER_CACHE_HOME_DIR}"
-elif openclaw_live_is_ci; then
-  CACHE_HOME_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/openclaw-docker-cache.XXXXXX")"
-  TEMP_DIRS+=("$CACHE_HOME_DIR")
-else
-  CACHE_HOME_DIR="$HOME/.cache/openclaw/docker-cache"
-fi
-mkdir -p "$CACHE_HOME_DIR"
-
-if openclaw_live_is_ci; then
-  DOCKER_USER="$(id -u):$(id -g)"
-  DOCKER_HOME_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/openclaw-docker-home.XXXXXX")"
-  TEMP_DIRS+=("$DOCKER_HOME_DIR")
-  DOCKER_HOME_MOUNT=(-v "$DOCKER_HOME_DIR":/home/node)
-fi
-
-PROFILE_MOUNT=()
-PROFILE_STATUS="none"
-if [[ -f "$PROFILE_FILE" && -r "$PROFILE_FILE" ]]; then
-  PROFILE_MOUNT=(-v "$PROFILE_FILE":/home/node/.profile:ro)
-  PROFILE_STATUS="$PROFILE_FILE"
-fi
+openclaw_live_init_temp_dirs
+openclaw_live_init_cache_home_dir
+openclaw_live_init_managed_home
+openclaw_live_init_profile_mount
 
 if [[ -n "${OPENAI_API_KEY:-}" || -n "${OPENAI_BASE_URL:-}" || -n "${GEMINI_API_KEY:-}" || -n "${GOOGLE_API_KEY:-}" ]]; then
   docker_env_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/openclaw-subagent-live-env.XXXXXX")"
@@ -76,11 +46,7 @@ if [[ -n "${OPENAI_API_KEY:-}" || -n "${OPENAI_BASE_URL:-}" || -n "${GEMINI_API_
   DOCKER_EXTRA_ENV_FILES+=(--env-file "$docker_env_file")
 fi
 
-CONTAINER_NODE_OPTIONS="${OPENCLAW_DOCKER_NODE_OPTIONS:-${NODE_OPTIONS:-}}"
-if [[ -z "$(openclaw_live_trim "$CONTAINER_NODE_OPTIONS")" ]]; then
-  CONTAINER_NODE_OPTIONS="--max-old-space-size=4096"
-fi
-CONTAINER_NODE_OPTIONS="$CONTAINER_NODE_OPTIONS --disable-warning=ExperimentalWarning"
+CONTAINER_NODE_OPTIONS="$(openclaw_live_container_node_options)"
 
 read -r -d '' LIVE_TEST_CMD <<'EOF' || true
 set -euo pipefail
@@ -119,16 +85,25 @@ cd "$tmp_dir"
 OPENCLAW_LIVE_TEST=1 \
 OPENCLAW_LIVE_SUBAGENT_E2E=1 \
 OPENCLAW_VITEST_MAX_WORKERS="${OPENCLAW_VITEST_MAX_WORKERS:-1}" \
-node scripts/test-live.mjs -- src/agents/subagent-announce.live.test.ts -- --reporter=verbose
+node --import tsx scripts/test-live.mts -- src/agents/subagents/announce/subagent-announce.live.test.ts -- --reporter=verbose
 EOF
 
 OPENCLAW_LIVE_DOCKER_REPO_ROOT="$ROOT_DIR" "$TRUSTED_HARNESS_DIR/scripts/test-live-build-docker.sh"
+if openclaw_live_uses_managed_bind_dirs; then
+  openclaw_live_chown_bind_dirs_for_container_user \
+    "$LIVE_IMAGE_NAME" \
+    "$DOCKER_USER" \
+    "$CACHE_HOME_DIR" \
+    "${DOCKER_HOME_DIR:-}"
+fi
 
 echo "==> Run subagent announce live test in Docker"
-echo "==> Target: src/agents/subagent-announce.live.test.ts"
-echo "==> Model: ${OPENCLAW_LIVE_SUBAGENT_E2E_MODEL:-openai/gpt-5.5}"
+echo "==> Target: src/agents/subagents/announce/subagent-announce.live.test.ts"
+echo "==> Model: ${OPENCLAW_LIVE_SUBAGENT_E2E_MODEL:-openai/gpt-5.6-luna}"
 echo "==> Profile file: $PROFILE_STATUS"
-DOCKER_RUN_ARGS=(docker run --rm -t \
+DOCKER_RUN_ARGS=()
+openclaw_live_init_docker_run_args DOCKER_RUN_ARGS "${OPENCLAW_LIVE_SUBAGENT_DOCKER_RUN_TIMEOUT:-1200s}"
+DOCKER_RUN_ARGS+=(--rm -t \
   -u "$DOCKER_USER" \
   --entrypoint bash \
   -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \

@@ -1,5 +1,7 @@
+// Covers approval handler runtime adapter creation and lazy wiring.
 import { describe, expect, it, vi } from "vitest";
 import {
+  createChannelApprovalNativeRuntimeAdapter,
   createChannelApprovalHandlerFromCapability,
   createLazyChannelApprovalNativeRuntimeAdapter,
 } from "./approval-handler-runtime.js";
@@ -7,7 +9,9 @@ import {
   createApprovalNativeRuntimeAdapterStubs,
   type ApprovalNativeRuntimeAdapterStubParams,
 } from "./approval-handler.test-helpers.js";
+import type { NormalizedApprovalRequest } from "./approval-types.js";
 import type { ExecApprovalRequest } from "./exec-approvals.js";
+import type { PluginApprovalRequest } from "./plugin-approvals.js";
 
 type ApprovalCapability = NonNullable<
   Parameters<typeof createChannelApprovalHandlerFromCapability>[0]["capability"]
@@ -36,8 +40,9 @@ function makeSequentialPendingBindingMock() {
     .mockResolvedValueOnce({ bindingId: "bound-2" });
 }
 
-function makeExecApprovalRequest(id: string): ExecApprovalRequest {
+function makeExecApprovalRequest(id: string): NormalizedApprovalRequest<ExecApprovalRequest> {
   return {
+    approvalKind: "exec",
     id,
     expiresAtMs: Date.now() + 60_000,
     request: {
@@ -135,34 +140,74 @@ describe("createChannelApprovalHandlerFromCapability", () => {
     expectApprovalRuntime(runtime);
   });
 
-  it("preserves the original request and resolved approval kind when stop-time cleanup unbinds", async () => {
+  it("derives kind once before stop-time cleanup unbinds", async () => {
     const unbindPending = vi.fn();
+    const shouldHandle = vi.fn().mockReturnValue(true);
     const runtime = await createTestApprovalHandler(
       makeNativeApprovalCapability({
-        resolveApprovalKind: vi.fn().mockReturnValue("plugin"),
+        eventKinds: ["plugin"],
+        shouldHandle,
         unbindPending,
       }),
     );
 
     const approvalRuntime = expectApprovalRuntime(runtime);
-    const request = {
+    const request: PluginApprovalRequest = {
       id: "custom:1",
+      createdAtMs: Date.now(),
       expiresAtMs: Date.now() + 60_000,
       request: {
+        title: "Plugin approval",
+        description: "Allow the plugin action",
         turnSourceChannel: "test",
         turnSourceTo: "origin-chat",
       },
-    } as never;
+    };
+    const normalizedRequest = { ...request, approvalKind: "plugin" as const };
 
     await approvalRuntime.handleRequested(request);
+    expect(shouldHandle).toHaveBeenCalledWith(
+      expect.objectContaining({ request: normalizedRequest, approvalKind: "plugin" }),
+    );
     await approvalRuntime.stop();
 
     expect(unbindPending).toHaveBeenCalledOnce();
     const stopUnbind = firstCallArg(unbindPending) as
       | { request?: unknown; approvalKind?: string }
       | undefined;
-    expect(stopUnbind?.request).toBe(request);
+    expect(stopUnbind?.request).toEqual(normalizedRequest);
     expect(stopUnbind?.approvalKind).toBe("plugin");
+  });
+
+  it("honors the shipped approval kind override through the capability runtime", async () => {
+    const resolveApprovalKind = vi.fn().mockReturnValue("plugin");
+    const shouldHandle = vi.fn().mockReturnValue(true);
+    const runtime = await createTestApprovalHandler(
+      makeNativeApprovalCapability({
+        eventKinds: ["plugin"],
+        resolveApprovalKind,
+        shouldHandle,
+      }),
+    );
+    const approvalRuntime = expectApprovalRuntime(runtime);
+    const request: PluginApprovalRequest = {
+      id: "plugin:legacy-owned-id",
+      createdAtMs: Date.now(),
+      expiresAtMs: Date.now() + 60_000,
+      request: {
+        title: "Plugin approval",
+        description: "Allow the plugin action",
+      },
+    };
+    const normalizedRequest = { ...request, approvalKind: "plugin" as const };
+
+    await approvalRuntime.handleRequested(request);
+
+    expect(resolveApprovalKind).toHaveBeenCalledWith(normalizedRequest);
+    expect(shouldHandle).toHaveBeenCalledWith(
+      expect.objectContaining({ request: normalizedRequest, approvalKind: "plugin" }),
+    );
+    await approvalRuntime.stop();
   });
 
   it("ignores duplicate pending request ids before finalization", async () => {
@@ -268,9 +313,34 @@ describe("createChannelApprovalHandlerFromCapability", () => {
 });
 
 describe("createLazyChannelApprovalNativeRuntimeAdapter", () => {
+  it("preserves the deprecated kind callback through the typed adapter factory", () => {
+    const resolveApprovalKind = vi.fn().mockReturnValue("plugin");
+    const adapter = createChannelApprovalNativeRuntimeAdapter({
+      resolveApprovalKind,
+      availability: {
+        isConfigured: vi.fn().mockReturnValue(true),
+        shouldHandle: vi.fn().mockReturnValue(true),
+      },
+      presentation: {
+        buildPendingPayload: vi.fn().mockReturnValue({ text: "pending" }),
+        buildResolvedResult: vi.fn().mockReturnValue({ kind: "leave" }),
+        buildExpiredResult: vi.fn().mockReturnValue({ kind: "leave" }),
+      },
+      transport: {
+        prepareTarget: vi.fn().mockReturnValue(null),
+        deliverPending: vi.fn().mockReturnValue(null),
+      },
+    });
+    const request = { id: "opaque-plugin-id" } as never;
+
+    expect(adapter.resolveApprovalKind?.(request)).toBe("plugin");
+    expect(resolveApprovalKind).toHaveBeenCalledWith(request);
+  });
+
   it("loads the runtime lazily and reuses the loaded adapter", async () => {
     const explicitIsConfigured = vi.fn().mockReturnValue(true);
     const explicitShouldHandle = vi.fn().mockReturnValue(false);
+    const resolveApprovalKind = vi.fn().mockReturnValue("exec");
     const buildPendingPayload = vi.fn().mockResolvedValue({ text: "pending" });
     const load = vi.fn().mockResolvedValue({
       availability: {
@@ -289,6 +359,7 @@ describe("createLazyChannelApprovalNativeRuntimeAdapter", () => {
     });
     const adapter = createLazyChannelApprovalNativeRuntimeAdapter({
       eventKinds: ["exec"],
+      resolveApprovalKind,
       isConfigured: explicitIsConfigured,
       shouldHandle: explicitShouldHandle,
       load,
@@ -298,8 +369,10 @@ describe("createLazyChannelApprovalNativeRuntimeAdapter", () => {
     const view = {} as never;
 
     expect(adapter.eventKinds).toEqual(["exec"]);
+    expect(adapter.resolveApprovalKind?.(request)).toBe("exec");
+    expect(resolveApprovalKind).toHaveBeenCalledWith(request);
     expect(adapter.availability.isConfigured({ cfg })).toBe(true);
-    expect(adapter.availability.shouldHandle({ cfg, request })).toBe(false);
+    expect(adapter.availability.shouldHandle({ cfg, request, approvalKind: "exec" })).toBe(false);
     await expect(
       adapter.presentation.buildPendingPayload({
         cfg,
@@ -311,7 +384,7 @@ describe("createLazyChannelApprovalNativeRuntimeAdapter", () => {
     ).resolves.toEqual({ text: "pending" });
     expect(load).toHaveBeenCalledTimes(1);
     expect(explicitIsConfigured).toHaveBeenCalledWith({ cfg });
-    expect(explicitShouldHandle).toHaveBeenCalledWith({ cfg, request });
+    expect(explicitShouldHandle).toHaveBeenCalledWith({ cfg, request, approvalKind: "exec" });
     expect(buildPendingPayload).toHaveBeenCalledWith({
       cfg,
       request,
@@ -390,8 +463,12 @@ describe("createLazyChannelApprovalNativeRuntimeAdapter", () => {
 
     const inflight = approvalRuntime.handleRequested(request);
     // Flush microtasks so deliverPending resolves and bindPending parks at the gate.
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => {
+      setTimeout(r, 0);
+    });
+    await new Promise((r) => {
+      setTimeout(r, 0);
+    });
 
     // stop() flips the stopped flag while bindPending is parked.
     await approvalRuntime.stop();
@@ -435,8 +512,12 @@ describe("createLazyChannelApprovalNativeRuntimeAdapter", () => {
 
     const inflight = approvalRuntime.handleRequested(request);
     // Flush microtasks so deliverPending is awaited and parked at the gate.
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => {
+      setTimeout(r, 0);
+    });
+    await new Promise((r) => {
+      setTimeout(r, 0);
+    });
 
     // stop() flips the stopped flag while deliverPending is still pending.
     await approvalRuntime.stop();
@@ -482,8 +563,12 @@ describe("createLazyChannelApprovalNativeRuntimeAdapter", () => {
 
     const inflight = approvalRuntime.handleRequested(request);
     // Flush microtasks so deliverPending resolves and bindPending awaits the gate.
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => {
+      setTimeout(r, 0);
+    });
+    await new Promise((r) => {
+      setTimeout(r, 0);
+    });
 
     // stop() flips the stopped flag while bindPending is parked; it then resolves to null.
     await approvalRuntime.stop();

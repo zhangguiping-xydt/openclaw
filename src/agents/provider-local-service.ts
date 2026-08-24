@@ -1,13 +1,36 @@
+/**
+ * Manages optional local provider sidecar processes attached to models. Leases
+ * keep shared services alive while requests run and stop them after idle.
+ */
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import path from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { isCanonicalDottedDecimalIPv4, isLoopbackIpAddress } from "@openclaw/net-policy/ip";
+import {
+  clampPositiveTimerTimeoutMs,
+  resolvePositiveTimerTimeoutMs,
+} from "@openclaw/normalization-core/number-coercion";
+import { sleepWithAbort } from "@openclaw/retry";
 import type { ModelProviderLocalServiceConfig } from "../config/types.models.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { toErrorObject } from "../infra/errors.js";
+import { mergeProcessEnv } from "../infra/process-env.js";
+import type { Model } from "../llm/types.js";
+import { isSensitiveFieldKey, redactSensitiveText } from "../logging/redact.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import {
+  forceKillChildProcessTree,
+  signalChildProcessTree,
+  shouldDetachChildForProcessTree,
+} from "../process/child-process-tree.js";
+import { setManagedProviderLocalServicesActive } from "./provider-runtime-lifecycle.js";
+import { unwrapHeadersInitSentinelsForProviderEgress } from "./provider-secret-egress.js";
 
 const log = createSubsystemLogger("provider-local-service");
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 2_000;
 const PROBE_INTERVAL_MS = 250;
+const LOCAL_SERVICE_OUTPUT_TAIL_MAX_BYTES = 8 * 1024;
 
 const MODEL_PROVIDER_LOCAL_SERVICE_SYMBOL = Symbol.for("openclaw.modelProviderLocalService");
 
@@ -22,6 +45,7 @@ type ManagedLocalService = {
   active: number;
   idleTimer?: NodeJS.Timeout;
   lastExit?: LocalServiceExit;
+  diagnostics?: LocalServiceDiagnostics;
 };
 
 const services = new Map<string, ManagedLocalService>();
@@ -32,10 +56,125 @@ type LocalServiceExit = {
   signal: NodeJS.Signals | null;
 };
 
+type LocalServiceDiagnostics = {
+  providerId: string;
+  healthUrl: string;
+  pid?: number;
+  startedAt: number;
+  spawnedAt?: number;
+  readyAt?: number;
+  lastHealthyAt?: number;
+  stdoutTail: string;
+  stderrTail: string;
+  lastExit?: LocalServiceExit;
+};
+
+/** Exact provider endpoint whose optional local process should be leased. */
+export type ProviderLocalServiceTarget = {
+  providerId: string;
+  baseUrl: string;
+  headers?: HeadersInit;
+  service?: ModelProviderLocalServiceConfig;
+};
+
+/** Configured provider endpoint whose host-owned local service may be leased. */
+export type ConfiguredProviderLocalServiceTarget = Omit<ProviderLocalServiceTarget, "service">;
+
+/** Lease returned for a started or already-running local provider service. */
 export type ProviderLocalServiceLease = {
   release: () => void;
 };
 
+/** Host-injected acquisition hook that cannot supply process configuration. */
+export type AcquireConfiguredProviderLocalService = (
+  target: ConfiguredProviderLocalServiceTarget,
+  signal?: AbortSignal | null,
+) => Promise<ProviderLocalServiceLease | undefined>;
+
+/** Bind local-service acquisition to a host-owned config snapshot. */
+export function createConfiguredProviderLocalServiceAcquirer(
+  getConfig: () => OpenClawConfig,
+): AcquireConfiguredProviderLocalService {
+  return async (target, signal) => {
+    const provider = getConfig().models?.providers?.[target.providerId];
+    const service = provider?.localService;
+    if (!service) {
+      return undefined;
+    }
+    if (!isConfiguredProviderBaseUrl(target.baseUrl, readConfiguredProviderBaseUrl(provider))) {
+      throw new Error(
+        `Local service target must match models.providers.${target.providerId}.baseUrl`,
+      );
+    }
+    return await ensureProviderLocalService({ ...target, service }, signal);
+  };
+}
+
+function readConfiguredProviderBaseUrl(
+  provider: { baseUrl?: string; baseURL?: unknown } | undefined,
+): string | undefined {
+  const canonical = provider?.baseUrl?.trim();
+  if (canonical) {
+    return canonical;
+  }
+  const alternate = provider?.baseURL;
+  return typeof alternate === "string" && alternate.trim() ? alternate.trim() : undefined;
+}
+
+function normalizeProviderBaseUrl(value: string): string | undefined {
+  const trimmed = value.trim();
+  const candidates = /^[a-z][a-z\d+.-]*:\/\//iu.test(trimmed) ? [trimmed] : [`http://${trimmed}`];
+  for (const candidate of candidates) {
+    try {
+      const url = new URL(candidate);
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        continue;
+      }
+      url.search = "";
+      url.hash = "";
+      url.pathname = url.pathname.replace(/\/+$/u, "") || "/";
+      return url.toString().replace(/\/$/u, "");
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
+function configuredProviderBaseUrlVariants(value: string): Set<string> {
+  const normalized = normalizeProviderBaseUrl(value);
+  if (!normalized) {
+    return new Set();
+  }
+  const withoutOpenAiPath = normalized.replace(/\/v1$/iu, "");
+  return new Set([normalized, withoutOpenAiPath, `${withoutOpenAiPath}/v1`]);
+}
+
+function isLoopbackProviderBaseUrl(value: string): boolean {
+  const normalized = normalizeProviderBaseUrl(value);
+  if (!normalized) {
+    return false;
+  }
+  const hostname = new URL(normalized).hostname.toLowerCase();
+  return (
+    hostname === "localhost" ||
+    hostname === "[::1]" ||
+    (isCanonicalDottedDecimalIPv4(hostname) && isLoopbackIpAddress(hostname))
+  );
+}
+
+function isConfiguredProviderBaseUrl(targetBaseUrl: string, configuredBaseUrl?: string): boolean {
+  const target = normalizeProviderBaseUrl(targetBaseUrl);
+  if (!target) {
+    return false;
+  }
+  const configured = configuredBaseUrl?.trim();
+  return configured
+    ? configuredProviderBaseUrlVariants(configured).has(target)
+    : isLoopbackProviderBaseUrl(target);
+}
+
+/** Attach local-service startup metadata to a model without mutating the original object. */
 export function attachModelProviderLocalService<TModel extends object>(
   model: TModel,
   service: ModelProviderLocalServiceConfig | undefined,
@@ -48,30 +187,50 @@ export function attachModelProviderLocalService<TModel extends object>(
   return next;
 }
 
+/** Read local-service startup metadata attached to a model. */
 export function getModelProviderLocalService(
   model: object,
 ): ModelProviderLocalServiceConfig | undefined {
   return (model as ModelWithProviderLocalService)[MODEL_PROVIDER_LOCAL_SERVICE_SYMBOL];
 }
 
+/** Ensure a model's local provider service is healthy and return a lease. */
 export async function ensureModelProviderLocalService(
-  model: Model<Api>,
+  model: Model,
   probeHeaders?: HeadersInit,
   signal?: AbortSignal | null,
 ): Promise<ProviderLocalServiceLease | undefined> {
   const service = getModelProviderLocalService(model);
+  return await ensureProviderLocalService(
+    {
+      providerId: model.provider,
+      baseUrl: model.baseUrl,
+      headers: buildHealthProbeHeaders((model as { headers?: HeadersInit }).headers, probeHeaders),
+      service,
+    },
+    signal,
+  );
+}
+
+/** Ensure a provider endpoint's local service is healthy and return a request lease. */
+export async function ensureProviderLocalService(
+  target: ProviderLocalServiceTarget,
+  signal?: AbortSignal | null,
+): Promise<ProviderLocalServiceLease | undefined> {
+  const service = target.service;
   if (!service) {
     return undefined;
   }
   throwIfAborted(signal);
 
-  validateLocalServiceConfig(service, model.provider);
-  const healthUrl = resolveHealthUrl(service, model.baseUrl);
-  const healthHeaders = buildHealthProbeHeaders(model, probeHeaders);
-  const key = localServiceKey(model.provider, service, healthUrl);
+  validateLocalServiceConfig(service, target.providerId);
+  const healthUrl = resolveHealthUrl(service, target.baseUrl);
+  const healthHeaders = buildHealthProbeHeaders(target.headers, undefined);
+  const key = localServiceKey(target.providerId, service, healthUrl);
   installExitHandler();
   const managed = services.get(key) ?? { active: 0 };
   services.set(key, managed);
+  setManagedProviderLocalServicesActive(true);
   clearIdleTimer(managed);
   managed.active += 1;
 
@@ -87,16 +246,18 @@ export async function ensureModelProviderLocalService(
 
   try {
     if (
-      managed.process?.exitCode === null &&
+      managed.process &&
+      !hasLocalServiceProcessExited(managed.process) &&
       (await probeHealth(healthUrl, healthHeaders, signal))
     ) {
       return { release };
     }
     if (!managed.starting) {
+      // Concurrent callers share one startup promise for the same service key.
       const startupAbort = new AbortController();
       managed.startupAbort = startupAbort;
       managed.starting = startAndWaitForLocalService({
-        provider: model.provider,
+        provider: target.providerId,
         service,
         healthUrl,
         healthHeaders,
@@ -110,7 +271,7 @@ export async function ensureModelProviderLocalService(
       });
     }
     await waitForAbort(managed.starting, signal);
-    if (!managed.process || managed.process.exitCode !== null) {
+    if (!managed.process || hasLocalServiceProcessExited(managed.process)) {
       release();
       return undefined;
     }
@@ -130,11 +291,22 @@ export async function ensureModelProviderLocalService(
   }
 }
 
-export function stopManagedProviderLocalServicesForTest(): void {
+/** Stop all managed local services owned by this process. */
+export function stopManagedProviderLocalServices(): void {
   for (const [key, managed] of services) {
-    stopManagedService(key, managed, "test");
+    stopManagedService(key, managed, "host-shutdown");
   }
   services.clear();
+  setManagedProviderLocalServicesActive(false);
+}
+
+/** Return bounded local-service state for focused lifecycle tests. */
+export function getManagedProviderLocalServiceDiagnosticsForTest(): LocalServiceDiagnostics[] {
+  return structuredClone(
+    [...services.values()]
+      .map((managed) => managed.diagnostics)
+      .filter((value): value is LocalServiceDiagnostics => value !== undefined),
+  );
 }
 
 function validateLocalServiceConfig(service: ModelProviderLocalServiceConfig, provider: string) {
@@ -144,11 +316,7 @@ function validateLocalServiceConfig(service: ModelProviderLocalServiceConfig, pr
 }
 
 function resolveHealthUrl(service: ModelProviderLocalServiceConfig, baseUrl: string): string {
-  const configured = service.healthUrl?.trim();
-  if (configured) {
-    return configured;
-  }
-  return `${baseUrl.replace(/\/+$/, "")}/models`;
+  return service.healthUrl?.trim() || `${baseUrl.replace(/\/+$/, "")}/models`;
 }
 
 function localServiceKey(
@@ -161,22 +329,20 @@ function localServiceKey(
     command: service.command,
     args: service.args ?? [],
     cwd: service.cwd ?? "",
-    env: sortedStringRecord(service.env),
+    envHash: hashStringRecord(service.env),
     healthUrl,
   });
 }
 
-function sortedStringRecord(record: Record<string, string> | undefined): Record<string, string> {
-  if (!record) {
-    return {};
-  }
-  return Object.fromEntries(
-    Object.entries(record).toSorted(([left], [right]) => left.localeCompare(right)),
+function hashStringRecord(record: Record<string, string> | undefined): string {
+  const sorted = Object.entries(record ?? {}).toSorted(([left], [right]) =>
+    left.localeCompare(right),
   );
+  return createHash("sha256").update(JSON.stringify(sorted)).digest("hex");
 }
 
 function buildHealthProbeHeaders(
-  model: Model<Api>,
+  providerHeaders: HeadersInit | undefined,
   requestHeaders: HeadersInit | undefined,
 ): Headers | undefined {
   const headers = new Headers();
@@ -190,7 +356,7 @@ function buildHealthProbeHeaders(
       }
     }
   };
-  appendHeaders((model as { headers?: HeadersInit }).headers);
+  appendHeaders(providerHeaders);
   appendHeaders(requestHeaders);
   return [...headers].length > 0 ? headers : undefined;
 }
@@ -201,13 +367,20 @@ async function probeHealth(
   signal?: AbortSignal | null,
 ): Promise<boolean> {
   throwIfAborted(signal);
+  // Local-service orchestration retains sentinel headers across retries. Only
+  // the actual health request may materialize credentials.
+  const egressHeaders = unwrapHeadersInitSentinelsForProviderEgress(
+    headers,
+    "to probe local model provider health",
+  );
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DEFAULT_PROBE_TIMEOUT_MS);
   timeout.unref?.();
   const onAbort = () => controller.abort(toAbortError(signal));
   signal?.addEventListener("abort", onAbort, { once: true });
+  let response: Response | undefined;
   try {
-    const response = await fetch(url, { headers, signal: controller.signal });
+    response = await fetch(url, { headers: egressHeaders, signal: controller.signal });
     return response.ok;
   } catch {
     if (signal?.aborted) {
@@ -217,6 +390,7 @@ async function probeHealth(
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener("abort", onAbort);
+    await response?.body?.cancel?.().catch(() => undefined);
   }
 }
 
@@ -232,52 +406,169 @@ async function startAndWaitForLocalService(params: {
   if (await probeHealth(healthUrl, healthHeaders, signal)) {
     return;
   }
-  if (managed.process?.exitCode === null) {
+  if (managed.process && !hasLocalServiceProcessExited(managed.process)) {
     log.info(`restarting unhealthy ${provider} local service`);
     await stopManagedProcessForRestart(managed, signal);
   }
 
+  const startedAt = Date.now();
+  const diagnostics: LocalServiceDiagnostics = {
+    providerId: provider,
+    healthUrl,
+    startedAt,
+    stdoutTail: "",
+    stderrTail: "",
+  };
+  managed.diagnostics = diagnostics;
+  // The last lease can disappear while the health probe or restart settles.
+  // Recheck at the spawn boundary so cleanup cannot orphan a newly created child.
+  throwIfAborted(signal);
   log.info(`starting ${provider} local service: ${service.command}`);
   managed.process = spawn(service.command, service.args ?? [], {
     cwd: service.cwd,
-    env: service.env ? { ...process.env, ...service.env } : process.env,
-    stdio: "ignore",
+    env: service.env ? mergeProcessEnv([process.env, service.env]) : process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: shouldDetachChildForProcessTree(),
   });
   const child = managed.process;
+  diagnostics.pid = child.pid;
   managed.lastExit = undefined;
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  const captureStdout = (chunk: string) => {
+    diagnostics.stdoutTail = appendLocalServiceOutputTail(
+      diagnostics.stdoutTail,
+      chunk,
+      service.env,
+      process.env,
+      service.args,
+      healthHeaders,
+    );
+  };
+  const captureStderr = (chunk: string) => {
+    diagnostics.stderrTail = appendLocalServiceOutputTail(
+      diagnostics.stderrTail,
+      chunk,
+      service.env,
+      process.env,
+      service.args,
+      healthHeaders,
+    );
+  };
+  child.stdout?.on("data", captureStdout);
+  child.stderr?.on("data", captureStderr);
   child.unref();
-  child.once("exit", (code, signal) => {
+  child.once("exit", (code, signalLocal) => {
+    const exit = { code, signal: signalLocal };
+    diagnostics.lastExit = exit;
     log.info(
-      `${provider} local service exited: ${signal ? `signal=${signal}` : `code=${code ?? 0}`}`,
+      `${provider} local service exited: ${signalLocal ? `signal=${signalLocal}` : `code=${code ?? 0}`}`,
     );
     if (managed.process === child) {
-      managed.lastExit = { code, signal };
+      managed.lastExit = exit;
       managed.process = undefined;
     }
   });
   const spawnError = await waitForSpawnResult(child, signal);
   if (spawnError) {
-    throw new Error(`${provider} local service failed to start: ${spawnError.message}`);
+    throw new Error(
+      `${provider} local service failed to start: ${spawnError.message}${formatLocalServiceDiagnosticTail(diagnostics)}`,
+    );
   }
+  diagnostics.spawnedAt = Date.now();
 
-  const deadline = Date.now() + (service.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS);
+  const readyTimeoutMs = resolvePositiveTimerTimeoutMs(
+    service.readyTimeoutMs,
+    DEFAULT_READY_TIMEOUT_MS,
+  );
+  const deadline = Date.now() + readyTimeoutMs;
   for (;;) {
     if (await probeHealth(healthUrl, healthHeaders, signal)) {
-      log.info(`${provider} local service ready`);
+      diagnostics.readyAt = Date.now();
+      diagnostics.lastHealthyAt = diagnostics.readyAt;
+      // Pipes keep startup alive while readiness is pending, then stop
+      // diagnostics from retaining runtime output or pinning one-shot hosts.
+      diagnostics.stdoutTail = "";
+      diagnostics.stderrTail = "";
+      drainLocalServiceOutput(child);
+      log.info(
+        `${provider} local service ready: pid=${diagnostics.pid ?? "unknown"} spawnMs=${diagnostics.spawnedAt - startedAt} readyMs=${diagnostics.readyAt - startedAt}`,
+      );
       return;
     }
     if (managed.lastExit) {
       throw new Error(
         `${provider} local service exited before readiness with ${formatLocalServiceExit(
           managed.lastExit,
-        )}`,
+        )}${formatLocalServiceDiagnosticTail(diagnostics)}`,
       );
     }
     if (Date.now() >= deadline) {
       throw new Error(`${provider} local service did not become ready at ${healthUrl}`);
     }
-    await sleep(PROBE_INTERVAL_MS, signal);
+    await sleepWithAbort(PROBE_INTERVAL_MS, signal, { ref: false });
   }
+}
+
+function appendLocalServiceOutputTail(
+  current: string,
+  chunk: Buffer | string,
+  serviceEnv: Record<string, string> | undefined,
+  inheritedEnv: NodeJS.ProcessEnv,
+  serviceArgs: string[] | undefined,
+  healthHeaders: HeadersInit | undefined,
+): string {
+  let redacted = redactSensitiveText(`${current}${chunk.toString()}`, { mode: "tools" });
+  for (const value of Object.values(serviceEnv ?? {})) {
+    if (value) {
+      redacted = redacted.replaceAll(value, "[redacted]");
+    }
+  }
+  for (const [key, value] of Object.entries(inheritedEnv)) {
+    if (value && isSensitiveFieldKey(key)) {
+      redacted = redacted.replaceAll(value, "[redacted]");
+    }
+  }
+  for (const value of serviceArgs ?? []) {
+    if (value) {
+      redacted = redacted.replaceAll(value, "[redacted]");
+    }
+  }
+  for (const [, value] of new Headers(healthHeaders)) {
+    if (value) {
+      redacted = redacted.replaceAll(value, "[redacted]");
+    }
+  }
+  const bytes = Buffer.from(redacted);
+  if (bytes.byteLength <= LOCAL_SERVICE_OUTPUT_TAIL_MAX_BYTES) {
+    return redacted;
+  }
+  let start = bytes.byteLength - LOCAL_SERVICE_OUTPUT_TAIL_MAX_BYTES;
+  while (start < bytes.byteLength) {
+    const byte = bytes.at(start);
+    if (byte === undefined || (byte & 0xc0) !== 0x80) {
+      break;
+    }
+    start += 1;
+  }
+  return bytes.subarray(start).toString("utf8");
+}
+
+function unrefLocalServiceOutput(stream: ChildProcess["stdout"]): void {
+  (stream as { unref?: () => void } | null)?.unref?.();
+}
+
+function drainLocalServiceOutput(child: ChildProcess): void {
+  child.stdout?.removeAllListeners("data");
+  child.stderr?.removeAllListeners("data");
+  child.stdout?.resume();
+  child.stderr?.resume();
+  unrefLocalServiceOutput(child.stdout);
+  unrefLocalServiceOutput(child.stderr);
+}
+
+function formatLocalServiceDiagnosticTail(diagnostics: LocalServiceDiagnostics): string {
+  return diagnostics.stderrTail ? `; stderr: ${diagnostics.stderrTail}` : "";
 }
 
 function scheduleIdleStop(
@@ -285,19 +576,21 @@ function scheduleIdleStop(
   managed: ManagedLocalService,
   service: ModelProviderLocalServiceConfig,
 ) {
-  const idleStopMs = service.idleStopMs ?? 0;
+  const idleStopMs = clampPositiveTimerTimeoutMs(service.idleStopMs);
   if (managed.active > 0) {
     return;
   }
   if (!managed.process) {
     if (!managed.starting) {
       services.delete(key);
+      setManagedProviderLocalServicesActive(services.size > 0);
     }
     return;
   }
-  if (idleStopMs <= 0) {
+  if (idleStopMs === undefined) {
     return;
   }
+  // Services without idleStopMs remain running until process exit or test cleanup.
   managed.idleTimer = setTimeout(() => {
     if (managed.active === 0) {
       stopManagedService(key, managed, "idle");
@@ -321,9 +614,13 @@ function stopManagedService(key: string, managed: ManagedLocalService, reason: s
   managed.process = undefined;
   managed.lastExit = undefined;
   services.delete(key);
-  if (child && child.exitCode === null) {
+  setManagedProviderLocalServicesActive(services.size > 0);
+  if (child) {
+    drainLocalServiceOutput(child);
+  }
+  if (child && !hasLocalServiceProcessExited(child)) {
     log.info(`stopping local model service: reason=${reason}`);
-    child.kill("SIGTERM");
+    signalChildProcessTree(child, "SIGTERM");
   }
 }
 
@@ -334,13 +631,14 @@ async function stopManagedProcessForRestart(
   const child = managed.process;
   managed.process = undefined;
   managed.lastExit = undefined;
-  if (!child || child.exitCode !== null) {
+  if (!child || hasLocalServiceProcessExited(child)) {
     return;
   }
-  child.kill("SIGTERM");
+  drainLocalServiceOutput(child);
+  signalChildProcessTree(child, "SIGTERM");
   await waitForChildExit(child, signal, DEFAULT_PROBE_TIMEOUT_MS);
-  if (child.exitCode === null) {
-    child.kill("SIGKILL");
+  if (!hasLocalServiceProcessExited(child)) {
+    forceKillChildProcessTree(child);
     await waitForChildExit(child, signal, DEFAULT_PROBE_TIMEOUT_MS);
   }
 }
@@ -402,29 +700,9 @@ function waitForAbort<T>(promise: Promise<T>, signal?: AbortSignal | null): Prom
       },
       (error: unknown) => {
         cleanup();
-        reject(error);
+        reject(toErrorObject(error, "Non-Error rejection"));
       },
     );
-  });
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  throwIfAborted(signal);
-  return new Promise((resolve, reject) => {
-    let timeout: NodeJS.Timeout;
-    const cleanup = () => signal?.removeEventListener("abort", onAbort);
-    const onDone = () => {
-      cleanup();
-      resolve();
-    };
-    const onAbort = () => {
-      clearTimeout(timeout);
-      cleanup();
-      reject(toAbortError(signal));
-    };
-    timeout = setTimeout(onDone, ms);
-    timeout.unref?.();
-    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -464,12 +742,11 @@ function waitForChildExit(
   signal: AbortSignal,
   timeoutMs: number,
 ): Promise<void> {
-  if (child.exitCode !== null) {
+  if (hasLocalServiceProcessExited(child)) {
     return Promise.resolve();
   }
   throwIfAborted(signal);
   return new Promise((resolve, reject) => {
-    let timeout: NodeJS.Timeout;
     const cleanup = () => {
       clearTimeout(timeout);
       child.off("exit", onExit);
@@ -484,9 +761,16 @@ function waitForChildExit(
       cleanup();
       reject(toAbortError(signal));
     };
-    timeout = setTimeout(finish, timeoutMs);
+    const timeout: NodeJS.Timeout = setTimeout(finish, timeoutMs);
     timeout.unref?.();
     child.once("exit", onExit);
     signal.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+/** Return whether a child process has already reported an exit code or signal. */
+export function hasLocalServiceProcessExited(
+  child: Pick<ChildProcess, "exitCode" | "signalCode">,
+): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
 }

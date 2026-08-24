@@ -16,13 +16,6 @@ metadata:
               "bins": ["gh"],
               "label": "Install GitHub CLI (brew)",
             },
-            {
-              "id": "apt",
-              "kind": "apt",
-              "package": "gh",
-              "bins": ["gh"],
-              "label": "Install GitHub CLI (apt)",
-            },
           ],
       },
   }
@@ -50,6 +43,13 @@ gh pr checks 55 --repo owner/repo
 gh pr diff 55 --repo owner/repo
 gh pr create --repo owner/repo --title "feat: title" --body-file /tmp/pr.md
 gh pr merge 55 --repo owner/repo --squash
+```
+
+When creating or refreshing a PR body, append this final footer only when the Runtime line supplies `sessionUrl=<exact-url>`. Replace `<sessionUrl>` with that URL verbatim; do not construct or modify it. Omit the footer when `sessionUrl` is absent. When refreshing an existing PR body, preserve or update exactly one footer and keep it final:
+
+```text
+---
+[View the OpenClaw work session](<sessionUrl>)
 ```
 
 URLs work directly: `gh pr view https://github.com/owner/repo/pull/55`.

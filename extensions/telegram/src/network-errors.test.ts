@@ -1,13 +1,16 @@
+// Telegram tests cover network errors plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
-  getTelegramNetworkErrorOrigin,
   isRecoverableTelegramNetworkError,
+  isRetryableTelegramApiError,
+  isTelegramAuthenticationError,
   isTelegramRateLimitError,
   isSafeToRetrySendError,
   isTelegramClientRejection,
   isTelegramPollingNetworkError,
   isTelegramServerError,
   tagTelegramNetworkError,
+  TelegramRequestNotStartedError,
 } from "./network-errors.js";
 
 const errorWithCode = (message: string, code: string) =>
@@ -58,6 +61,20 @@ describe("Telegram error_code predicate contracts", () => {
   );
 });
 
+describe("isTelegramAuthenticationError", () => {
+  it.each([
+    ["Unauthorized", 401, true],
+    ["Forbidden", 403, false],
+    ["Not Found", 404, true],
+  ])("returns %s for error_code %s", (message, errorCode, expected) => {
+    expect(isTelegramAuthenticationError(errorWithTelegramCode(message, errorCode))).toBe(expected);
+  });
+
+  it("does not infer authentication failure from an unstructured message", () => {
+    expect(isTelegramAuthenticationError(new Error("Unauthorized"))).toBe(false);
+  });
+});
+
 describe("isRecoverableTelegramNetworkError", () => {
   it("tracks Telegram polling origin separately from generic network matching", () => {
     const slackDnsError = Object.assign(
@@ -74,15 +91,12 @@ describe("isRecoverableTelegramNetworkError", () => {
       method: "getUpdates",
       url: "https://api.telegram.org/bot123456:ABC/getUpdates",
     });
-    expect(getTelegramNetworkErrorOrigin(slackDnsError)).toEqual({
-      method: "getupdates",
-      url: "https://api.telegram.org/bot123456:ABC/getUpdates",
-    });
     expect(isTelegramPollingNetworkError(slackDnsError)).toBe(true);
   });
 
   it.each([
     ["ETIMEDOUT", "timeout"],
+    ["ENETDOWN", "network down"],
     ["ECONNABORTED", "aborted"],
     ["ERR_NETWORK", "network"],
   ])("detects recoverable error code %s", (code, message) => {
@@ -137,6 +151,18 @@ describe("isRecoverableTelegramNetworkError", () => {
     expect(isRecoverableTelegramNetworkError(undiciSnippetErr, { context: "polling" })).toBe(true);
   });
 
+  it("treats delete/react/edit/action (idempotent) contexts like polling, not send", () => {
+    const undiciSnippetErr = new Error("Undici: socket failure");
+    // delete, react, edit, and action are idempotent or non-message operations;
+    // a transient snippet-only error must be retried (allowMessageMatch defaults true),
+    // matching polling/webhook. send stays strict as the regression guard.
+    expect(isRecoverableTelegramNetworkError(undiciSnippetErr, { context: "delete" })).toBe(true);
+    expect(isRecoverableTelegramNetworkError(undiciSnippetErr, { context: "react" })).toBe(true);
+    expect(isRecoverableTelegramNetworkError(undiciSnippetErr, { context: "edit" })).toBe(true);
+    expect(isRecoverableTelegramNetworkError(undiciSnippetErr, { context: "action" })).toBe(true);
+    expect(isRecoverableTelegramNetworkError(undiciSnippetErr, { context: "send" })).toBe(false);
+  });
+
   it("treats grammY failed-after envelope errors as recoverable in send context", () => {
     expect(
       isRecoverableTelegramNetworkError(
@@ -144,6 +170,17 @@ describe("isRecoverableTelegramNetworkError", () => {
         { context: "send" },
       ),
     ).toBe(true);
+  });
+
+  it("keeps request-not-started markers recoverable across Telegram contexts", () => {
+    const marker = new TelegramRequestNotStartedError();
+    const wrapped = Object.assign(new Error("Network request for 'getUpdates' failed!"), {
+      name: "HttpError",
+      error: marker,
+    });
+
+    expect(isRecoverableTelegramNetworkError(marker, { context: "send" })).toBe(true);
+    expect(isRecoverableTelegramNetworkError(wrapped, { context: "polling" })).toBe(true);
   });
 
   it("returns false for unrelated errors", () => {
@@ -159,7 +196,6 @@ describe("isRecoverableTelegramNetworkError", () => {
     const inner = new Error("inner");
     tagTelegramNetworkError(inner, { method: " ", url: " " });
     const outer = Object.assign(new Error("outer"), { cause: inner });
-    expect(getTelegramNetworkErrorOrigin(outer)).toEqual({ method: null, url: null });
     expect(isTelegramPollingNetworkError(outer)).toBe(false);
   });
 
@@ -218,12 +254,13 @@ describe("isSafeToRetrySendError", () => {
     ["ECONNREFUSED", "connect ECONNREFUSED", true],
     ["ENOTFOUND", "getaddrinfo ENOTFOUND", true],
     ["EAI_AGAIN", "getaddrinfo EAI_AGAIN", true],
+    ["ENETDOWN", "connect ENETDOWN", true],
     ["ENETUNREACH", "connect ENETUNREACH", true],
     ["EHOSTUNREACH", "connect EHOSTUNREACH", true],
     ["ECONNRESET", "read ECONNRESET", false],
     ["ETIMEDOUT", "connect ETIMEDOUT", false],
     ["EPIPE", "write EPIPE", false],
-    ["UND_ERR_CONNECT_TIMEOUT", "connect timeout", false],
+    ["UND_ERR_CONNECT_TIMEOUT", "connect timeout", true],
   ])("returns %s => %s", (code, message, expected) => {
     expect(isSafeToRetrySendError(errorWithCode(message, code))).toBe(expected);
   });
@@ -254,6 +291,17 @@ describe("isSafeToRetrySendError", () => {
     expect(isSafeToRetrySendError(wrapped)).toBe(false);
   });
 
+  it("accepts only direct and exact grammY-wrapped request-not-started markers", () => {
+    const marker = new TelegramRequestNotStartedError();
+
+    expect(isSafeToRetrySendError(marker)).toBe(true);
+    expect(
+      isSafeToRetrySendError(
+        new MockHttpError("Network request for 'sendMessage' failed!", marker),
+      ),
+    ).toBe(true);
+  });
+
   it.each([
     ["status", Object.assign(new Error("Misdirected Request"), { status: 421 })],
     ["statusCode", Object.assign(new Error("Misdirected Request"), { statusCode: "421" })],
@@ -272,8 +320,8 @@ describe("isSafeToRetrySendError", () => {
         Object.assign(new Error("Misdirected Request"), { status: 421 }),
       ),
     ],
-  ])("treats Telegram 421 Misdirected Request as safe to retry via %s", (_name, err) => {
-    expect(isSafeToRetrySendError(err)).toBe(true);
+  ])("does not infer safe retry from broad Telegram 421 shape %s", (_name, err) => {
+    expect(isSafeToRetrySendError(err)).toBe(false);
   });
 
   it("does not parse malformed status strings as Telegram 421", () => {
@@ -306,6 +354,19 @@ describe("isTelegramRateLimitError", () => {
       response: { parameters: { retry_after: 1 } },
     };
     expect(isTelegramRateLimitError(wrapped)).toBe(true);
+  });
+});
+
+describe("isRetryableTelegramApiError", () => {
+  it.each([
+    ["Too Many Requests", 429, true],
+    ["Internal Server Error", 500, true],
+    ["Bad Gateway", 502, true],
+    ["Conflict", 409, false],
+    ["Unauthorized", 401, false],
+    ["Not Found", 404, false],
+  ])("returns %s for error_code %s", (message, errorCode, expected) => {
+    expect(isRetryableTelegramApiError(errorWithTelegramCode(message, errorCode))).toBe(expected);
   });
 });
 

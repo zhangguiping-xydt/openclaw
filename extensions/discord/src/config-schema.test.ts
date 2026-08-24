@@ -1,3 +1,4 @@
+// Discord tests cover config schema plugin behavior.
 import { describe, expect, it } from "vitest";
 import { DiscordConfigSchema } from "../config-api.js";
 
@@ -38,19 +39,77 @@ describe("discord config schema", () => {
     expect(issues[0]?.path.join(".")).toBe("allowFrom");
   });
 
-  it('rejects legacy dm.policy="open" with empty dm.allowFrom', () => {
-    const issues = expectInvalidDiscordConfig({
-      dm: { policy: "open", allowFrom: [] },
-    });
-
-    expect(issues[0]?.path.join(".")).toBe("dm.allowFrom");
+  it('rejects dmPolicy="allowlist" without allowFrom', () => {
+    const issues = expectInvalidDiscordConfig({ dmPolicy: "allowlist" });
+    expect(issues.some((issue) => issue.path.includes("allowFrom"))).toBe(true);
   });
 
-  it('accepts legacy dm.policy="open" with top-level allowFrom alias', () => {
+  it("accepts account allowlist policy inherited from the channel", () => {
     expectValidDiscordConfig({
-      dm: { policy: "open", allowFrom: ["123"] },
-      allowFrom: ["*"],
+      allowFrom: ["123456789"],
+      accounts: { work: { dmPolicy: "allowlist" } },
     });
+  });
+
+  it("accepts progress commentary in streaming config", () => {
+    expectValidDiscordConfig({
+      streaming: {
+        mode: "progress",
+        progress: { commentary: true },
+      },
+    });
+  });
+
+  it("rejects retired subagent progress config", () => {
+    expectInvalidDiscordConfig({ subagentProgress: true });
+    expectInvalidDiscordConfig({ subagentProgress: { enabled: true } });
+  });
+
+  it("validates mention aliases at channel and account scope", () => {
+    expectValidDiscordConfig({
+      mentionAliases: { opslead: "123456789012345678" },
+      accounts: {
+        work: { mentionAliases: { vladislava: "234567890123456789" } },
+      },
+    });
+    expectInvalidDiscordConfig({ mentionAliases: { opslead: "not-a-user-id" } });
+  });
+
+  it("normalizes shipped nested DM access keys at root and account scope", () => {
+    const cfg = expectValidDiscordConfig({
+      dmPolicy: "pairing",
+      allowFrom: ["canonical-root"],
+      dm: { enabled: false, policy: "open", allowFrom: ["legacy-root"] },
+      accounts: {
+        work: {
+          dmPolicy: "allowlist",
+          allowFrom: ["canonical-account"],
+          dm: { groupEnabled: true, policy: "disabled", allowFrom: ["legacy-account"] },
+        },
+        personal: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+        },
+      },
+    });
+
+    expect(cfg).toMatchObject({
+      dmPolicy: "pairing",
+      allowFrom: ["canonical-root"],
+      dm: { enabled: false },
+      accounts: {
+        work: {
+          dmPolicy: "allowlist",
+          allowFrom: ["canonical-account"],
+          dm: { groupEnabled: true },
+        },
+        personal: {
+          dmPolicy: "open",
+          allowFrom: ["*"],
+          dm: { enabled: true },
+        },
+      },
+    });
+    expectInvalidDiscordConfig({ dm: { enabled: false, unexpected: true } });
   });
 
   it("accepts textChunkLimit without reviving legacy message limits", () => {
@@ -90,11 +149,11 @@ describe("discord config schema", () => {
     expect(cfg.accounts?.noisy?.suppressEmbeds).toBe(false);
   });
 
-  it("rejects Telegram-only native tool-progress draft config", () => {
+  it("rejects unknown preview config keys", () => {
     const issues = expectInvalidDiscordConfig({
       streaming: {
         preview: {
-          nativeToolProgress: true,
+          unknownPreviewFlag: true,
         },
       },
     });
@@ -129,9 +188,9 @@ describe("discord config schema", () => {
   it("loads guild map and dm group settings", () => {
     const cfg = expectValidDiscordConfig({
       enabled: true,
+      allowFrom: ["steipete"],
       dm: {
         enabled: true,
-        allowFrom: ["steipete"],
         groupEnabled: true,
         groupChannels: ["openclaw-dm"],
       },
@@ -193,13 +252,19 @@ describe("discord config schema", () => {
     const cfg = expectValidDiscordConfig({
       voice: {
         mode: "agent-proxy",
-        model: "openai-codex/gpt-5.5",
+        model: "openai/gpt-5.5",
+        followUsersEnabled: true,
+        followUsers: ["58398277829140480"],
         realtime: {
           provider: "openai",
           model: "gpt-realtime-2",
-          voice: "cedar",
+          speakerVoice: "cedar",
+          speakerVoiceId: "voice-123",
           toolPolicy: "safe-read-only",
           consultPolicy: "always",
+          requireWakeName: true,
+          wakeNames: ["Molty"],
+          bootstrapContextFiles: ["IDENTITY.md", "USER.md", "SOUL.md"],
           bargeIn: true,
           minBargeInAudioEndMs: 500,
           providers: {
@@ -213,12 +278,22 @@ describe("discord config schema", () => {
     });
 
     expect(cfg.voice?.mode).toBe("agent-proxy");
-    expect(cfg.voice?.model).toBe("openai-codex/gpt-5.5");
+    expect(cfg.voice?.model).toBe("openai/gpt-5.5");
+    expect(cfg.voice?.followUsersEnabled).toBe(true);
+    expect(cfg.voice?.followUsers).toEqual(["58398277829140480"]);
     expect(cfg.voice?.realtime?.provider).toBe("openai");
     expect(cfg.voice?.realtime?.model).toBe("gpt-realtime-2");
-    expect(cfg.voice?.realtime?.voice).toBe("cedar");
+    expect(cfg.voice?.realtime?.speakerVoice).toBe("cedar");
+    expect(cfg.voice?.realtime?.speakerVoiceId).toBe("voice-123");
     expect(cfg.voice?.realtime?.toolPolicy).toBe("safe-read-only");
     expect(cfg.voice?.realtime?.consultPolicy).toBe("always");
+    expect(cfg.voice?.realtime?.requireWakeName).toBe(true);
+    expect(cfg.voice?.realtime?.wakeNames).toEqual(["Molty"]);
+    expect(cfg.voice?.realtime?.bootstrapContextFiles).toEqual([
+      "IDENTITY.md",
+      "USER.md",
+      "SOUL.md",
+    ]);
     expect(cfg.voice?.realtime?.bargeIn).toBe(true);
     expect(cfg.voice?.realtime?.minBargeInAudioEndMs).toBe(500);
   });
@@ -229,10 +304,15 @@ describe("discord config schema", () => {
       { mode: "talk-buffer" },
       { mode: "bidi", realtime: { toolPolicy: "dangerous" } },
       { mode: "agent-proxy", realtime: { consultPolicy: "substantive" } },
+      { mode: "bidi", realtime: { bootstrapContextFiles: ["AGENTS.md"] } },
+      { mode: "agent-proxy", realtime: { wakeNames: [] } },
+      { mode: "agent-proxy", realtime: { wakeNames: [""] } },
+      { mode: "agent-proxy", realtime: { wakeNames: ["Claw Bot Helper"] } },
       { mode: "agent-proxy", realtime: { debounceMs: 10_001 } },
       { mode: "agent-proxy", realtime: { minBargeInAudioEndMs: -1 } },
       { mode: "agent-proxy", realtime: { minBargeInAudioEndMs: 10_001 } },
       { agentSession: { mode: "target" } },
+      { followUsers: [""] },
     ]) {
       expectInvalidDiscordConfig({ voice });
     }
@@ -262,6 +342,16 @@ describe("discord config schema", () => {
     expect(cfg.voice?.allowedChannels).toEqual([{ guildId: "123", channelId: "456" }]);
   });
 
+  it("accepts occupancy-managed Discord voice auto-join channels", () => {
+    const cfg = expectValidDiscordConfig({
+      voice: {
+        autoJoin: [{ guildId: "123", channelId: "456", whenOccupied: true }],
+      },
+    });
+
+    expect(cfg.voice?.autoJoin).toEqual([{ guildId: "123", channelId: "456", whenOccupied: true }]);
+  });
+
   it("rejects invalid Discord voice allowed channels", () => {
     for (const voice of [
       { allowedChannels: [{ guildId: "", channelId: "456" }] },
@@ -287,7 +377,7 @@ describe("discord config schema", () => {
   it("coerces safe-integer numeric allowlist entries to strings", () => {
     const cfg = expectValidDiscordConfig({
       allowFrom: [123],
-      dm: { allowFrom: [456], groupChannels: [789] },
+      dm: { groupChannels: [789] },
       guilds: {
         "123": {
           users: [111],
@@ -301,13 +391,21 @@ describe("discord config schema", () => {
     });
 
     expect(cfg.allowFrom).toEqual(["123"]);
-    expect(cfg.dm?.allowFrom).toEqual(["456"]);
     expect(cfg.dm?.groupChannels).toEqual(["789"]);
     expect(cfg.guilds?.["123"]?.users).toEqual(["111"]);
     expect(cfg.guilds?.["123"]?.roles).toEqual(["222"]);
     expect(cfg.guilds?.["123"]?.channels?.general?.users).toEqual(["333"]);
     expect(cfg.guilds?.["123"]?.channels?.general?.roles).toEqual(["444"]);
     expect(cfg.execApprovals?.approvers).toEqual(["555"]);
+  });
+
+  it.each([true, false, "auto"] as const)("accepts execApprovals.enabled=%s", (enabled) => {
+    const cfg = expectValidDiscordConfig({ execApprovals: { enabled } });
+    expect(cfg.execApprovals?.enabled).toBe(enabled);
+  });
+
+  it("rejects execApprovals.enabled with other string values", () => {
+    expectInvalidDiscordConfig({ execApprovals: { enabled: "on" } });
   });
 
   it("rejects numeric IDs that are not valid non-negative safe integers", () => {
@@ -338,12 +436,89 @@ describe("discord config schema", () => {
           enabled: true,
           intervalMs: 30000,
           minUpdateIntervalMs: 15000,
-          exhaustedText: "token exhausted",
         },
       },
     },
   ] as const)("accepts $name", ({ config }) => {
     expect(DiscordConfigSchema.safeParse(config).success).toBe(true);
+  });
+
+  it("accepts guild online-presence event routing", () => {
+    const cfg = expectValidDiscordConfig({
+      intents: { presence: true },
+      guilds: {
+        "123456789012345678": {
+          presenceEvents: {
+            channelId: "234567890123456789",
+            users: ["345678901234567890"],
+          },
+        },
+      },
+    });
+
+    expect(cfg.guilds?.["123456789012345678"]?.presenceEvents?.channelId).toBe(
+      "234567890123456789",
+    );
+  });
+
+  it("accepts mention-only gateway intent mode", () => {
+    const cfg = expectValidDiscordConfig({
+      intents: { messageContent: false },
+    });
+
+    expect(cfg.intents?.messageContent).toBe(false);
+  });
+
+  it("accepts online-presence throttling knobs", () => {
+    const cfg = expectValidDiscordConfig({
+      intents: { presence: true },
+      guilds: {
+        "123456789012345678": {
+          presenceEvents: {
+            channelId: "234567890123456789",
+            reconnectSuppressSeconds: 0,
+            burstLimit: 4,
+            burstWindowSeconds: 30,
+          },
+        },
+      },
+    });
+
+    expect(cfg.guilds?.["123456789012345678"]?.presenceEvents?.burstLimit).toBe(4);
+  });
+
+  it("rejects invalid online-presence throttling values", () => {
+    const issues = expectInvalidDiscordConfig({
+      guilds: {
+        "123456789012345678": {
+          presenceEvents: {
+            channelId: "234567890123456789",
+            reconnectSuppressSeconds: -1,
+            burstLimit: 0,
+            burstWindowSeconds: 0,
+          },
+        },
+      },
+    });
+
+    for (const field of ["reconnectSuppressSeconds", "burstLimit", "burstWindowSeconds"]) {
+      expect(issues.some((issue) => issue.path.join(".").endsWith(field))).toBe(true);
+    }
+  });
+
+  it("rejects mutable names in online-presence event routing", () => {
+    const issues = expectInvalidDiscordConfig({
+      guilds: {
+        maintainers: {
+          presenceEvents: {
+            channelId: "maintainers",
+            users: ["alice"],
+          },
+        },
+      },
+    });
+
+    expect(issues.some((issue) => issue.path.join(".").includes("presenceEvents"))).toBe(true);
   });
 
   it.each([
@@ -377,6 +552,35 @@ describe("discord config schema", () => {
     });
 
     expect(res.success).toBe(true);
+  });
+
+  it("accepts agentComponents.ttlMs at channel and account scope", () => {
+    const res = DiscordConfigSchema.safeParse({
+      agentComponents: {
+        ttlMs: 86_400_000,
+      },
+      accounts: {
+        work: {
+          agentComponents: {
+            ttlMs: 120_000,
+          },
+        },
+      },
+    });
+
+    expect(res.success).toBe(true);
+  });
+
+  it("rejects invalid agentComponents.ttlMs values", () => {
+    for (const ttlMs of [0, -1, 1.5, 86_400_001]) {
+      const res = DiscordConfigSchema.safeParse({
+        agentComponents: {
+          ttlMs,
+        },
+      });
+
+      expect(res.success).toBe(false);
+    }
   });
 
   it("accepts agentComponents.enabled at account scope", () => {

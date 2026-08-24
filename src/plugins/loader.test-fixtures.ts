@@ -1,10 +1,14 @@
+/** Shared plugin-loader fixture builders for temp manifests, bundle roots, and isolated env state. */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resetDiagnosticEventsForTest } from "../infra/diagnostic-events.js";
 import { withEnv } from "../test-utils/env.js";
-import { clearPluginLoaderCache, loadOpenClawPlugins } from "./loader.js";
+import { pluginLoaderCacheState } from "./loader-cache.js";
+import { loadOpenClawPlugins } from "./loader.js";
 import { resetPluginRuntimeStateForTest } from "./runtime.js";
+
+export { loadOpenClawPlugins };
 
 export type TempPlugin = { dir: string; file: string; id: string };
 export type PluginLoadConfig = NonNullable<Parameters<typeof loadOpenClawPlugins>[0]>["config"];
@@ -70,7 +74,7 @@ export function inlineChannelPluginEntryFactorySource(): string {
 `;
 }
 
-export function makeTempDir() {
+export function makePluginLoaderTempDir() {
   const dir = path.join(fixtureRoot, `case-${tempDirIndex++}`);
   mkdirSafe(dir);
   return dir;
@@ -81,8 +85,9 @@ export function writePlugin(params: {
   body: string;
   dir?: string;
   filename?: string;
+  configSchema?: Record<string, unknown>;
 }): TempPlugin {
-  const dir = params.dir ?? makeTempDir();
+  const dir = params.dir ?? makePluginLoaderTempDir();
   const filename = params.filename ?? `${params.id}.cjs`;
   mkdirSafe(dir);
   const file = path.join(dir, filename);
@@ -92,7 +97,7 @@ export function writePlugin(params: {
     JSON.stringify(
       {
         id: params.id,
-        configSchema: EMPTY_PLUGIN_SCHEMA,
+        configSchema: params.configSchema ?? EMPTY_PLUGIN_SCHEMA,
       },
       null,
       2,
@@ -114,8 +119,8 @@ export function loadBundleFixture(params: {
   onlyPluginIds?: string[];
 }) {
   useNoBundledPlugins();
-  const workspaceDir = makeTempDir();
-  const stateDir = makeTempDir();
+  const workspaceDir = makePluginLoaderTempDir();
+  const stateDir = makePluginLoaderTempDir();
   const bundleRoot = path.join(workspaceDir, ".openclaw", "extensions", params.pluginId);
   params.build(bundleRoot);
   return withEnv({ OPENCLAW_STATE_DIR: stateDir, ...params.env }, () =>
@@ -150,6 +155,12 @@ export function resetPluginLoaderTestStateForTest() {
   } else {
     process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS = prevDisableBundledPlugins;
   }
+}
+
+/** Clears loader state for test isolation without exposing a production-only reset export. */
+export function clearPluginLoaderCache(): void {
+  pluginLoaderCacheState.clear();
+  resetPluginRuntimeStateForTest();
 }
 
 export function cleanupPluginLoaderFixturesForTest() {

@@ -1,7 +1,13 @@
+// Google tests cover provider models plugin behavior.
 import type { ProviderRuntimeModel } from "openclaw/plugin-sdk/plugin-entry";
 import { describe, expect, it } from "vitest";
 import { createProviderDynamicModelContext as createContext } from "../test-support/provider-model-test-helpers.js";
-import { isModernGoogleModel, resolveGoogleGeminiForwardCompatModel } from "./provider-models.js";
+import {
+  isGoogleNativeVideoModelId,
+  isGoogleTextGenerationModelId,
+  isModernGoogleModel,
+  resolveGoogleGeminiForwardCompatModel,
+} from "./provider-models.js";
 
 function createTemplateModel(
   provider: string,
@@ -64,7 +70,7 @@ describe("resolveGoogleGeminiForwardCompatModel", () => {
         provider: "google-gemini-cli",
         modelId: "gemini-2.5-flash-lite",
         models: [
-          createTemplateModel("google-gemini-cli", "gemini-3.1-flash-lite-preview", {
+          createTemplateModel("google-gemini-cli", "gemini-3.1-flash-lite", {
             contextWindow: 1_048_576,
             api: "google-gemini-cli",
             baseUrl: "https://cloudcode-pa.googleapis.com",
@@ -286,7 +292,7 @@ describe("resolveGoogleGeminiForwardCompatModel", () => {
     const models = [
       createTemplateModel("google", "gemini-3-pro-preview", { reasoning: true }),
       createTemplateModel("google", "gemini-3-flash-preview", { reasoning: true }),
-      createTemplateModel("google", "gemini-3.1-flash-lite-preview", { reasoning: true }),
+      createTemplateModel("google", "gemini-3.1-flash-lite", { reasoning: true }),
     ];
 
     expectModelFields(
@@ -409,13 +415,13 @@ describe("resolveGoogleGeminiForwardCompatModel", () => {
         providerId: "google-antigravity",
         ctx: createContext({
           provider: "google-antigravity",
-          modelId: "gemini-3.1-flash-lite-preview",
+          modelId: "gemini-3.1-flash-lite",
           models,
         }),
       }),
       {
         provider: "google-antigravity",
-        id: "gemini-3.1-flash-lite-preview",
+        id: "gemini-3.1-flash-lite",
         api: "openai-completions",
         contextWindow: 1_048_576,
       },
@@ -440,12 +446,12 @@ describe("resolveGoogleGeminiForwardCompatModel", () => {
       providerId: "google-vertex",
       ctx: createContext({
         provider: "google-vertex",
-        modelId: "gemini-3.1-flash-lite-preview",
+        modelId: "gemini-3.1-flash-lite",
         models: [
           createTemplateModel("google-gemini-cli", "gemini-3-flash-preview", {
             contextWindow: 128_000,
           }),
-          createTemplateModel("google-gemini-cli", "gemini-3.1-flash-lite-preview", {
+          createTemplateModel("google-gemini-cli", "gemini-3.1-flash-lite", {
             contextWindow: 1_048_576,
           }),
         ],
@@ -454,7 +460,7 @@ describe("resolveGoogleGeminiForwardCompatModel", () => {
 
     expectModelFields(model, {
       provider: "google-vertex",
-      id: "gemini-3.1-flash-lite-preview",
+      id: "gemini-3.1-flash-lite",
       contextWindow: 1_048_576,
       reasoning: false,
     });
@@ -494,6 +500,24 @@ describe("resolveGoogleGeminiForwardCompatModel", () => {
     });
   });
 
+  it("canonicalizes Gemma 4 26B shorthand before cloning templates", () => {
+    const model = resolveGoogleGeminiForwardCompatModel({
+      providerId: "google",
+      ctx: createContext({
+        provider: "google",
+        modelId: "gemma-4-26b",
+        models: [createTemplateModel("google", "gemini-3-flash-preview", { reasoning: false })],
+      }),
+    });
+
+    expectModelFields(model, {
+      provider: "google",
+      id: "gemma-4-26b-a4b-it",
+      api: "google-generative-ai",
+      reasoning: true,
+    });
+  });
+
   it("preserves template reasoning for non-Gemma 4 gemma models", () => {
     const model = resolveGoogleGeminiForwardCompatModel({
       providerId: "google",
@@ -509,5 +533,72 @@ describe("resolveGoogleGeminiForwardCompatModel", () => {
       id: "gemma-3-4b-it",
       reasoning: false,
     });
+  });
+
+  it.each([
+    ["gemini-3.7-flash", "gemini-3-flash-preview"],
+    ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+  ])("resolves future Gemini 3 text family %s from %s metadata", (modelId, templateId) => {
+    const model = resolveGoogleGeminiForwardCompatModel({
+      providerId: "google",
+      ctx: createContext({
+        provider: "google",
+        modelId,
+        models: [
+          createTemplateModel("google", templateId, {
+            reasoning: true,
+            contextWindow: 1_048_576,
+          }),
+        ],
+      }),
+    });
+
+    expectModelFields(model, {
+      provider: "google",
+      id: modelId,
+      reasoning: true,
+      contextWindow: 1_048_576,
+    });
+  });
+
+  it("keeps non-chat Gemini surfaces out of text discovery and forward compatibility", () => {
+    for (const modelId of [
+      "gemini-3.1-flash-image",
+      "gemini-3.1-flash-tts-preview",
+      "gemini-3.1-flash-live-preview",
+      "gemini-2.5-flash-preview-native-audio-dialog",
+    ]) {
+      expect(isGoogleTextGenerationModelId(modelId)).toBe(false);
+      expect(
+        resolveGoogleGeminiForwardCompatModel({
+          providerId: "google",
+          ctx: createContext({
+            provider: "google",
+            modelId,
+            models: [createTemplateModel("google", "gemini-3-flash-preview")],
+          }),
+        }),
+      ).toBeUndefined();
+    }
+  });
+
+  it("classifies only ordinary Gemini generation ids for native video", () => {
+    for (const modelId of [
+      "gemini-2.5-flash",
+      "google/gemini-3.1-pro-preview",
+      "models/gemini-flash-latest",
+    ]) {
+      expect(isGoogleNativeVideoModelId(modelId), modelId).toBe(true);
+    }
+    for (const modelId of [
+      "gemma-4-26b-a4b-it",
+      "tunedModels/gemini-2.5-flash",
+      "gemini-3.1-flash-image",
+      "gemini-2.5-computer-use-preview",
+      "gemini-2.5-flash-tts-preview",
+      "gemini-2.5-flash-live-preview",
+    ]) {
+      expect(isGoogleNativeVideoModelId(modelId), modelId).toBe(false);
+    }
   });
 });

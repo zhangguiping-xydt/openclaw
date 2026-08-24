@@ -1,3 +1,4 @@
+// Tests subagent agent-list command output and filtering.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const THREAD_CHANNEL = "thread-chat";
@@ -70,10 +71,15 @@ function subagentRun(params: {
     task: params.task,
     cleanup: "keep",
     createdAt: Date.now() - startedAgoMs,
-    startedAt: Date.now() - startedAgoMs,
-    ...(params.endedAgoMs === undefined
-      ? {}
-      : { endedAt: Date.now() - params.endedAgoMs, outcome: { status: "ok" } }),
+    execution:
+      params.endedAgoMs === undefined
+        ? { status: "running" as const, startedAt: Date.now() - startedAgoMs }
+        : {
+            status: "terminal" as const,
+            startedAt: Date.now() - startedAgoMs,
+            endedAt: Date.now() - params.endedAgoMs,
+            outcome: { status: "ok" as const },
+          },
   };
 }
 

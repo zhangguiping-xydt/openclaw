@@ -1,18 +1,21 @@
+// Codex plugin module implements command account behavior.
 import {
   ensureAuthProfileStore,
   findNormalizedProviderValue,
   resolveAuthProfileEligibility,
   resolveAuthProfileOrder,
-  resolveDefaultAgentDir,
   resolveProfileUnusableUntilForDisplay,
   type AuthProfileCredential,
   type AuthProfileFailureReason,
   type AuthProfileStore,
 } from "openclaw/plugin-sdk/agent-runtime";
 import type { PluginCommandContext } from "openclaw/plugin-sdk/plugin-entry";
+import {
+  normalizeOptionalString,
+  normalizeUniqueStringEntries,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { CODEX_CONTROL_METHODS, type CodexControlMethod } from "./app-server/capabilities.js";
-import { isJsonObject, type JsonObject, type JsonValue } from "./app-server/protocol.js";
-import { rememberCodexRateLimits } from "./app-server/rate-limit-cache.js";
+import { isJsonObject, type JsonValue } from "./app-server/protocol.js";
 import {
   summarizeCodexAccountUsage,
   type CodexAccountUsageSummary,
@@ -20,7 +23,7 @@ import {
 import type { CodexControlRequestOptions, SafeValue } from "./command-rpc.js";
 
 const OPENAI_PROVIDER_ID = "openai";
-const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+const OPENAI_CODEX_PROVIDER_ID = OPENAI_PROVIDER_ID;
 
 type AuthProfileOrderConfig = Parameters<typeof resolveAuthProfileOrder>[0]["cfg"];
 
@@ -31,7 +34,7 @@ type SafeCodexControlRequest = (
   options?: CodexControlRequestOptions,
 ) => Promise<SafeValue<JsonValue | undefined>>;
 
-export type CodexAccountAuthRow = {
+type CodexAccountAuthRow = {
   profileId: string;
   label: string;
   kind: string;
@@ -51,18 +54,19 @@ export type CodexAccountAuthOverview = {
 
 export async function readCodexAccountAuthOverview(params: {
   ctx: PluginCommandContext;
+  agentDir: string;
   pluginConfig: unknown;
   safeCodexControlRequest: SafeCodexControlRequest;
   account: SafeValue<JsonValue | undefined>;
   limits: SafeValue<JsonValue | undefined>;
 }): Promise<CodexAccountAuthOverview | undefined> {
   const config = params.ctx.config;
-  const agentDir = resolveDefaultAgentDir(config);
+  const agentDir = params.agentDir;
   const store = ensureAuthProfileStore(agentDir, {
     allowKeychainPrompt: false,
     config,
   });
-  const order = resolveDisplayAuthOrder({ config, store });
+  const { order, explicit: explicitOrder } = resolveDisplayAuthOrder({ config, store });
   if (order.length === 0) {
     return undefined;
   }
@@ -71,6 +75,7 @@ export async function readCodexAccountAuthOverview(params: {
   const activeProfileId = resolveActiveProfileId({
     store,
     order,
+    explicitOrder,
     config,
     account: params.account,
     limits: params.limits,
@@ -89,6 +94,7 @@ export async function readCodexAccountAuthOverview(params: {
     subscriptionProfileId && (!activeIsSubscription || subscriptionProfileId !== activeProfileId)
       ? await readSubscriptionUsage({
           ...params,
+          agentDir,
           config,
           subscriptionProfileId,
           now,
@@ -135,21 +141,45 @@ export async function readCodexAccountAuthOverview(params: {
   };
 }
 
+type DisplayAuthOrder = {
+  readonly order: string[];
+  readonly explicit: boolean;
+};
+
 function resolveDisplayAuthOrder(params: {
   config: AuthProfileOrderConfig;
   store: AuthProfileStore;
-}): string[] {
+}): DisplayAuthOrder {
   const codexOrder =
     resolveOrder(params.store.order, OPENAI_CODEX_PROVIDER_ID) ??
     resolveOrder(params.config?.auth?.order, OPENAI_CODEX_PROVIDER_ID);
   if (codexOrder && codexOrder.length > 0) {
-    return dedupe(codexOrder);
+    return { order: normalizeUniqueStringEntries(codexOrder), explicit: true };
   }
-  return resolveAuthProfileOrder({
+  const order = resolveAuthProfileOrder({
     cfg: params.config,
     store: params.store,
     provider: OPENAI_CODEX_PROVIDER_ID,
   });
+  return { order, explicit: hasExplicitOpenAiAuthOrder(params) };
+}
+
+function hasExplicitOpenAiAuthOrder(params: {
+  config: AuthProfileOrderConfig;
+  store: AuthProfileStore;
+}): boolean {
+  const sources = [params.store.order, params.config?.auth?.order];
+  for (const source of sources) {
+    const codex = resolveOrder(source, OPENAI_CODEX_PROVIDER_ID);
+    if (codex && codex.length > 0) {
+      return true;
+    }
+    const openai = resolveOrder(source, OPENAI_PROVIDER_ID);
+    if (openai && openai.length > 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function resolveOrder(
@@ -162,6 +192,7 @@ function resolveOrder(
 function resolveActiveProfileId(params: {
   store: AuthProfileStore;
   order: string[];
+  explicitOrder: boolean;
   config: AuthProfileOrderConfig;
   account: SafeValue<JsonValue | undefined>;
   limits: SafeValue<JsonValue | undefined>;
@@ -175,12 +206,31 @@ function resolveActiveProfileId(params: {
   if (liveProfileId) {
     return liveProfileId;
   }
+  // Explicit auth order (`models auth order set` or `config.auth.order`) is
+  // authoritative for the status display and overrides `lastGood`/usage
+  // heuristics, matching the core `resolveAuthProfileOrder` precedence so the
+  // display does not silently disagree with the runtime resolver. When no
+  // fully-usable candidate exists return undefined — marking an ineligible
+  // profile as active would misrepresent what the runtime resolver can use.
+  if (params.explicitOrder) {
+    return params.order.find(
+      (profileId) =>
+        isActiveProfileCandidate(params, profileId) &&
+        resolveAuthProfileEligibility({
+          cfg: params.config,
+          store: params.store,
+          provider: OPENAI_CODEX_PROVIDER_ID,
+          profileId,
+          now: params.now,
+        }).eligible,
+    );
+  }
   const lastGood = [
     params.store.lastGood?.[OPENAI_PROVIDER_ID],
     params.store.lastGood?.[OPENAI_CODEX_PROVIDER_ID],
   ].find(
     (profileId): profileId is string =>
-      !!profileId &&
+      typeof profileId === "string" &&
       params.order.includes(profileId) &&
       isActiveProfileCandidate(params, profileId),
   );
@@ -231,9 +281,9 @@ function resolveLiveAccountProfileId(params: {
   const account = isJsonObject(params.account.value.account)
     ? params.account.value.account
     : params.account.value;
-  const type = readString(account, "type")?.toLowerCase();
+  const type = normalizeOptionalString(account.type)?.toLowerCase();
   if (type === "chatgpt") {
-    const email = readString(account, "email")?.toLowerCase();
+    const email = normalizeOptionalString(account.email)?.toLowerCase();
     const firstSubscription = params.order.find((profileId) =>
       isChatGptSubscriptionProfile(params.store.profiles[profileId]),
     );
@@ -243,7 +293,7 @@ function resolveLiveAccountProfileId(params: {
     return (
       params.order.find((profileId) => {
         const credential = params.store.profiles[profileId];
-        if (!isChatGptSubscriptionProfile(credential)) {
+        if (!credential || !isChatGptSubscriptionProfile(credential)) {
           return false;
         }
         const profileEmail =
@@ -267,6 +317,7 @@ function shouldInferApiKeyActiveFromRateLimitProbe(
 async function readSubscriptionUsage(params: {
   pluginConfig: unknown;
   safeCodexControlRequest: SafeCodexControlRequest;
+  agentDir: string;
   config: AuthProfileOrderConfig;
   subscriptionProfileId: string;
   now: number;
@@ -277,6 +328,7 @@ async function readSubscriptionUsage(params: {
     undefined,
     {
       config: params.config,
+      agentDir: params.agentDir,
       authProfileId: params.subscriptionProfileId,
       isolated: true,
     },
@@ -284,7 +336,6 @@ async function readSubscriptionUsage(params: {
   if (!limits.ok) {
     return undefined;
   }
-  rememberCodexRateLimits(limits.value);
   return summarizeCodexAccountUsage(limits.value, params.now);
 }
 
@@ -387,11 +438,6 @@ function formatSubscriptionUsageLine(
 
 function formatUsageLineForDisplay(value: string): string {
   return value.replace(/^weekly\b/u, "Weekly").replace(/\bshort-term\b/u, "Short-term");
-}
-
-function readString(record: JsonObject, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function isChatGptSubscriptionProfile(credential: AuthProfileCredential | undefined): boolean {
@@ -527,18 +573,4 @@ function formatRelativeReset(untilMs: number, nowMs: number): string {
   }
   const days = Math.ceil(durationMs / dayMs);
   return `in ${days} ${days === 1 ? "day" : "days"}`;
-}
-
-function dedupe(values: string[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const value of values) {
-    const trimmed = value.trim();
-    if (!trimmed || seen.has(trimmed)) {
-      continue;
-    }
-    seen.add(trimmed);
-    result.push(trimmed);
-  }
-  return result;
 }

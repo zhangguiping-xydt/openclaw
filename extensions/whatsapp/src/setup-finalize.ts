@@ -1,19 +1,19 @@
-import path from "node:path";
+// Whatsapp plugin module implements setup finalize behavior.
 import {
   DEFAULT_ACCOUNT_ID,
-  pathExists,
   splitSetupEntries,
   createSetupTranslator,
+  type ChannelSetupWizard,
   type DmPolicy,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/setup";
-import type { ChannelSetupWizard } from "openclaw/plugin-sdk/setup";
 import { formatCliCommand, formatDocsLink } from "openclaw/plugin-sdk/setup-tools";
 import {
   resolveDefaultWhatsAppAccountId,
   resolveWhatsAppAccount,
   resolveWhatsAppAuthDir,
 } from "./accounts.js";
+import { hasWebCredsSync } from "./creds-files.js";
 import {
   normalizeWhatsAppAllowFromEntries,
   normalizeWhatsAppAllowFromEntry,
@@ -159,8 +159,7 @@ function setWhatsAppSelfChatMode(
 
 async function detectWhatsAppLinked(cfg: OpenClawConfig, accountId: string): Promise<boolean> {
   const { authDir } = resolveWhatsAppAuthDir({ cfg, accountId });
-  const credsPath = path.join(authDir, "creds.json");
-  return await pathExists(credsPath);
+  return hasWebCredsSync(authDir);
 }
 
 async function promptWhatsAppOwnerAllowFrom(params: {
@@ -388,6 +387,7 @@ export async function finalizeWhatsAppSetup(params: {
   forceAllowFrom: boolean;
   prompter: SetupPrompter;
   runtime: SetupRuntime;
+  options?: Parameters<NonNullable<ChannelSetupWizard["finalize"]>>[0]["options"];
 }) {
   const accountId = params.accountId.trim() || resolveDefaultWhatsAppAccountId(params.cfg);
   let next =
@@ -405,6 +405,18 @@ export async function finalizeWhatsAppSetup(params: {
     accountId,
   });
 
+  if (params.options?.deferDeviceLinkToClient) {
+    // The gateway client renders the pairing QR itself (web.login.start/wait);
+    // running the terminal QR login here would print to a headless process.
+    next = await promptWhatsAppDmAccess({
+      cfg: next,
+      accountId,
+      forceAllowFrom: params.forceAllowFrom,
+      prompter: params.prompter,
+    });
+    return { cfg: next };
+  }
+
   if (!linked) {
     await params.prompter.note(
       [
@@ -421,15 +433,41 @@ export async function finalizeWhatsAppSetup(params: {
     initialValue: !linked,
   });
   if (wantsLink) {
-    try {
-      const { loginWeb } = await import("./login.js");
-      await loginWeb(false, undefined, params.runtime, accountId);
-    } catch (error) {
+    const reportLoginFailure = async (error: unknown) => {
       params.runtime.error(`WhatsApp login failed: ${String(error)}`);
       await params.prompter.note(
         t("wizard.channels.docs", { link: formatDocsLink("/whatsapp", "whatsapp") }),
         t("wizard.whatsapp.helpTitle"),
       );
+    };
+    let loginWeb: (typeof import("./login.js"))["loginWeb"] | undefined;
+    try {
+      ({ loginWeb } = await import("./login.js"));
+    } catch (error) {
+      await reportLoginFailure(error);
+    }
+    if (loginWeb) {
+      let persistenceGuardFailure: { error: unknown } | undefined;
+      const beforeCredentialPersistence = params.options?.beforePersistentEffect
+        ? async () => {
+            try {
+              await params.options?.beforePersistentEffect?.();
+            } catch (error) {
+              persistenceGuardFailure = { error };
+              throw error;
+            }
+          }
+        : undefined;
+      try {
+        await loginWeb(false, undefined, params.runtime, accountId, {
+          beforeCredentialPersistence,
+        });
+      } catch (error) {
+        if (persistenceGuardFailure) {
+          throw persistenceGuardFailure.error;
+        }
+        await reportLoginFailure(error);
+      }
     }
   } else if (!linked) {
     await params.prompter.note(

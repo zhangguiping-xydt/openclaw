@@ -1,3 +1,4 @@
+/** Guardrail tests that keep ACP/session binding flows off legacy thread-binding APIs. */
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,7 +13,7 @@ type GuardedSource = {
 
 const GUARDED_SOURCES: GuardedSource[] = [
   {
-    path: "agents/acp-spawn.ts",
+    path: "agents/subagents/spawn/acp-spawn.ts",
     forbiddenPatterns: [/\bgetThreadBindingManager\b/, /\bparseDiscordTarget\b/],
   },
   {

@@ -1,3 +1,5 @@
+// Matrix plugin module implements location behavior.
+import { parseStrictFiniteNumber } from "openclaw/plugin-sdk/number-runtime";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -35,13 +37,16 @@ function parseGeoUri(value: string): GeoUriParams | null {
   }
   const payload = trimmed.slice(4);
   const [coordsPart, ...paramParts] = payload.split(";");
+  if (!coordsPart) {
+    return null;
+  }
   const coords = coordsPart.split(",");
   if (coords.length < 2) {
     return null;
   }
-  const latitude = Number.parseFloat(coords[0] ?? "");
-  const longitude = Number.parseFloat(coords[1] ?? "");
-  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+  const latitude = parseStrictFiniteNumber(coords[0] ?? "");
+  const longitude = parseStrictFiniteNumber(coords[1] ?? "");
+  if (latitude === undefined || longitude === undefined) {
     return null;
   }
 
@@ -63,12 +68,12 @@ function parseGeoUri(value: string): GeoUriParams | null {
   }
 
   const accuracyRaw = params.get("u");
-  const accuracy = accuracyRaw ? Number.parseFloat(accuracyRaw) : undefined;
+  const accuracy = accuracyRaw ? parseStrictFiniteNumber(accuracyRaw) : undefined;
 
   return {
     latitude,
     longitude,
-    accuracy: Number.isFinite(accuracy) ? accuracy : undefined,
+    accuracy,
   };
 }
 

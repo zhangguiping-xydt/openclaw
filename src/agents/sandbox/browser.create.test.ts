@@ -1,5 +1,11 @@
-import { readFileSync } from "node:fs";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+// Sandbox browser creation tests cover Docker args, bridge auth, noVNC access,
+// config hashing, and cached bridge invalidation.
+import { mkdirSync, readFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo, Socket } from "node:net";
+import path from "node:path";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import {
   computeSandboxBrowserConfigHash,
   SANDBOX_DOCKER_EXPLICIT_ENV_POLICY_EPOCH,
@@ -8,6 +14,7 @@ import { resolveSandboxBrowserDockerCreateConfig } from "./config.js";
 import {
   SANDBOX_BROWSER_IMAGE_CONTRACT_EPOCH,
   SANDBOX_BROWSER_SECURITY_HASH_EPOCH,
+  SANDBOX_DOCKER_CREATE_ARGS_EPOCH,
 } from "./constants.js";
 import { collectDockerFlagValues, findDockerArgsCall } from "./test-args.js";
 import type { SandboxConfig } from "./types.js";
@@ -15,15 +22,12 @@ import { SANDBOX_MOUNT_FORMAT_VERSION } from "./workspace-mounts.js";
 
 let BROWSER_BRIDGES: Map<string, unknown>;
 let ensureSandboxBrowser: typeof import("./browser.js").ensureSandboxBrowser;
-let resetNoVncObserverTokensForTests: typeof import("./novnc-auth.js").resetNoVncObserverTokensForTests;
 
 const dockerMocks = vi.hoisted(() => ({
   dockerContainerState: vi.fn(),
   execDocker: vi.fn(),
   readDockerContainerEnvVar: vi.fn(),
   readDockerContainerLabel: vi.fn(),
-  readDockerNetworkDriver: vi.fn(),
-  readDockerNetworkGateway: vi.fn(),
   readDockerPort: vi.fn(),
 }));
 
@@ -37,6 +41,12 @@ const bridgeMocks = vi.hoisted(() => ({
   stopBrowserBridgeServer: vi.fn(),
 }));
 
+const runtimeMocks = vi.hoisted(() => ({
+  log: vi.fn(),
+}));
+
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
 vi.mock("./docker.js", async () => {
   const actual = await vi.importActual<typeof import("./docker.js")>("./docker.js");
   return {
@@ -45,8 +55,6 @@ vi.mock("./docker.js", async () => {
     execDocker: dockerMocks.execDocker,
     readDockerContainerEnvVar: dockerMocks.readDockerContainerEnvVar,
     readDockerContainerLabel: dockerMocks.readDockerContainerLabel,
-    readDockerNetworkDriver: dockerMocks.readDockerNetworkDriver,
-    readDockerNetworkGateway: dockerMocks.readDockerNetworkGateway,
     readDockerPort: dockerMocks.readDockerPort,
   };
 });
@@ -59,6 +67,10 @@ vi.mock("./registry.js", () => ({
 vi.mock("../../plugin-sdk/browser-bridge.js", () => ({
   startBrowserBridgeServer: bridgeMocks.startBrowserBridgeServer,
   stopBrowserBridgeServer: bridgeMocks.stopBrowserBridgeServer,
+}));
+
+vi.mock("../../runtime.js", () => ({
+  defaultRuntime: runtimeMocks,
 }));
 
 vi.mock("../../plugin-sdk/browser-profiles.js", () => ({
@@ -95,16 +107,16 @@ async function loadFreshBrowserModulesForTest() {
   vi.resetModules();
   ({ BROWSER_BRIDGES } = await import("./browser-bridges.js"));
   ({ ensureSandboxBrowser } = await import("./browser.js"));
-  ({ resetNoVncObserverTokensForTests } = await import("./novnc-auth.js"));
 }
 
-function buildConfig(enableNoVnc: boolean): SandboxConfig {
+function buildConfig(noVncEnabled: boolean): SandboxConfig {
   return {
     mode: "all",
     backend: "docker",
     scope: "session",
     workspaceAccess: "none",
     workspaceRoot: "/tmp/openclaw-sandboxes",
+    dockerTmpfsSource: "default",
     docker: {
       image: "openclaw-sandbox:bookworm-slim",
       containerPrefix: "openclaw-sbx-",
@@ -130,7 +142,7 @@ function buildConfig(enableNoVnc: boolean): SandboxConfig {
       vncPort: 5900,
       noVncPort: 6080,
       headless: false,
-      enableNoVnc,
+      noVncEnabled,
       allowHostControl: false,
       autoStart: true,
       autoStartTimeoutMs: 12_000,
@@ -144,6 +156,41 @@ function buildConfig(enableNoVnc: boolean): SandboxConfig {
       maxAgeDays: 7,
     },
   };
+}
+
+function computeTestBrowserHash(params: {
+  cfg: SandboxConfig;
+  createArgsEpoch: string;
+  workspaceDir?: string;
+  agentWorkspaceDir?: string;
+  dockerEnvPolicyEpoch?: string;
+}): string {
+  const workspaceDir = params.workspaceDir ?? "/tmp/workspace";
+  const agentWorkspaceDir = params.agentWorkspaceDir ?? workspaceDir;
+  const browserDockerCfg = resolveSandboxBrowserDockerCreateConfig({
+    docker: params.cfg.docker,
+    browser: params.cfg.browser,
+  });
+  return computeSandboxBrowserConfigHash({
+    docker: browserDockerCfg,
+    dockerEnvPolicyEpoch: params.dockerEnvPolicyEpoch,
+    browser: {
+      cdpPort: params.cfg.browser.cdpPort,
+      cdpSourceRange: params.cfg.browser.cdpSourceRange,
+      vncPort: params.cfg.browser.vncPort,
+      noVncPort: params.cfg.browser.noVncPort,
+      headless: params.cfg.browser.headless,
+      noVncEnabled: params.cfg.browser.noVncEnabled,
+      autoStartTimeoutMs: params.cfg.browser.autoStartTimeoutMs,
+    },
+    securityEpoch: SANDBOX_BROWSER_SECURITY_HASH_EPOCH,
+    workspaceAccess: params.cfg.workspaceAccess,
+    workspaceDir,
+    agentWorkspaceDir,
+    mountFormatVersion: SANDBOX_MOUNT_FORMAT_VERSION,
+    createArgsEpoch: params.createArgsEpoch,
+    readOnlyWorkspaceSkillMounts: [],
+  });
 }
 
 type EnsureSandboxBrowserParams = Parameters<typeof import("./browser.js").ensureSandboxBrowser>[0];
@@ -190,18 +237,16 @@ describe("ensureSandboxBrowser create args", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     BROWSER_BRIDGES.clear();
-    resetNoVncObserverTokensForTests();
     dockerMocks.dockerContainerState.mockClear();
     dockerMocks.execDocker.mockClear();
     dockerMocks.readDockerContainerEnvVar.mockClear();
     dockerMocks.readDockerContainerLabel.mockClear();
-    dockerMocks.readDockerNetworkDriver.mockClear();
-    dockerMocks.readDockerNetworkGateway.mockClear();
     dockerMocks.readDockerPort.mockClear();
     registryMocks.readBrowserRegistry.mockClear();
     registryMocks.updateBrowserRegistry.mockClear();
     bridgeMocks.startBrowserBridgeServer.mockClear();
     bridgeMocks.stopBrowserBridgeServer.mockClear();
+    runtimeMocks.log.mockClear();
 
     dockerMocks.dockerContainerState.mockResolvedValue({ exists: false, running: false });
     dockerMocks.execDocker.mockImplementation(async (args: string[]) => {
@@ -212,8 +257,6 @@ describe("ensureSandboxBrowser create args", () => {
     });
     dockerMocks.readDockerContainerLabel.mockResolvedValue(null);
     dockerMocks.readDockerContainerEnvVar.mockResolvedValue(null);
-    dockerMocks.readDockerNetworkDriver.mockResolvedValue("bridge");
-    dockerMocks.readDockerNetworkGateway.mockResolvedValue("172.21.0.1");
     dockerMocks.readDockerPort.mockImplementation(async (_containerName: string, port: number) => {
       if (port === 9222) {
         return 49100;
@@ -226,7 +269,7 @@ describe("ensureSandboxBrowser create args", () => {
     registryMocks.readBrowserRegistry.mockResolvedValue({ entries: [] });
     registryMocks.updateBrowserRegistry.mockResolvedValue(undefined);
     bridgeMocks.startBrowserBridgeServer.mockResolvedValue({
-      server: {} as never,
+      server: { listening: true } as never,
       port: 19000,
       baseUrl: "http://127.0.0.1:19000",
       state: {
@@ -274,6 +317,8 @@ describe("ensureSandboxBrowser create args", () => {
   });
 
   it("publishes noVNC on loopback and injects noVNC password env", async () => {
+    // noVNC password stays in the container environment; external access uses a
+    // short-lived observer token so URLs do not carry the password.
     const result = await ensureTestSandboxBrowser({
       scopeKey: "session:test",
       workspaceDir: "/tmp/workspace",
@@ -294,6 +339,153 @@ describe("ensureSandboxBrowser create args", () => {
     expect(result?.noVncUrl).not.toContain("password=");
   });
 
+  it("creates browser containers with Docker init and the shared args epoch", async () => {
+    await ensureTestSandboxBrowser({
+      scopeKey: "session:test",
+      workspaceDir: "/tmp/workspace",
+      agentWorkspaceDir: "/tmp/workspace",
+      cfg: buildConfig(false),
+    });
+
+    const createArgs = requireDockerCreateArgs();
+    expect(createArgs.filter((arg) => arg === "--init")).toHaveLength(1);
+    expect(createArgs).toContain(`openclaw.createArgsEpoch=${SANDBOX_DOCKER_CREATE_ARGS_EPOCH}`);
+  });
+
+  it("serializes concurrent provisioning for the same browser container", async () => {
+    let created = false;
+    let cdpAuthToken: string | undefined;
+    let configHash: string | undefined;
+    dockerMocks.dockerContainerState.mockImplementation(async () => ({
+      exists: created,
+      running: created,
+    }));
+    dockerMocks.readDockerContainerEnvVar.mockImplementation(async (_containerName, key) =>
+      key === "OPENCLAW_BROWSER_CDP_AUTH_TOKEN" ? (cdpAuthToken ?? null) : null,
+    );
+    dockerMocks.readDockerContainerLabel.mockImplementation(async () => configHash ?? null);
+    dockerMocks.execDocker.mockImplementation(async (args: string[]) => {
+      if (args[0] === "image" && args[1] === "inspect") {
+        return { stdout: `${SANDBOX_BROWSER_IMAGE_CONTRACT_EPOCH}\n`, stderr: "", code: 0 };
+      }
+      if (args[0] === "create") {
+        if (created) {
+          throw new Error("docker name conflict");
+        }
+        created = true;
+        cdpAuthToken = collectDockerFlagValues(args, "-e")
+          .find((entry) => entry.startsWith("OPENCLAW_BROWSER_CDP_AUTH_TOKEN="))
+          ?.slice("OPENCLAW_BROWSER_CDP_AUTH_TOKEN=".length);
+        configHash = collectDockerFlagValues(args, "--label")
+          .find((entry) => entry.startsWith("openclaw.configHash="))
+          ?.slice("openclaw.configHash=".length);
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    });
+
+    const params = {
+      scopeKey: "session:test",
+      workspaceDir: "/tmp/workspace",
+      agentWorkspaceDir: "/tmp/workspace",
+      cfg: buildConfig(false),
+    };
+    await expect(
+      Promise.all([ensureTestSandboxBrowser(params), ensureTestSandboxBrowser(params)]),
+    ).resolves.toHaveLength(2);
+
+    expect(dockerMocks.execDocker.mock.calls.filter(([args]) => args[0] === "create")).toHaveLength(
+      1,
+    );
+    expect(dockerMocks.execDocker.mock.calls.filter(([args]) => args[0] === "start")).toHaveLength(
+      1,
+    );
+  });
+
+  it("recreates a cold browser container when the shared args epoch changes", async () => {
+    const cfg = buildConfig(false);
+    const oldHash = computeTestBrowserHash({
+      cfg,
+      createArgsEpoch: "pre-init",
+    });
+    dockerMocks.dockerContainerState.mockResolvedValue({ exists: true, running: true });
+    dockerMocks.readDockerContainerEnvVar.mockResolvedValue("existing-cdp-token");
+    dockerMocks.readDockerContainerLabel.mockResolvedValue(oldHash);
+    registryMocks.readBrowserRegistry.mockResolvedValue({
+      entries: [
+        {
+          containerName: "openclaw-sbx-browser-session-test-0661d10a",
+          sessionKey: "session:test",
+          createdAtMs: 1,
+          lastUsedAtMs: 0,
+          image: cfg.browser.image,
+          configHash: oldHash,
+          cdpPort: 49100,
+        },
+      ],
+    });
+    BROWSER_BRIDGES.set("session:test", {
+      containerName: "openclaw-sbx-browser-session-test-0661d10a",
+      bridge: { server: { listening: true } },
+    });
+
+    await ensureTestSandboxBrowser({
+      scopeKey: "session:test",
+      workspaceDir: "/tmp/workspace",
+      agentWorkspaceDir: "/tmp/workspace",
+      cfg,
+    });
+
+    expect(dockerMocks.execDocker).toHaveBeenCalledWith(
+      ["rm", "-f", "openclaw-sbx-browser-session-test-0661d10a"],
+      { allowFailure: true },
+    );
+    const rmCallIndex = dockerMocks.execDocker.mock.calls.findIndex(([args]) => args[0] === "rm");
+    expect(bridgeMocks.stopBrowserBridgeServer.mock.invocationCallOrder[0]).toBeLessThan(
+      dockerMocks.execDocker.mock.invocationCallOrder[rmCallIndex] ?? Number.MAX_SAFE_INTEGER,
+    );
+    expect(requireDockerCreateArgs()).toContain("--init");
+  });
+
+  it("keeps a hot pre-init browser running and emits the recreate hint", async () => {
+    const cfg = buildConfig(false);
+    const oldHash = computeTestBrowserHash({
+      cfg,
+      createArgsEpoch: "pre-init",
+    });
+    dockerMocks.dockerContainerState.mockResolvedValue({ exists: true, running: true });
+    dockerMocks.readDockerContainerEnvVar.mockResolvedValue("existing-cdp-token");
+    dockerMocks.readDockerContainerLabel.mockResolvedValue(oldHash);
+    registryMocks.readBrowserRegistry.mockResolvedValue({
+      entries: [
+        {
+          containerName: "openclaw-sbx-browser-session-test-0661d10a",
+          sessionKey: "session:test",
+          createdAtMs: 1,
+          lastUsedAtMs: Date.now(),
+          image: cfg.browser.image,
+          configHash: oldHash,
+          cdpPort: 49100,
+        },
+      ],
+    });
+
+    await ensureTestSandboxBrowser({
+      scopeKey: "session:test",
+      workspaceDir: "/tmp/workspace",
+      agentWorkspaceDir: "/tmp/workspace",
+      cfg,
+    });
+
+    expect(findDockerArgsCall(dockerMocks.execDocker.mock.calls, "rm")).toBeUndefined();
+    expect(findDockerArgsCall(dockerMocks.execDocker.mock.calls, "create")).toBeUndefined();
+    expect(runtimeMocks.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Recreate to apply: openclaw sandbox recreate --browser --session session:test",
+      ),
+    );
+    expect(registryMocks.updateBrowserRegistry.mock.calls.at(-1)?.[0]?.configHash).toBe(oldHash);
+  });
+
   it("does not inject noVNC password env when noVNC is disabled", async () => {
     const result = await ensureTestSandboxBrowser({
       scopeKey: "session:test",
@@ -310,6 +502,42 @@ describe("ensureSandboxBrowser create args", () => {
     expect(result?.noVncUrl).toBeUndefined();
   });
 
+  it("skips browser user binds that conflict with protected skill overlay container paths", async () => {
+    // Protected skill overlays are authoritative; a browser bind targeting the same
+    // container path is skipped so the read-only skill overlay wins and Docker does
+    // not reject the container with a "Duplicate mount point" error.
+    const workspaceDir = tempDirs.make("openclaw-browser-mounts-");
+    const customRoot = tempDirs.make("openclaw-browser-mounts-");
+    mkdirSync(path.join(workspaceDir, "skills", "demo"), { recursive: true });
+    const cfg = buildConfig(false);
+    cfg.workspaceAccess = "rw";
+    cfg.docker.dangerouslyAllowExternalBindSources = true;
+    cfg.docker.dangerouslyAllowReservedContainerTargets = true;
+    cfg.browser.binds = [`${customRoot}:/workspace/skills:rw`];
+
+    await ensureTestSandboxBrowser({
+      scopeKey: "session:test",
+      workspaceDir,
+      agentWorkspaceDir: workspaceDir,
+      cfg,
+    });
+
+    const bindArgs = collectDockerFlagValues(requireDockerCreateArgs(), "-v");
+    const workspaceMountIdx = bindArgs.indexOf(`${workspaceDir}:/workspace:z`);
+    const customMount = `${customRoot}:/workspace/skills:rw`;
+    const protectedMount = `${path.join(workspaceDir, "skills")}:/workspace/skills:ro,z`;
+    const protectedMountIdx = bindArgs.indexOf(protectedMount);
+
+    expect(workspaceMountIdx).toBeGreaterThanOrEqual(0);
+    // User bind is skipped because it conflicts with the protected skill overlay
+    expect(bindArgs).not.toContain(customMount);
+    // Protected skill overlay is present and appended after user binds
+    expect(protectedMountIdx).toBeGreaterThan(workspaceMountIdx);
+    expect(runtimeMocks.log).toHaveBeenCalledWith(
+      expect.stringContaining(`skipping user bind "${customMount}"`),
+    );
+  });
+
   it("includes the explicit env policy epoch in the browser config hash when needed", async () => {
     const cfg = buildConfig(false);
     cfg.docker.env = {
@@ -319,27 +547,12 @@ describe("ensureSandboxBrowser create args", () => {
     const scopeKey = "session-1";
     const workspaceDir = "/tmp/workspace";
     const agentWorkspaceDir = "/tmp/workspace";
-    const browserDockerCfg = resolveSandboxBrowserDockerCreateConfig({
-      docker: cfg.docker,
-      browser: cfg.browser,
-    });
-    const expectedHash = computeSandboxBrowserConfigHash({
-      docker: browserDockerCfg,
+    const expectedHash = computeTestBrowserHash({
+      cfg,
       dockerEnvPolicyEpoch: SANDBOX_DOCKER_EXPLICIT_ENV_POLICY_EPOCH,
-      browser: {
-        cdpPort: cfg.browser.cdpPort,
-        vncPort: cfg.browser.vncPort,
-        noVncPort: cfg.browser.noVncPort,
-        headless: cfg.browser.headless,
-        enableNoVnc: cfg.browser.enableNoVnc,
-        autoStartTimeoutMs: cfg.browser.autoStartTimeoutMs,
-        cdpSourceRange: undefined,
-      },
-      securityEpoch: SANDBOX_BROWSER_SECURITY_HASH_EPOCH,
-      workspaceAccess: cfg.workspaceAccess,
       workspaceDir,
       agentWorkspaceDir,
-      mountFormatVersion: SANDBOX_MOUNT_FORMAT_VERSION,
+      createArgsEpoch: SANDBOX_DOCKER_CREATE_ARGS_EPOCH,
     });
 
     await ensureTestSandboxBrowser({
@@ -398,7 +611,7 @@ describe("ensureSandboxBrowser create args", () => {
 
   it("recreates a cached bridge when the SSRF policy changes", async () => {
     const existingBridge = {
-      server: {} as never,
+      server: { listening: true } as never,
       port: 19000,
       baseUrl: "http://127.0.0.1:19000",
       state: {
@@ -411,6 +624,8 @@ describe("ensureSandboxBrowser create args", () => {
           cdpIsLoopback: true,
           cdpPortRangeStart: 18800,
           cdpPortRangeEnd: 18899,
+          extensionRelayDefaultPort: 18799,
+          extensionRelayPorts: {},
           remoteCdpTimeoutMs: 1500,
           remoteCdpHandshakeTimeoutMs: 3000,
           localLaunchTimeoutMs: 15_000,
@@ -460,7 +675,7 @@ describe("ensureSandboxBrowser create args", () => {
 
   it("recreates a cached bridge when evaluate permission changes", async () => {
     const existingBridge = {
-      server: {} as never,
+      server: { listening: true } as never,
       port: 19000,
       baseUrl: "http://127.0.0.1:19000",
       state: {
@@ -473,6 +688,8 @@ describe("ensureSandboxBrowser create args", () => {
           cdpIsLoopback: true,
           cdpPortRangeStart: 18800,
           cdpPortRangeEnd: 18899,
+          extensionRelayDefaultPort: 18799,
+          extensionRelayPorts: {},
           remoteCdpTimeoutMs: 1500,
           remoteCdpHandshakeTimeoutMs: 3000,
           localLaunchTimeoutMs: 15_000,
@@ -564,6 +781,8 @@ describe("ensureSandboxBrowser create args", () => {
   });
 
   it("force-removes the browser container when CDP never becomes reachable", async () => {
+    // A browser container that starts but never exposes CDP is unusable; remove
+    // it immediately so the next attempt recreates from a clean state.
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("timeout"));
     bridgeMocks.startBrowserBridgeServer.mockImplementationOnce(async (params) => {
       await params.onEnsureAttachTarget?.({});
@@ -598,9 +817,124 @@ describe("ensureSandboxBrowser create args", () => {
     );
   });
 
-  it("requires auth for the sandbox CDP relay without auto-derived source ranges", async () => {
-    dockerMocks.readDockerNetworkGateway.mockResolvedValue("172.21.0.1");
+  it.each([200, 503])(
+    "cancels the CDP probe response body after a %i startup probe",
+    async (status) => {
+      const cancels: Array<ReturnType<typeof vi.fn>> = [];
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        const cancel = vi.fn().mockResolvedValue(undefined);
+        cancels.push(cancel);
+        return {
+          ok: status === 200,
+          body: { cancel },
+        } as never;
+      });
+      bridgeMocks.startBrowserBridgeServer.mockImplementationOnce(async (params) => {
+        await params.onEnsureAttachTarget?.({});
+        throw new Error("probe completed before bridge creation");
+      });
 
+      const cfg = buildConfig(false);
+      cfg.browser.autoStartTimeoutMs = 50;
+
+      await expect(
+        ensureTestSandboxBrowser({
+          scopeKey: "session:test",
+          workspaceDir: "/tmp/workspace",
+          agentWorkspaceDir: "/tmp/workspace",
+          cfg,
+        }),
+      ).rejects.toThrow(
+        status === 200
+          ? "probe completed before bridge creation"
+          : "hung container has been forcefully removed",
+      );
+
+      expect(cancels).not.toHaveLength(0);
+      for (const cancel of cancels) {
+        expect(cancel).toHaveBeenCalledOnce();
+      }
+    },
+  );
+
+  it("keeps a stalled CDP request inside the browser startup deadline", async () => {
+    const sockets = new Set<Socket>();
+    let requestPath: string | undefined;
+    let resolveRequestReceived: (() => void) | undefined;
+    const requestReceived = new Promise<void>((resolve) => {
+      resolveRequestReceived = resolve;
+    });
+    const server = createServer((req, _res) => {
+      requestPath = req.url;
+      req.resume();
+      resolveRequestReceived?.();
+      // Accept the CDP request but never send response headers.
+    });
+    server.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const cdpPort = (server.address() as AddressInfo).port;
+    dockerMocks.readDockerPort.mockImplementation(async (_containerName: string, port: number) => {
+      if (port === 9222) {
+        return cdpPort;
+      }
+      if (port === 6080) {
+        return 49101;
+      }
+      return null;
+    });
+    bridgeMocks.startBrowserBridgeServer.mockImplementationOnce(async (params) => {
+      await params.onEnsureAttachTarget?.({});
+      throw new Error("expected CDP startup to time out before bridge creation");
+    });
+
+    const cfg = buildConfig(false);
+    cfg.browser.autoStartTimeoutMs = 250;
+
+    try {
+      const startup = ensureTestSandboxBrowser({
+        scopeKey: "session:test",
+        workspaceDir: "/tmp/workspace",
+        agentWorkspaceDir: "/tmp/workspace",
+        cfg,
+      });
+      const startupResult = startup.then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      await Promise.race([
+        requestReceived,
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(() => reject(new Error("CDP request was not received")), 2_000).unref();
+        }),
+      ]);
+
+      expect(requestPath).toBe("/json/version");
+      const result = await startupResult;
+      expect(result.ok).toBe(false);
+      if (result.ok) {
+        throw new Error("expected stalled CDP startup to fail");
+      }
+      expect(result.error).toBeInstanceOf(Error);
+      expect((result.error as Error).message).toContain(
+        `within ${cfg.browser.autoStartTimeoutMs}ms. The hung container has been forcefully removed.`,
+      );
+    } finally {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  it("requires auth for the sandbox CDP relay without auto-derived source ranges", async () => {
     await ensureTestSandboxBrowser({
       scopeKey: "session:test",
       workspaceDir: "/tmp/workspace",
@@ -615,8 +949,6 @@ describe("ensureSandboxBrowser create args", () => {
     );
     expect(authEntry).toMatch(/^OPENCLAW_BROWSER_CDP_AUTH_TOKEN=[0-9a-f]{48}$/);
     expect(envEntries).not.toContain("OPENCLAW_BROWSER_CDP_SOURCE_RANGE=172.21.0.1/32");
-    expect(dockerMocks.readDockerNetworkDriver).not.toHaveBeenCalled();
-    expect(dockerMocks.readDockerNetworkGateway).not.toHaveBeenCalled();
 
     const token = requireValue(authEntry, "CDP auth env").slice(
       "OPENCLAW_BROWSER_CDP_AUTH_TOKEN=".length,
@@ -630,7 +962,6 @@ describe("ensureSandboxBrowser create args", () => {
   });
 
   it("passes explicit cdpSourceRange as an additional relay filter", async () => {
-    dockerMocks.readDockerNetworkGateway.mockResolvedValue("172.21.0.1");
     const cfg = buildConfig(false);
     cfg.browser.cdpSourceRange = "10.0.0.0/24";
 
@@ -644,7 +975,6 @@ describe("ensureSandboxBrowser create args", () => {
     const createArgs = findDockerArgsCall(dockerMocks.execDocker.mock.calls, "create");
     const envEntries = collectDockerFlagValues(createArgs ?? [], "-e");
     expect(envEntries).toContain("OPENCLAW_BROWSER_CDP_SOURCE_RANGE=10.0.0.0/24");
-    expect(dockerMocks.readDockerNetworkGateway).not.toHaveBeenCalled();
   });
 
   it("recreates existing browser containers that do not expose relay auth", async () => {
@@ -665,23 +995,62 @@ describe("ensureSandboxBrowser create args", () => {
     requireDockerCreateArgs();
   });
 
-  it("does not inject a source range for network=none by default", async () => {
-    dockerMocks.readDockerNetworkGateway.mockResolvedValue(null);
-    const cfg = buildConfig(false);
-    cfg.browser.network = "none";
+  it("retains a stale container and cached bridge until bridge cleanup can retry", async () => {
+    const containerName = "openclaw-sbx-browser-session-test-0661d10a";
+    const cached = {
+      containerName,
+      bridge: { server: { listening: true } },
+    };
+    BROWSER_BRIDGES.set("session:test", cached);
+    dockerMocks.dockerContainerState.mockResolvedValue({ exists: true, running: true });
+    dockerMocks.readDockerContainerEnvVar.mockResolvedValue(null);
+    bridgeMocks.stopBrowserBridgeServer.mockRejectedValueOnce(new Error("bridge cleanup failed"));
 
-    const result = await ensureTestSandboxBrowser({
+    await expect(
+      ensureTestSandboxBrowser({
+        scopeKey: "session:test",
+        workspaceDir: "/tmp/workspace",
+        agentWorkspaceDir: "/tmp/workspace",
+        cfg: buildConfig(false),
+      }),
+    ).rejects.toThrow("bridge cleanup failed");
+
+    expect(BROWSER_BRIDGES.get("session:test")).toBe(cached);
+    expect(findDockerArgsCall(dockerMocks.execDocker.mock.calls, "rm")).toBeUndefined();
+
+    bridgeMocks.stopBrowserBridgeServer.mockClear();
+    dockerMocks.execDocker.mockClear();
+    await ensureTestSandboxBrowser({
       scopeKey: "session:test",
       workspaceDir: "/tmp/workspace",
       agentWorkspaceDir: "/tmp/workspace",
-      cfg,
+      cfg: buildConfig(false),
     });
 
-    requireValue(result, "sandbox browser result");
-    const createArgs = requireDockerCreateArgs();
-    const envEntries = collectDockerFlagValues(createArgs, "-e");
-    expect(envEntries.some((entry) => entry.startsWith("OPENCLAW_BROWSER_CDP_SOURCE_RANGE="))).toBe(
-      false,
+    const rmCallIndex = dockerMocks.execDocker.mock.calls.findIndex(([args]) => args[0] === "rm");
+    expect(bridgeMocks.stopBrowserBridgeServer.mock.invocationCallOrder[0]).toBeLessThan(
+      dockerMocks.execDocker.mock.invocationCallOrder[rmCallIndex] ?? Number.MAX_SAFE_INTEGER,
     );
+    expect(BROWSER_BRIDGES.get("session:test")).not.toBe(cached);
+  });
+
+  it("rejects network=none before Docker inspection or browser bridge startup", async () => {
+    const cfg = buildConfig(false);
+    cfg.browser.network = "none";
+
+    await expect(
+      ensureTestSandboxBrowser({
+        scopeKey: "session:test",
+        workspaceDir: "/tmp/workspace",
+        agentWorkspaceDir: "/tmp/workspace",
+        cfg,
+      }),
+    ).rejects.toThrow(
+      'Sandbox browser network mode "none" is unsupported because browser control requires a host-reachable published CDP port.',
+    );
+    expect(dockerMocks.dockerContainerState).not.toHaveBeenCalled();
+    expect(dockerMocks.execDocker).not.toHaveBeenCalled();
+    expect(dockerMocks.readDockerPort).not.toHaveBeenCalled();
+    expect(bridgeMocks.startBrowserBridgeServer).not.toHaveBeenCalled();
   });
 });

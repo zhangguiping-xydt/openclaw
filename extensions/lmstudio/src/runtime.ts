@@ -1,3 +1,4 @@
+// Lmstudio plugin module implements runtime behavior.
 import {
   CUSTOM_LOCAL_AUTH_MARKER,
   isKnownEnvApiKeyMarker,
@@ -42,7 +43,9 @@ export function buildLmstudioAuthHeaders(
   return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
-function sanitizeStringHeaders(headers: unknown): Record<string, string> | undefined {
+export function sanitizeLmstudioStringHeaders(
+  headers: unknown,
+): Record<string, string> | undefined {
   if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
     return undefined;
   }
@@ -70,19 +73,20 @@ function shouldSuppressResolvedRuntimeApiKeyForHeaderAuth(
   return /^profile:|^(?:shell )?env(?::|$)/.test(source);
 }
 
-export async function resolveLmstudioConfiguredApiKey(params: {
+export async function resolveLmstudioConfiguredApiKeyForProvider(params: {
+  providerId: string;
   config?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
   path?: string;
   allowUnresolved?: boolean;
 }): Promise<string | undefined> {
-  const providerConfig = params.config?.models?.providers?.[LMSTUDIO_PROVIDER_ID];
+  const providerConfig = params.config?.models?.providers?.[params.providerId];
   const apiKeyInput = providerConfig?.apiKey;
   if (apiKeyInput === undefined || apiKeyInput === null) {
     return undefined;
   }
 
-  const path = params.path ?? "models.providers.lmstudio.apiKey";
+  const path = params.path ?? `models.providers.${params.providerId}.apiKey`;
   const env = params.env ?? process.env;
   const directApiKey = normalizeOptionalSecretInput(apiKeyInput);
   if (directApiKey !== undefined) {
@@ -140,6 +144,18 @@ export async function resolveLmstudioConfiguredApiKey(params: {
   return trimmedResolvedValue;
 }
 
+export async function resolveLmstudioConfiguredApiKey(params: {
+  config?: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
+  path?: string;
+  allowUnresolved?: boolean;
+}): Promise<string | undefined> {
+  return await resolveLmstudioConfiguredApiKeyForProvider({
+    ...params,
+    providerId: LMSTUDIO_PROVIDER_ID,
+  });
+}
+
 export async function resolveLmstudioProviderHeaders(params: {
   config?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
@@ -152,7 +168,7 @@ export async function resolveLmstudioProviderHeaders(params: {
   }
 
   if (!params.config) {
-    return sanitizeStringHeaders(headerInputs);
+    return sanitizeLmstudioStringHeaders(headerInputs);
   }
 
   const pathPrefix = params.path ?? "models.providers.lmstudio.headers";

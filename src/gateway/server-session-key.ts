@@ -1,8 +1,15 @@
+// Gateway run-id to session-key resolver.
+// Bridges live agent run context with persisted session stores.
+import {
+  asDateTimestampMs,
+  resolveExpiresAtMsFromDurationMs,
+} from "@openclaw/normalization-core/number-coercion";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { getRuntimeConfig } from "../config/io.js";
 import type { SessionEntry } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.js";
-import { getAgentRunContext } from "../infra/agent-events.js";
+import { getAgentRunContext } from "../infra/agent-run-registry.js";
+import { pruneMapToMaxSize } from "../infra/map-size.js";
 import {
   normalizeAgentId,
   parseAgentSessionKey,
@@ -10,11 +17,14 @@ import {
 } from "../routing/session-key.js";
 import { resolvePreferredSessionKeyForSessionIdMatches } from "../sessions/session-id-resolution.js";
 import { resolveSessionStoreAgentId, resolveSessionStoreKey } from "./session-store-key.js";
-import { loadCombinedSessionStoreForGateway } from "./session-utils.js";
+import { loadCombinedSessionStoreForGatewayCore } from "./session-utils.js";
 
 const RUN_LOOKUP_CACHE_LIMIT = 256;
 const RUN_LOOKUP_MISS_TTL_MS = 1_000;
 
+// Run-id to session-key lookup bridges live agent events and persisted session
+// stores. Positive hits are stable; misses stay short-lived so late transcript
+// writes can become visible without polling on every caller.
 type RunLookupCacheEntry = {
   sessionKey: string | null;
   expiresAt: number | null;
@@ -39,17 +49,26 @@ function setResolvedSessionKeyCache(
     !resolvedSessionKeyByRunId.has(cacheKey) &&
     resolvedSessionKeyByRunId.size >= RUN_LOOKUP_CACHE_LIMIT
   ) {
-    const oldest = resolvedSessionKeyByRunId.keys().next().value;
-    if (oldest) {
-      resolvedSessionKeyByRunId.delete(oldest);
+    pruneMapToMaxSize(resolvedSessionKeyByRunId, RUN_LOOKUP_CACHE_LIMIT - 1);
+  }
+  let expiresAt: number | null = null;
+  if (sessionKey === null) {
+    // Negative caching avoids repeated full-store scans while still allowing
+    // a just-created run/session pair to appear shortly after the first lookup.
+    const missExpiresAt = resolveExpiresAtMsFromDurationMs(RUN_LOOKUP_MISS_TTL_MS);
+    if (missExpiresAt === undefined) {
+      return;
     }
+    expiresAt = missExpiresAt;
   }
   resolvedSessionKeyByRunId.set(cacheKey, {
     sessionKey,
-    expiresAt: sessionKey === null ? Date.now() + RUN_LOOKUP_MISS_TTL_MS : null,
+    expiresAt,
   });
 }
 
+// Agent scoping accepts global sessions only when global scope is configured,
+// and rejects malformed agent-prefixed keys before store normalization.
 function sessionKeyMatchesAgent(sessionKey: string, agentId: string, cfg: OpenClawConfig): boolean {
   if (cfg.session?.scope === "global" && sessionKey.trim().toLowerCase() === "global") {
     return true;
@@ -67,6 +86,7 @@ function resolveRunSessionKeyForCaller(storeKey: string) {
   return toAgentRequestSessionKey(storeKey) ?? storeKey;
 }
 
+/** Resolves the caller-facing session key for an active or recently persisted run id. */
 export function resolveSessionKeyForRun(runId: string, opts: { agentId?: string } = {}) {
   const cfg = getRuntimeConfig();
   const explicitAgentId =
@@ -90,18 +110,22 @@ export function resolveSessionKeyForRun(runId: string, opts: { agentId?: string 
     if (cachedLookup.sessionKey !== null) {
       return cachedLookup.sessionKey;
     }
-    if ((cachedLookup.expiresAt ?? 0) > Date.now()) {
+    const expiresAt = asDateTimestampMs(cachedLookup.expiresAt);
+    const now = asDateTimestampMs(Date.now());
+    if (expiresAt !== undefined && now !== undefined && expiresAt > now) {
       return undefined;
     }
     resolvedSessionKeyByRunId.delete(cacheKey);
   }
-  const { store } = loadCombinedSessionStoreForGateway(cfg, { agentId: requestedAgentId });
+  const { store } = loadCombinedSessionStoreForGatewayCore(cfg, { agentId: requestedAgentId });
   const matches = Object.entries(store).filter(
     (entry): entry is [string, SessionEntry] =>
       entry[1]?.sessionId === runId && sessionKeyMatchesAgent(entry[0], requestedAgentId, cfg),
   );
   const storeKey = resolvePreferredSessionKeyForSessionIdMatches(matches, runId);
   if (storeKey) {
+    // Return caller-facing agent request keys, not raw store keys, because
+    // HTTP/RPC clients reuse this value in later session operations.
     const sessionKey = resolveRunSessionKeyForCaller(storeKey);
     setResolvedSessionKeyCache(runId, cacheAgentId, sessionKey);
     return sessionKey;
@@ -110,6 +134,7 @@ export function resolveSessionKeyForRun(runId: string, opts: { agentId?: string 
   return undefined;
 }
 
+/** Clears the run lookup cache for tests that mutate session stores. */
 export function resetResolvedSessionKeyForRunCacheForTest(): void {
   resolvedSessionKeyByRunId.clear();
 }

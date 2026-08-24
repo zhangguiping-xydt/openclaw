@@ -6,14 +6,12 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import path from "node:path";
-import { hasBinary } from "../agents/skills.js";
+import process from "node:process";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { resolveExecutable } from "../infra/executable-path.js";
-import { getWindowsInstallRoots } from "../infra/windows-install-roots.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { runCommandWithTimeout } from "../process/exec.js";
-import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
+import { killProcessTree } from "../process/kill-tree.js";
+import { hasBinary } from "../skills/loading/config.js";
 import { ensureTailscaleEndpoint } from "./gmail-setup-utils.js";
 import { isAddressInUseError } from "./gmail-watcher-errors.js";
 import {
@@ -21,47 +19,21 @@ import {
   buildGogWatchServeArgs,
   buildGogWatchStartArgs,
   type GmailHookRuntimeConfig,
+  resolveGogExecutable,
+  resolveGogServeInvocation,
   resolveGmailHookRuntimeConfig,
 } from "./gmail.js";
 
 const log = createSubsystemLogger("gmail-watcher");
+const GMAIL_WATCHER_STDERR_TAIL_CHARS = 512;
 
 let watcherProcess: ChildProcess | null = null;
 let renewInterval: ReturnType<typeof setInterval> | null = null;
+let renewalInFlight: Promise<boolean> | null = null;
+let renewalAbortController: AbortController | null = null;
 let shuttingDown = false;
 let currentConfig: GmailHookRuntimeConfig | null = null;
-let gogBin: string | undefined;
-const WINDOWS_UNSAFE_CMD_CHARS_RE = /[&|<>^%\r\n]/;
-
-function escapeForCmdExe(arg: string): string {
-  if (WINDOWS_UNSAFE_CMD_CHARS_RE.test(arg)) {
-    throw new Error(`Unsafe Windows cmd.exe argument detected: ${JSON.stringify(arg)}`);
-  }
-  if (!arg.includes(" ") && !arg.includes('"')) {
-    return arg;
-  }
-  return `"${arg.replace(/"/g, '""')}"`;
-}
-
-function resolveGogServeInvocation(args: string[]): {
-  args: string[];
-  command: string;
-  windowsHide?: true;
-  windowsVerbatimArguments?: true;
-} {
-  const command = (gogBin ??= resolveExecutable("gog"));
-  const ext = normalizeLowercaseStringOrEmpty(path.extname(command));
-  if (process.platform !== "win32" || (ext !== ".cmd" && ext !== ".bat")) {
-    return { command, args, windowsHide: process.platform === "win32" ? true : undefined };
-  }
-  const cmdExe = path.win32.join(getWindowsInstallRoots().systemRoot, "System32", "cmd.exe");
-  return {
-    command: cmdExe,
-    args: ["/d", "/s", "/c", [command, ...args].map(escapeForCmdExe).join(" ")],
-    windowsHide: true,
-    windowsVerbatimArguments: true,
-  };
-}
+let respawnTimeout: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * Check if gog binary is available
@@ -77,7 +49,7 @@ async function startGmailWatch(
   cfg: Pick<GmailHookRuntimeConfig, "account" | "label" | "topic">,
   options: { signal?: AbortSignal } = {},
 ): Promise<boolean> {
-  const args = [(gogBin ??= resolveExecutable("gog")), ...buildGogWatchStartArgs(cfg)];
+  const args = [resolveGogExecutable(), ...buildGogWatchStartArgs(cfg)];
   try {
     const result = await runCommandWithTimeout(args, {
       timeoutMs: 120_000,
@@ -103,15 +75,22 @@ function spawnGogServe(cfg: GmailHookRuntimeConfig): ChildProcess {
   const args = buildGogWatchServeArgs(cfg);
   log.info(`starting gog ${buildGogWatchServeLogArgs(cfg).join(" ")}`);
   let addressInUse = false;
+  let spawnFailed = false;
+  // Carry a bounded tail so bind markers split across stderr chunks survive until close.
+  let stderrTail = "";
   const invocation = resolveGogServeInvocation(args);
 
   const child = spawn(invocation.command, invocation.args, {
     stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
+    // Own process group on Unix so killProcessTree can reach descendants on shutdown.
+    detached: process.platform !== "win32",
     windowsHide: invocation.windowsHide,
     windowsVerbatimArguments: invocation.windowsVerbatimArguments,
   });
 
+  child.stdout?.on("error", (err) => {
+    log.error(`gog stdout error: ${String(err)}`);
+  });
   child.stdout?.on("data", (data: Buffer) => {
     const line = data.toString().trim();
     if (line) {
@@ -119,23 +98,43 @@ function spawnGogServe(cfg: GmailHookRuntimeConfig): ChildProcess {
     }
   });
 
+  child.stderr?.on("error", (err) => {
+    log.error(`gog stderr error: ${String(err)}`);
+  });
   child.stderr?.on("data", (data: Buffer) => {
-    const line = data.toString().trim();
+    const chunk = data.toString();
+    // Classify before truncation so a marker completed across the retention boundary survives.
+    const combined = stderrTail + chunk;
+    if (!addressInUse && isAddressInUseError(combined)) {
+      addressInUse = true;
+    }
+    stderrTail = combined.slice(-GMAIL_WATCHER_STDERR_TAIL_CHARS);
+    const line = chunk.trim();
     if (!line) {
       return;
-    }
-    if (isAddressInUseError(line)) {
-      addressInUse = true;
     }
     log.warn(`[gog] ${line}`);
   });
 
   child.on("error", (err) => {
+    // Failed spawn emits close without a pid; later errors on a running child remain retryable.
+    if (child.pid === undefined) {
+      spawnFailed = true;
+    }
     log.error(`gog process error: ${String(err)}`);
   });
 
-  child.on("exit", (code, signal) => {
+  // `close` follows stdio drain, so late stderr participates in restart classification.
+  child.on("close", (code, signal) => {
+    // If a newer watcher has replaced this child, do not respawn.
+    if (watcherProcess !== null && watcherProcess !== child) {
+      return;
+    }
     if (shuttingDown) {
+      return;
+    }
+    if (spawnFailed) {
+      watcherProcess = null;
       return;
     }
     if (addressInUse) {
@@ -148,7 +147,8 @@ function spawnGogServe(cfg: GmailHookRuntimeConfig): ChildProcess {
     }
     log.warn(`gog exited (code=${code}, signal=${signal}); restarting in 5s`);
     watcherProcess = null;
-    setTimeout(() => {
+    respawnTimeout = setTimeout(() => {
+      respawnTimeout = null;
       if (shuttingDown || !currentConfig) {
         return;
       }
@@ -159,7 +159,99 @@ function spawnGogServe(cfg: GmailHookRuntimeConfig): ChildProcess {
   return child;
 }
 
-export type GmailWatcherStartResult = {
+/**
+ * Signal the gog process tree to exit gracefully (SIGTERM, SIGKILL after 3 s)
+ * and resolve on exit/close/error or a final 8 s safety timeout.
+ */
+function settleProcess(proc: ChildProcess): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    let processSettled = false;
+    let graceElapsed = false;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const settle = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+      }
+      if (finalTimeout) {
+        clearTimeout(finalTimeout);
+      }
+      resolve();
+    };
+    const settleAfterEscalation = () => {
+      processSettled = true;
+      if (graceElapsed) {
+        settle();
+      }
+    };
+    const finalTimeout = setTimeout(() => {
+      if (!settled) {
+        log.warn("gog process did not exit after SIGKILL; giving up");
+        settle();
+      }
+    }, 8_000);
+
+    proc.on("exit", settleAfterEscalation);
+    proc.on("close", settleAfterEscalation);
+    proc.on("error", settleAfterEscalation);
+
+    // killProcessTree sends SIGTERM to the process group (Unix) or uses taskkill /T
+    // (Windows) and escalates to SIGKILL after graceMs, reaching any descendants
+    // spawned by gog that plain proc.kill() would miss.
+    if (typeof proc.pid === "number") {
+      const graceMs = 3_000;
+      killProcessTree(proc.pid, {
+        graceMs,
+        detached: process.platform !== "win32",
+      });
+      // killProcessTree owns escalation but intentionally unrefs its timer.
+      // Keep shutdown referenced until that escalation has had a chance to run.
+      graceTimer = setTimeout(() => {
+        graceElapsed = true;
+        if (processSettled) {
+          settle();
+        }
+      }, graceMs + 25);
+    } else {
+      // pid absent means spawn never started; direct kill clears any lingering state.
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        /* process may not exist */
+      }
+      graceElapsed = true;
+    }
+  });
+}
+
+async function stopPeriodicRenewal(): Promise<void> {
+  if (renewInterval) {
+    clearInterval(renewInterval);
+    renewInterval = null;
+  }
+
+  const renewal = renewalInFlight;
+  const controller = renewalAbortController;
+  if (!renewal) {
+    renewalAbortController = null;
+    return;
+  }
+
+  controller?.abort();
+  await renewal;
+  if (renewalInFlight === renewal) {
+    renewalInFlight = null;
+  }
+  if (renewalAbortController === controller) {
+    renewalAbortController = null;
+  }
+}
+
+type GmailWatcherStartResult = {
   started: boolean;
   reason?: string;
 };
@@ -269,6 +361,29 @@ export async function startGmailWatcher(
   }
   currentConfig = runtimeConfig;
 
+  // Stop any existing watcher before doing async setup so a re-entry
+  // does not orphan the old serve process or leave a dangling timer.
+  // This must run before Tailscale/watch-start to prevent the old
+  // process from exiting and queuing a respawn during async work.
+  if (watcherProcess || renewInterval || renewalInFlight || respawnTimeout) {
+    shuttingDown = true;
+    if (respawnTimeout) {
+      clearTimeout(respawnTimeout);
+      respawnTimeout = null;
+    }
+    await stopPeriodicRenewal();
+    if (watcherProcess) {
+      const oldProcess = watcherProcess;
+      watcherProcess = null;
+      await settleProcess(oldProcess);
+      // Remove lingering spawnGogServe listeners so a late exit (after the
+      // settleProcess timeout) cannot trigger a duplicate respawn while
+      // watcherProcess is null and shuttingDown is false.
+      oldProcess.removeAllListeners();
+    }
+    shuttingDown = false;
+  }
+
   // Set up Tailscale endpoint if needed
   if (runtimeConfig.tailscale.mode !== "off") {
     const cancellation = createGmailWatcherCancellation(options);
@@ -317,14 +432,22 @@ export async function startGmailWatcher(
   }
   shuttingDown = false;
   watcherProcess = spawnGogServe(runtimeConfig);
-
-  // Set up renewal interval
   const renewMs = runtimeConfig.renewEveryMinutes * 60_000;
   renewInterval = setInterval(() => {
-    if (shuttingDown) {
+    if (shuttingDown || renewalInFlight) {
       return;
     }
-    void startGmailWatch(runtimeConfig);
+    const controller = new AbortController();
+    renewalAbortController = controller;
+    const renewal = startGmailWatch(runtimeConfig, { signal: controller.signal }).finally(() => {
+      if (renewalInFlight === renewal) {
+        renewalInFlight = null;
+      }
+      if (renewalAbortController === controller) {
+        renewalAbortController = null;
+      }
+    });
+    renewalInFlight = renewal;
   }, renewMs);
 
   log.info(
@@ -340,31 +463,17 @@ export async function startGmailWatcher(
 export async function stopGmailWatcher(): Promise<void> {
   shuttingDown = true;
 
-  if (renewInterval) {
-    clearInterval(renewInterval);
-    renewInterval = null;
+  if (respawnTimeout) {
+    clearTimeout(respawnTimeout);
+    respawnTimeout = null;
   }
+  await stopPeriodicRenewal();
 
   if (watcherProcess) {
     log.info("stopping gmail watcher");
-    watcherProcess.kill("SIGTERM");
-
-    // Wait a bit for graceful shutdown
-    await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
-        if (watcherProcess) {
-          watcherProcess.kill("SIGKILL");
-        }
-        resolve();
-      }, 3000);
-
-      watcherProcess?.on("exit", () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-    });
-
+    const proc = watcherProcess;
     watcherProcess = null;
+    await settleProcess(proc);
   }
 
   currentConfig = null;

@@ -1,9 +1,10 @@
+// Boundary invariant tests cover plugin boundary rules that must hold across the repo.
 import { spawnSync } from "node:child_process";
 import fs, { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { expectNoReaddirSyncDuring } from "../../test-utils/fs-scan-assertions.js";
 import { listGitTrackedFiles, toRepoRelativePath } from "../../test-utils/repo-files.js";
 
@@ -14,40 +15,36 @@ const tsFilesCache = new Map<string, string[]>();
 const BUNDLED_TYPED_HOOK_REGISTRATION_FILES = [
   "extensions/acpx/index.ts",
   "extensions/active-memory/index.ts",
+  "extensions/clickclack/src/discussions/register.ts",
   "extensions/codex/index.ts",
   "extensions/diffs/src/plugin.ts",
   "extensions/discord/subagent-hooks-api.ts",
   "extensions/feishu/subagent-hooks-api.ts",
   "extensions/matrix/subagent-hooks-api.ts",
+  "extensions/memory-core/index.ts",
   "extensions/memory-core/src/dreaming.ts",
   "extensions/memory-lancedb/index.ts",
-  "extensions/skill-workshop/index.ts",
-  "extensions/thread-ownership/index.ts",
+  "extensions/onepassword/index.ts",
+  "extensions/workboard/index.ts",
 ] as const;
 const BUNDLED_TYPED_HOOK_REGISTRATION_GUARDS = {
   "extensions/acpx/index.ts": ["reply_dispatch"],
-  "extensions/active-memory/index.ts": ["before_prompt_build"],
-  "extensions/codex/index.ts": ["inbound_claim"],
+  "extensions/active-memory/index.ts": ["agent_end", "before_prompt_build"],
+  "extensions/clickclack/src/discussions/register.ts": ["before_tool_call"],
+  "extensions/codex/index.ts": ["after_compaction", "inbound_claim", "session_end"],
   "extensions/diffs/src/plugin.ts": ["before_prompt_build"],
   "extensions/discord/subagent-hooks-api.ts": [
+    "gateway_start",
     "subagent_delivery_target",
     "subagent_ended",
-    "subagent_spawning",
   ],
-  "extensions/feishu/subagent-hooks-api.ts": [
-    "subagent_delivery_target",
-    "subagent_ended",
-    "subagent_spawning",
-  ],
-  "extensions/matrix/subagent-hooks-api.ts": [
-    "subagent_delivery_target",
-    "subagent_ended",
-    "subagent_spawning",
-  ],
+  "extensions/feishu/subagent-hooks-api.ts": ["subagent_delivery_target", "subagent_ended"],
+  "extensions/matrix/subagent-hooks-api.ts": ["subagent_delivery_target", "subagent_ended"],
   "extensions/memory-core/src/dreaming.ts": ["before_agent_reply", "gateway_start", "gateway_stop"],
+  "extensions/memory-core/index.ts": ["before_agent_reply", "before_prompt_build"],
   "extensions/memory-lancedb/index.ts": ["agent_end", "before_prompt_build", "session_end"],
-  "extensions/skill-workshop/index.ts": ["agent_end", "before_prompt_build"],
-  "extensions/thread-ownership/index.ts": ["message_received", "message_sending"],
+  "extensions/onepassword/index.ts": ["before_tool_call", "tool_result_persist"],
+  "extensions/workboard/index.ts": ["agent_end", "gateway_start", "gateway_stop", "subagent_ended"],
 } as const satisfies Record<
   (typeof BUNDLED_TYPED_HOOK_REGISTRATION_FILES)[number],
   readonly string[]
@@ -62,15 +59,15 @@ const BUNDLED_LIVE_CONFIG_HOOK_GUARDS = {
   ],
   "extensions/memory-core/src/dreaming.ts": [
     'params.reason === "runtime"',
-    "resolveMemoryCorePluginConfig(startupCfg)",
+    "resolveMemoryDreamingPluginConfig(startupCfg)",
     "api.runtime.config?.current?.() ?? api.config",
   ],
   "extensions/memory-lancedb/index.ts": ["resolveLivePluginConfigObject(", '"memory-lancedb"'],
-  "extensions/skill-workshop/index.ts": ["resolveLivePluginConfigObject(", '"skill-workshop"'],
-  "extensions/thread-ownership/index.ts": [
+  "extensions/onepassword/index.ts": [
     "resolveLivePluginConfigObject(",
-    '"thread-ownership"',
-    "api.runtime.config?.current?.() ?? api.config",
+    "resolveEffectiveEnableState(",
+    '"onepassword"',
+    "api.runtime.config?.current",
   ],
 } as const satisfies Record<string, readonly string[]>;
 const BUNDLED_LIVE_CONFIG_PROVIDER_GUARDS = {
@@ -78,17 +75,13 @@ const BUNDLED_LIVE_CONFIG_PROVIDER_GUARDS = {
     "resolvePluginConfigObject(",
     "const startupPluginConfig = (api.pluginConfig ?? {})",
     "const currentPluginConfig = resolveCurrentPluginConfig(ctx.config);",
-    "const currentGuardrail = resolveCurrentPluginConfig(config)?.guardrail;",
+    "const currentPluginConfig = resolveCurrentPluginConfig(config);",
+    "const currentGuardrail = currentPluginConfig?.guardrail;",
   ],
   "extensions/amazon-bedrock-mantle/register.sync.runtime.ts": [
     "resolvePluginConfigObject(",
     "const startupPluginConfig = (api.pluginConfig ?? {})",
     "const currentPluginConfig = resolveCurrentPluginConfig(ctx.config);",
-  ],
-  "extensions/codex/provider.ts": [
-    "resolvePluginConfigObject(",
-    "const runtimePluginConfig = resolvePluginConfigObject(ctx.config, CODEX_PROVIDER_ID);",
-    "const pluginConfig = runtimePluginConfig ?? (ctx.config ? undefined : options.pluginConfig);",
   ],
   "extensions/github-copilot/index.ts": [
     "resolvePluginConfigObject(",
@@ -109,10 +102,6 @@ const BUNDLED_LIVE_CONFIG_PROVIDER_GUARDS = {
 } as const satisfies Record<string, readonly string[]>;
 const BUNDLED_STARTUP_GATED_HOOK_FORBIDDEN_SNIPPETS = {
   "extensions/memory-lancedb/index.ts": ["if (cfg.autoRecall)", "if (cfg.autoCapture)"],
-  "extensions/skill-workshop/index.ts": [
-    "if (!startupConfig.enabled)",
-    'if (startupConfig.autoCapture && startupConfig.reviewMode !== "off")',
-  ],
 } as const satisfies Record<string, readonly string[]>;
 
 type FileFilter = {
@@ -270,7 +259,7 @@ function collectBundledExtensionImports(source: string): string[] {
   }
 
   visit(sourceFile);
-  return specifiers.filter((specifier) => specifier.includes("extensions/"));
+  return specifiers.filter((specifier) => /(?:^|\/)extensions\/[^/]+\//u.test(specifier));
 }
 
 function isBundledExtensionImportHelperCall(expression: ts.Expression): boolean {
@@ -293,6 +282,22 @@ function collectTypedHookNames(source: string): string[] {
 }
 
 describe("plugin contract boundary invariants", () => {
+  let bundledCapabilityMetadataOffenders: string[];
+
+  beforeAll(() => {
+    const files = listTsFiles("src");
+    bundledCapabilityMetadataOffenders = files.filter((file) => {
+      if (
+        file === "src/plugins/contracts/boundary-invariants.test.ts" ||
+        file.endsWith(".contract.test.ts") ||
+        file.endsWith("-capability-metadata.test.ts")
+      ) {
+        return false;
+      }
+      return readRepoSource(file).includes("contracts/inventory/bundled-capability-metadata");
+    });
+  });
+
   it("lists boundary invariant source files without walking roots in-process", () => {
     try {
       expectNoReaddirSyncDuring(() => {
@@ -309,18 +314,7 @@ describe("plugin contract boundary invariants", () => {
   });
 
   it("keeps bundled-capability-metadata confined to contract/test inventory", () => {
-    const files = listTsFiles("src");
-    const offenders = files.filter((file) => {
-      if (
-        file === "src/plugins/contracts/boundary-invariants.test.ts" ||
-        file.endsWith(".contract.test.ts") ||
-        file.endsWith("-capability-metadata.test.ts")
-      ) {
-        return false;
-      }
-      return readRepoSource(file).includes("contracts/inventory/bundled-capability-metadata");
-    });
-    expect(offenders).toStrictEqual([]);
+    expect(bundledCapabilityMetadataOffenders).toStrictEqual([]);
   });
 
   it("keeps the bundled contract inventory out of non-test runtime code", () => {
@@ -379,12 +373,6 @@ describe("plugin contract boundary invariants", () => {
       const source = readRepoSource(file);
       return /extensions\/\$\{|\.\.\/\.\.\/\.\.\/\.\.\/extensions\//u.test(source);
     });
-    expect(offenders).toStrictEqual([]);
-  });
-
-  it("keeps bundled plugin production code off legacy before_agent_start hooks", () => {
-    const files = listTsFiles("extensions", { excludeTests: true });
-    const offenders = files.filter((file) => readRepoSource(file).includes("before_agent_start"));
     expect(offenders).toStrictEqual([]);
   });
 

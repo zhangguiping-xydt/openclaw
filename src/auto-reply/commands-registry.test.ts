@@ -1,9 +1,6 @@
+/** Tests command registry definitions, native specs, aliases, and argument menus. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  pinActivePluginChannelRegistry,
-  resetPluginRuntimeStateForTest,
-  setActivePluginRegistry,
-} from "../plugins/runtime.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import {
   buildCommandText,
@@ -15,14 +12,16 @@ import {
   listChatCommandsForConfig,
   listNativeCommandSpecs,
   listNativeCommandSpecsForConfig,
+  mergeNativeCommandSpecs,
   normalizeCommandBody,
   parseCommandArgs,
   resolveCommandArgChoices,
   resolveCommandArgMenu,
+  resolveTextCommand,
   serializeCommandArgs,
   shouldHandleTextCommands,
 } from "./commands-registry.js";
-import type { ChatCommandDefinition } from "./commands-registry.types.js";
+import type { ChatCommandDefinition, NativeCommandSpec } from "./commands-registry.types.js";
 
 type NativeCommandNameResolver = (params: { commandKey: string; defaultName: string }) => string;
 
@@ -146,10 +145,7 @@ function requireNativeCommand(name: string, provider?: string): ChatCommandDefin
   return command;
 }
 
-function requireNativeSpec(
-  specs: readonly { name: string; acceptsArgs?: boolean; descriptionLocalizations?: unknown }[],
-  name: string,
-) {
+function requireNativeSpec(specs: readonly NativeCommandSpec[], name: string) {
   const spec = specs.find((candidate) => candidate.name === name);
   if (!spec) {
     throw new Error(`Expected native command spec "${name}"`);
@@ -193,6 +189,7 @@ function requireSeenChoice(
   seen: {
     provider?: string;
     model?: string;
+    agentRuntime?: string;
     catalogLength?: number;
     commandKey: string;
     argName: string;
@@ -218,10 +215,39 @@ describe("commands registry", () => {
       "help",
       "stop",
       "skill",
+      "learn",
       "tasks",
       "whoami",
       "compact",
     ]);
+  });
+
+  it("registers /login natively for Discord, Slack, and Telegram", () => {
+    const command = requireChatCommand("login");
+    expect(command.textAliases).toEqual(["/login"]);
+    expect(command.nativeName).toBe("login");
+    expect(command.nativeProviders).toEqual(["discord", "slack", "telegram"]);
+
+    expect(nativeNameSet(listNativeCommandSpecs()).has("login")).toBe(false);
+    for (const provider of ["discord", "slack"] as const) {
+      setActivePluginRegistry(createNativeCommandsRegistry(provider));
+      expect(nativeNameSet(listNativeCommandSpecs({ provider })).has("login")).toBe(true);
+      expect(
+        findCommandByNativeName("login", provider, {
+          includeBundledChannelFallback: false,
+        })?.key,
+      ).toBe("login");
+    }
+    expect(
+      findCommandByNativeName("login", "telegram", {
+        includeBundledChannelFallback: false,
+      })?.key,
+    ).toBe("login");
+    expect(
+      findCommandByNativeName("login", "signal", {
+        includeBundledChannelFallback: false,
+      }),
+    ).toBeUndefined();
   });
 
   it("exposes /side as a BTW text and native alias", () => {
@@ -231,7 +257,72 @@ describe("commands registry", () => {
     expect(btw.textAliases).toEqual(["/btw", "/side"]);
     expect(normalizeCommandBody("/side what changed?")).toBe("/btw what changed?");
     expect(requireNativeCommand("side").key).toBe("btw");
-    expect(requireNativeSpec(listNativeCommandSpecs(), "side").acceptsArgs).toBe(true);
+    const sideNativeSpec = requireNativeSpec(listNativeCommandSpecs(), "side");
+    expect(sideNativeSpec.acceptsArgs).toBe(true);
+    expect(sideNativeSpec.isAlias).toBe(true);
+  });
+
+  it("matches text command names case-insensitively without changing args", () => {
+    expect(normalizeCommandBody("/STATUS")).toBe("/status");
+    expect(normalizeCommandBody("/Model OpenAI-Codex/GPT-5.5")).toBe("/model OpenAI-Codex/GPT-5.5");
+    expect(normalizeCommandBody("/T HIGH")).toBe("/think HIGH");
+
+    expect(resolveTextCommand("/COMPACT Keep CaseSensitivePath")?.command.key).toBe("compact");
+    expect(resolveTextCommand("/COMPACT Keep CaseSensitivePath")?.args).toBe(
+      "Keep CaseSensitivePath",
+    );
+  });
+
+  it("preserves multiline payloads for skill slash commands", () => {
+    expect(normalizeCommandBody("/skill demo_skill first line\nsecond line")).toBe(
+      "/skill demo_skill first line\nsecond line",
+    );
+    expect(
+      normalizeCommandBody("/skill@openclaw: demo_skill first line\nsecond line", {
+        botUsername: "openclaw",
+      }),
+    ).toBe("/skill demo_skill first line\nsecond line");
+    expect(resolveTextCommand("/skill demo_skill first line\nsecond line")?.args).toBe(
+      "demo_skill first line\nsecond line",
+    );
+  });
+
+  it("registers /learn as a standard tools command with optional free text", () => {
+    const learn = requireChatCommand("learn");
+    expect(learn.nativeName).toBe("learn");
+    expect(learn.textAliases).toEqual(["/learn"]);
+    expect(learn.category).toBe("tools");
+    expect(learn.tier).toBe("standard");
+    expect(learn.acceptsArgs).toBe(true);
+    expect(requireCommandArg(learn, "request").required).not.toBe(true);
+    expect(normalizeCommandBody("/learn first line\nsecond line")).toBe(
+      "/learn first line\nsecond line",
+    );
+    expect(resolveTextCommand("/learn first line\nsecond line")?.args).toBe(
+      "first line\nsecond line",
+    );
+  });
+
+  it("registers /loop as a standard tools command with an optional spec", () => {
+    const loop = requireChatCommand("loop");
+    expect(loop.nativeName).toBe("loop");
+    expect(loop.textAliases).toEqual(["/loop"]);
+    expect(loop.category).toBe("tools");
+    expect(loop.tier).toBe("standard");
+    expect(loop.acceptsArgs).toBe(true);
+    expect(requireCommandArg(loop, "spec").required).not.toBe(true);
+    expect(resolveTextCommand("/loop 5m check ci")?.args).toBe("5m check ci");
+  });
+
+  it("preserves multiline payloads for direct skill slash aliases only when unregistered", () => {
+    expect(normalizeCommandBody("/demo_skill first line\nsecond line")).toBe(
+      "/demo_skill first line\nsecond line",
+    );
+    expect(normalizeCommandBody("/reset soft\nre-read persona files")).toBe(
+      "/reset soft re-read persona files",
+    );
+    expect(normalizeCommandBody("/side first line\nsecond line")).toBe("/btw first line");
+    expect(normalizeCommandBody("/id\nignored")).toBe("/whoami");
   });
 
   it("filters commands based on config flags", () => {
@@ -289,6 +380,47 @@ describe("commands registry", () => {
     expect(requireNativeSpec(native, "demo_skill").descriptionLocalizations).toEqual({
       ko: "데모 스킬",
     });
+  });
+
+  it("merges native command specs with primary precedence and stable secondary order", () => {
+    const primary: readonly NativeCommandSpec[] = [
+      { name: " Primary ", description: "primary", acceptsArgs: false },
+      { name: "", description: "blank primary", acceptsArgs: false },
+      { name: "PRIMARY", description: "duplicate primary", acceptsArgs: false },
+    ];
+    const acceptedSecondary: NativeCommandSpec = {
+      name: "Secondary",
+      description: "secondary",
+      descriptionLocalizations: { de: "Sekundär" },
+      acceptsArgs: true,
+      args: [{ name: "value", description: "value", type: "string" }],
+      isAlias: true,
+    };
+    const secondary: readonly NativeCommandSpec[] = [
+      { name: "primary", description: "primary collision", acceptsArgs: false },
+      { name: " ", description: "blank secondary", acceptsArgs: false },
+      acceptedSecondary,
+      { name: " secondary ", description: "secondary collision", acceptsArgs: false },
+      { name: "third", description: "third", acceptsArgs: false },
+    ];
+    const primaryBefore = structuredClone(primary);
+    const secondaryBefore = structuredClone(secondary);
+    const collisions: string[] = [];
+
+    const merged = mergeNativeCommandSpecs({
+      primary,
+      secondary,
+      onCollision: (name) => collisions.push(name),
+    });
+
+    expect(merged).toEqual([primary[0], acceptedSecondary, secondary[4]]);
+    expect(merged).not.toBe(primary);
+    expect(merged[0]).toBe(primary[0]);
+    expect(merged[1]).toBe(acceptedSecondary);
+    expect(merged[2]).toBe(secondary[4]);
+    expect(collisions).toEqual(["primary", "secondary"]);
+    expect(primary).toEqual(primaryBefore);
+    expect(secondary).toEqual(secondaryBefore);
   });
 
   it("applies discord native command overrides", () => {
@@ -409,13 +541,47 @@ describe("commands registry", () => {
     expect(fast.textAliases).toEqual(["/fast"]);
     expect(fast.category).toBe("options");
     const modeArg = requireCommandArg(fast, "mode");
-    expect(modeArg.choices).toEqual(["status", "on", "off", "default"]);
+    expect(typeof modeArg.choices).toBe("function");
+    const menu = requireCommandArgMenu({
+      command: fast,
+      args: undefined,
+      cfg: {
+        agents: {
+          defaults: {
+            model: "openai-codex/gpt-5.5",
+            models: {
+              "openai-codex/gpt-5.5": {
+                params: { fastMode: "auto", fastAutoOnSeconds: 30 },
+              },
+            },
+          },
+        },
+      } as never,
+      provider: "openai-codex",
+      model: "gpt-5.5",
+    });
+    expect(menu.choices).toEqual([
+      { label: "on", value: "on" },
+      { label: "off", value: "off" },
+      { label: "auto (30 sec)", value: "auto" },
+      { label: "default", value: "default" },
+      { label: "status", value: "status" },
+    ]);
+  });
+
+  it("scopes configured-default wording to direct model selections", () => {
+    const model = requireChatCommand("model");
+    expect(model.description).toBe(
+      "Show or set the model; direct owner/admin selections request a default update.",
+    );
   });
 
   it("detects known text commands", () => {
     const detection = getCommandDetection();
     expect(detection.exact.has("/commands")).toBe(true);
     expect(detection.exact.has("/skill")).toBe(true);
+    expect(detection.exact.has("/learn")).toBe(true);
+    expect(detection.exact.has("/loop")).toBe(true);
     expect(detection.exact.has("/compact")).toBe(true);
     expect(detection.exact.has("/whoami")).toBe(true);
     expect(detection.exact.has("/id")).toBe(true);
@@ -474,61 +640,6 @@ describe("commands registry", () => {
     ).toBe(true);
   });
 
-  it("refreshes dock commands when pinned-empty fallback active registry changes", () => {
-    const pinnedEmptyRegistry = createTestRegistry([]);
-    setActivePluginRegistry(pinnedEmptyRegistry);
-    pinActivePluginChannelRegistry(pinnedEmptyRegistry);
-
-    setActivePluginRegistry(createNativeCommandsRegistry("discord"));
-    const discordCommandKeys = commandKeySet(listChatCommands());
-    expect(discordCommandKeys.has("dock:discord")).toBe(true);
-    expect(discordCommandKeys.has("dock:slack")).toBe(false);
-
-    setActivePluginRegistry(createNativeCommandsRegistry("slack"));
-    const slackCommandKeys = commandKeySet(listChatCommands());
-    expect(slackCommandKeys.has("dock:discord")).toBe(false);
-    expect(slackCommandKeys.has("dock:slack")).toBe(true);
-  });
-
-  it("refreshes text-command gating when pinned-empty fallback active registry changes", () => {
-    const cfg = { commands: { text: false } };
-    const pinnedEmptyRegistry = createTestRegistry([]);
-    setActivePluginRegistry(pinnedEmptyRegistry);
-    pinActivePluginChannelRegistry(pinnedEmptyRegistry);
-
-    setActivePluginRegistry(createNativeCommandsRegistry("discord"));
-    expect(
-      shouldHandleTextCommands({
-        cfg,
-        surface: "discord",
-        commandSource: "text",
-      }),
-    ).toBe(false);
-    expect(
-      shouldHandleTextCommands({
-        cfg,
-        surface: "slack",
-        commandSource: "text",
-      }),
-    ).toBe(true);
-
-    setActivePluginRegistry(createNativeCommandsRegistry("slack"));
-    expect(
-      shouldHandleTextCommands({
-        cfg,
-        surface: "discord",
-        commandSource: "text",
-      }),
-    ).toBe(true);
-    expect(
-      shouldHandleTextCommands({
-        cfg,
-        surface: "slack",
-        commandSource: "text",
-      }),
-    ).toBe(false);
-  });
-
   it("normalizes telegram-style command mentions for the current bot", () => {
     expect(normalizeCommandBody("/help@openclaw", { botUsername: "openclaw" })).toBe("/help");
     expect(
@@ -547,6 +658,21 @@ describe("commands registry", () => {
     expect(normalizeCommandBody("/help@otherbot", { botUsername: "openclaw" })).toBe(
       "/help@otherbot",
     );
+  });
+
+  it("normalizes targeted command bodies before bot identity only when requested", () => {
+    expect(
+      normalizeCommandBody("/help@unresolved_bot", {
+        targetedCommandMode: "pre-identity",
+      }),
+    ).toBe("/help");
+    expect(normalizeCommandBody("/help@unresolved_bot")).toBe("/help@unresolved_bot");
+    expect(
+      normalizeCommandBody("/help@some_other_bot", {
+        botUsername: "openclaw_bot",
+        targetedCommandMode: "pre-identity",
+      }),
+    ).toBe("/help@some_other_bot");
   });
 
   it("keeps unregistered dock underscore aliases unchanged", () => {
@@ -653,6 +779,7 @@ describe("commands registry args", () => {
     let seen: {
       provider?: string;
       model?: string;
+      agentRuntime?: string;
       catalogLength?: number;
       commandKey: string;
       argName: string;
@@ -670,12 +797,13 @@ describe("commands registry args", () => {
           name: "level",
           description: "level",
           type: "string",
-          choices: ({ provider, model, catalog, command, arg }) => {
+          choices: ({ provider, model, agentRuntime, catalog, command: commandLocal, arg }) => {
             seen = {
               provider,
               model,
+              agentRuntime,
               catalogLength: catalog?.length,
-              commandKey: command.key,
+              commandKey: commandLocal.key,
               argName: arg.name,
             };
             return ["low", "high"];
@@ -684,7 +812,12 @@ describe("commands registry args", () => {
       ],
     };
 
-    const menu = requireCommandArgMenu({ command, args: undefined, cfg: {} as never });
+    const menu = requireCommandArgMenu({
+      command,
+      args: undefined,
+      cfg: {} as never,
+      agentRuntime: "codex",
+    });
     expect(menu.arg.name).toBe("level");
     expect(menu.choices).toEqual([
       { label: "low", value: "low" },
@@ -700,27 +833,63 @@ describe("commands registry args", () => {
     expect(seenChoice.provider?.trim().length).toBeGreaterThan(0);
     expect(typeof seenChoice.model).toBe("string");
     expect(seenChoice.model?.trim().length).toBeGreaterThan(0);
+    expect(seenChoice.agentRuntime).toBe("codex");
     expect(seenChoice.catalogLength).toBe(0);
   });
 
-  it("uses configured model catalog reasoning for /think arg menus", () => {
-    installOllamaThinkingProvider();
-    const command = requireNativeCommand("think");
+  it.each([
+    { model: "gpt-5.6-sol", agentRuntime: "codex", supportsUltra: true },
+    { model: "gpt-5.6-terra", agentRuntime: "codex", supportsUltra: true },
+    { model: "gpt-5.6-luna", agentRuntime: "codex", supportsUltra: false },
+    { model: "gpt-5.6-luna", agentRuntime: "openclaw", supportsUltra: true },
+  ])(
+    "uses the $agentRuntime thinking profile for openai/$model native menus",
+    ({ model, agentRuntime, supportsUltra }) => {
+      const command = requireNativeCommand("think");
+      const menu = requireCommandArgMenu({
+        command,
+        args: undefined,
+        cfg: {} as never,
+        provider: "openai",
+        model,
+        agentRuntime,
+      });
 
-    const menu = requireCommandArgMenu({
-      command,
-      args: undefined,
+      expect(menu.choices.some((choice) => choice.value === "ultra")).toBe(supportsUltra);
+    },
+  );
+
+  it.each([
+    {
+      source: "configured",
       cfg: {
         models: {
           providers: {
             ollama: {
-              models: [{ id: "glm-5.1:cloud", name: "GLM 5.1 Cloud", reasoning: true }],
+              models: [{ id: "glm-5.2:cloud", name: "GLM 5.2 Cloud", reasoning: true }],
             },
           },
         },
-      } as never,
+      },
+      catalog: undefined,
+    },
+    {
+      source: "runtime",
+      cfg: { agents: { defaults: { models: { "ollama/*": {} } } } },
+      catalog: [
+        { provider: "ollama", id: "glm-5.2:cloud", name: "GLM 5.2 Cloud", reasoning: true },
+      ],
+    },
+  ])("uses $source model catalog reasoning for /think arg menus", ({ cfg, catalog }) => {
+    installOllamaThinkingProvider();
+    const command = requireNativeCommand("think");
+    const menu = requireCommandArgMenu({
+      command,
+      args: undefined,
+      cfg: cfg as never,
       provider: "ollama",
-      model: "glm-5.1:cloud",
+      model: "glm-5.2:cloud",
+      catalog,
     });
 
     expect(menu.arg.name).toBe("level");

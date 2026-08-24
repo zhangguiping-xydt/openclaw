@@ -1,6 +1,15 @@
+/**
+ * Shared transport lifecycle helpers for stdio and WebSocket Codex app-server
+ * connections.
+ */
+import { terminateCodexAppServerDescendants } from "./transport-process-containment.js";
+
+const CODEX_APP_SERVER_TRANSPORT_CLOSES = new WeakMap<object, Promise<void>>();
+
+/** Child-process-like transport shape consumed by the Codex app-server client. */
 export type CodexAppServerTransport = {
   stdin: {
-    write: (data: string, callback?: (error?: Error | null) => void) => unknown;
+    write: (data: string | Uint8Array, callback?: (error?: Error | null) => void) => unknown;
     end?: () => unknown;
     destroy?: () => unknown;
     unref?: () => unknown;
@@ -24,12 +33,55 @@ export type CodexAppServerTransport = {
   off?: (event: string, listener: (...args: unknown[]) => void) => unknown;
 };
 
+/** Starts graceful transport shutdown and schedules a force kill fallback. */
 export function closeCodexAppServerTransport(
   child: CodexAppServerTransport,
   options: { forceKillDelayMs?: number } = {},
 ): void {
-  child.stdin.end?.();
-  child.stdin.destroy?.();
+  void beginCodexAppServerTransportClose(child, options);
+}
+
+function beginCodexAppServerTransportClose(
+  child: CodexAppServerTransport,
+  options: { forceKillDelayMs?: number },
+): Promise<void> {
+  const current = CODEX_APP_SERVER_TRANSPORT_CLOSES.get(child);
+  if (current) {
+    return current;
+  }
+  if (
+    process.platform === "win32" ||
+    !child.pid ||
+    !child.kill ||
+    hasCodexAppServerTransportExited(child)
+  ) {
+    finishCodexAppServerTransportClose(child, options);
+    const completed = Promise.resolve();
+    CODEX_APP_SERVER_TRANSPORT_CLOSES.set(child, completed);
+    return completed;
+  }
+  const closing = (async () => {
+    let resumeRoot: (() => void) | undefined;
+    try {
+      resumeRoot = await terminateCodexAppServerDescendants(child);
+    } catch {
+      resumeRoot = undefined;
+    }
+    try {
+      finishCodexAppServerTransportClose(child, options, resumeRoot);
+    } catch {
+      signalCodexAppServerTransport(child, "SIGKILL");
+    }
+  })();
+  CODEX_APP_SERVER_TRANSPORT_CLOSES.set(child, closing);
+  return closing;
+}
+
+function finishCodexAppServerTransportClose(
+  child: CodexAppServerTransport,
+  options: { forceKillDelayMs?: number },
+  resumeRoot?: () => void,
+): void {
   const forceKillDelayMs = options.forceKillDelayMs ?? 1_000;
   const forceKill = setTimeout(
     () => {
@@ -46,18 +98,25 @@ export function closeCodexAppServerTransport(
     child.stdout.destroy?.();
     child.stderr.destroy?.();
   });
+  try {
+    child.stdin.end?.();
+    child.stdin.destroy?.();
+  } finally {
+    resumeRoot?.();
+  }
   child.unref?.();
   child.stdout.unref?.();
   child.stderr.unref?.();
   child.stdin.unref?.();
 }
 
+/** Closes a transport and waits briefly for an exit event. */
 export async function closeCodexAppServerTransportAndWait(
   child: CodexAppServerTransport,
   options: { exitTimeoutMs?: number; forceKillDelayMs?: number } = {},
 ): Promise<boolean> {
   if (!hasCodexAppServerTransportExited(child)) {
-    closeCodexAppServerTransport(child, options);
+    await beginCodexAppServerTransportClose(child, options);
   }
   return await waitForCodexAppServerTransportExit(child, options.exitTimeoutMs ?? 2_000);
 }

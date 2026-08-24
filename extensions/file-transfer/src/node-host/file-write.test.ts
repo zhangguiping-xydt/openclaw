@@ -1,8 +1,9 @@
+// File Transfer tests cover file write plugin behavior.
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleFileWrite } from "./file-write.js";
 
 let tmpRoot: string;
@@ -163,7 +164,7 @@ describe("handleFileWrite — parent directory handling", () => {
 });
 
 describe("handleFileWrite — symlink protection", () => {
-  it("refuses to write through an existing symlink (lstat)", async () => {
+  it("rejects a final symlink by default with the canonical target", async () => {
     const real = path.join(tmpRoot, "real.txt");
     const link = path.join(tmpRoot, "link.txt");
     await fs.writeFile(real, "untouched");
@@ -174,8 +175,24 @@ describe("handleFileWrite — symlink protection", () => {
       contentBase64: b64("evil"),
       overwrite: true,
     });
+    expectFailure(r, "SYMLINK_REDIRECT");
+    expect(r.ok ? null : r.canonicalPath).toBe(real);
+    expect(await fs.readFile(real, "utf-8")).toBe("untouched");
+  });
+
+  it("refuses to write through a final symlink when followSymlinks=true", async () => {
+    const real = path.join(tmpRoot, "real.txt");
+    const link = path.join(tmpRoot, "link.txt");
+    await fs.writeFile(real, "untouched");
+    await fs.symlink(real, link);
+
+    const r = await handleFileWrite({
+      path: link,
+      contentBase64: b64("evil"),
+      overwrite: true,
+      followSymlinks: true,
+    });
     expectFailure(r, "SYMLINK_TARGET_DENIED");
-    // The original file must be unchanged.
     expect(await fs.readFile(real, "utf-8")).toBe("untouched");
   });
 
@@ -359,6 +376,19 @@ describe("handleFileWrite — base64 round-trip validation", () => {
     // Buffer.from([0xfb, 0xff]) -> "+/8=" standard, "-_8=" url
     const r = await handleFileWrite({ path: target, contentBase64: "-_8=" });
     expect(r.ok).toBe(true);
+  });
+
+  it("rejects whitespace and control characters before decoding", async () => {
+    const bufferFrom = vi.spyOn(Buffer, "from");
+    const target = path.join(tmpRoot, "whitespace.bin");
+    const r = await handleFileWrite({
+      path: target,
+      contentBase64: " \n\t".repeat(1024 * 1024),
+    });
+
+    expectFailure(r, "INVALID_BASE64");
+    expect(bufferFrom).not.toHaveBeenCalled();
+    await expectAccessMissing(target);
   });
 });
 

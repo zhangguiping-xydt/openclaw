@@ -1,47 +1,88 @@
-import fs from "node:fs";
+// Telegram plugin module implements message cache behavior.
 import type { Message } from "grammy/types";
 import { formatLocationText } from "openclaw/plugin-sdk/channel-inbound";
+import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
 import type { MsgContext } from "openclaw/plugin-sdk/reply-runtime";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
-import { appendRegularFileSync, replaceFileAtomicSync } from "openclaw/plugin-sdk/security-runtime";
-import { resolveTelegramPrimaryMedia } from "./bot/body-helpers.js";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  resolveTelegramPrimaryMedia,
+  resolveTelegramRichMessageBody,
+  type TelegramMediaKind,
+} from "./bot/body-helpers.js";
 import {
   buildSenderName,
   extractTelegramLocation,
   getTelegramTextParts,
   normalizeForwardedContext,
+  type TelegramThreadSpec,
 } from "./bot/helpers.js";
+import {
+  isTelegramMessageCacheSourceMessage,
+  parseTelegramResolvedMedia,
+  type PersistedTelegramMessageCacheValue,
+  type TelegramResolvedMedia,
+  resolveTelegramMessageCachePersistentScopeKey,
+  TELEGRAM_MESSAGE_CACHE_PERSISTENT_MAX_MESSAGES,
+  TELEGRAM_MESSAGE_CACHE_PERSISTENT_NAMESPACE,
+  TELEGRAM_MESSAGE_CACHE_PERSISTED_VERSION,
+  type TelegramMessageThreadBinding,
+} from "./message-cache-persistence.js";
+import { parseTelegramMessageThreadId } from "./outbound-params.js";
+import {
+  parseTelegramPromptContextProjection,
+  type TelegramPromptContextProjection,
+  type TelegramPromptContextProjectionMarker,
+} from "./prompt-context-projection.js";
+import { getOptionalTelegramRuntime } from "./runtime.js";
 
-export type TelegramReplyChainEntry = NonNullable<MsgContext["ReplyChain"]>[number];
-
-export type TelegramCachedMessageNode = TelegramReplyChainEntry & {
-  sourceMessage: Message;
+export type TelegramReplyChainEntry = NonNullable<MsgContext["ReplyChain"]>[number] & {
+  mediaKind?: TelegramMediaKind;
 };
 
-export type TelegramConversationContextNode = {
+export type TelegramCachedMessageNode = Omit<TelegramReplyChainEntry, "messageId"> & {
+  messageId: string;
+  resolvedMedia?: TelegramResolvedMedia;
+  sourceMessage: Message;
+  promptContextProjectionMarker?: TelegramPromptContextProjectionMarker;
+  threadBinding?: TelegramMessageThreadBinding;
+};
+
+type TelegramConversationContextNode = {
   node: TelegramCachedMessageNode;
   isReplyTarget?: boolean;
 };
 
-export type TelegramMessageCache = {
+type TelegramMessageCache = {
   record: (params: {
     accountId: string;
     chatId: string | number;
     msg: Message;
+    botUserId?: number;
+    promptContextProjection?: TelegramPromptContextProjection;
+    /** Set only while recording an authenticated provider event or response. */
+    providerObservedThread?: TelegramThreadSpec;
     threadId?: number;
-  }) => TelegramCachedMessageNode | null;
+  }) => Promise<TelegramCachedMessageNode>;
+  recordResolvedMedia: (params: {
+    accountId: string;
+    botUserId?: number;
+    chatId: string | number;
+    messageId: string;
+    media: TelegramResolvedMedia;
+  }) => Promise<void>;
   get: (params: {
     accountId: string;
     chatId: string | number;
     messageId?: string;
-  }) => TelegramCachedMessageNode | null;
+  }) => Promise<TelegramCachedMessageNode | null>;
   recentBefore: (params: {
     accountId: string;
     chatId: string | number;
     messageId?: string;
     threadId?: number;
     limit: number;
-  }) => TelegramCachedMessageNode[];
+  }) => Promise<TelegramCachedMessageNode[]>;
   around: (params: {
     accountId: string;
     chatId: string | number;
@@ -49,18 +90,26 @@ export type TelegramMessageCache = {
     threadId?: number;
     before: number;
     after: number;
-  }) => TelegramCachedMessageNode[];
+  }) => Promise<TelegramCachedMessageNode[]>;
+  latestMatchingAtOrBefore: (params: {
+    accountId: string;
+    chatId: string | number;
+    messageId?: string;
+    threadId?: number;
+    matches: (node: TelegramCachedMessageNode) => boolean;
+  }) => Promise<TelegramCachedMessageNode | null>;
 };
 
 type MessageWithExternalReply = Message & { external_reply?: Message };
+type MessageWithPromptContextTimestamp = Message & {
+  openclaw_prompt_context_timestamp_ms?: unknown;
+};
 
 type TelegramMessageCacheBucket = {
   messages: Map<string, TelegramCachedMessageNode>;
-  persistedEntryCount: number;
-};
-
-type PersistedMessageReadResult = TelegramMessageCacheBucket & {
-  needsRewrite: boolean;
+  hydrated: boolean;
+  hydratePromise?: Promise<void>;
+  persistentStore?: TelegramMessageCachePersistentStore;
 };
 
 type TelegramMessageObservationMode = "authoritative" | "partial";
@@ -73,27 +122,44 @@ type TelegramCachedMessageObservation = {
 type TelegramEmbeddedReplyMessage = NonNullable<Message["reply_to_message"]>;
 
 const DEFAULT_MAX_MESSAGES = 5000;
-const COMPACT_THRESHOLD_RATIO = 2;
-const persistedMessageCacheBuckets = new Map<string, TelegramMessageCacheBucket>();
+const PERSISTENT_BUCKET_KEY = `plugin-state:${TELEGRAM_MESSAGE_CACHE_PERSISTENT_NAMESPACE}`;
+const TELEGRAM_MESSAGE_CACHE_BUCKETS_KEY = Symbol.for("openclaw.telegram.messageCacheBuckets");
 
-export function resetTelegramMessageCacheBucketsForTest(): void {
-  persistedMessageCacheBuckets.clear();
+function getPersistedMessageCacheBuckets(): Map<string, TelegramMessageCacheBucket> {
+  const globalRecord = globalThis as Record<PropertyKey, unknown>;
+  const existing = globalRecord[TELEGRAM_MESSAGE_CACHE_BUCKETS_KEY] as
+    | Map<string, TelegramMessageCacheBucket>
+    | undefined;
+  if (existing) {
+    return existing;
+  }
+  const created = new Map<string, TelegramMessageCacheBucket>();
+  globalRecord[TELEGRAM_MESSAGE_CACHE_BUCKETS_KEY] = created;
+  return created;
 }
 
+type TelegramMessageCachePersistentStore = {
+  register(key: string, value: PersistedTelegramMessageCacheValue): Promise<void>;
+  entries(): Promise<Array<{ key: string; value: unknown }>>;
+};
+
 function telegramMessageCacheKey(params: {
+  scopeKey: string | undefined;
   accountId: string;
   chatId: string | number;
   messageId: string;
 }) {
-  return `${params.accountId}:${params.chatId}:${params.messageId}`;
+  const key = `${params.accountId}:${params.chatId}:${params.messageId}`;
+  return params.scopeKey ? `${params.scopeKey}:${key}` : key;
 }
 
-function telegramMessageCacheKeyPrefix(params: { accountId: string; chatId: string | number }) {
-  return `${params.accountId}:${params.chatId}:`;
-}
-
-export function resolveTelegramMessageCachePath(storePath: string): string {
-  return `${storePath}.telegram-messages.json`;
+function telegramMessageCacheKeyPrefix(params: {
+  scopeKey: string | undefined;
+  accountId: string;
+  chatId: string | number;
+}) {
+  const prefix = `${params.accountId}:${params.chatId}:`;
+  return params.scopeKey ? `${params.scopeKey}:${prefix}` : prefix;
 }
 
 function resolveReplyMessage(msg: Message): Message | undefined {
@@ -105,232 +171,225 @@ function resolveEmbeddedReplyMessage(msg: Message): Message | undefined {
   return msg.reply_to_message;
 }
 
-function resolveMessageBody(msg: Message): string | undefined {
-  const text = getTelegramTextParts(msg).text.trim();
-  if (text) {
-    return text;
+export function isTelegramMessageFromCurrentBot(msg: Message, botUserId?: number): boolean {
+  const currentBotUserId = parseStrictPositiveInteger(botUserId);
+  if (currentBotUserId === undefined) {
+    return msg.from?.is_bot === true;
+  }
+  return msg.from?.id === currentBotUserId || msg.sender_business_bot?.id === currentBotUserId;
+}
+
+function resolveMessageBody(msg: Message, preserveWhitespace: boolean): string | undefined {
+  const text = getTelegramTextParts(msg).text;
+  if (text.trim()) {
+    return preserveWhitespace ? text : text.trim();
   }
   const location = extractTelegramLocation(msg);
   if (location) {
     return formatLocationText(location);
   }
-  return resolveTelegramPrimaryMedia(msg)?.placeholder;
+  return resolveTelegramRichMessageBody(msg);
 }
 
-function resolveMediaType(placeholder?: string): string | undefined {
-  return placeholder?.match(/^<media:([^>]+)>$/)?.[1];
+function resolveMessageTimestamp(msg: Message): number | undefined {
+  const promptContextTimestamp = (msg as MessageWithPromptContextTimestamp)
+    .openclaw_prompt_context_timestamp_ms;
+  return typeof promptContextTimestamp === "number" && Number.isFinite(promptContextTimestamp)
+    ? promptContextTimestamp
+    : msg.date
+      ? msg.date * 1000
+      : undefined;
 }
 
 function normalizeMessageNode(
   msg: Message,
-  params: { threadId?: number },
-): TelegramCachedMessageNode | null {
-  if (typeof msg.message_id !== "number") {
-    return null;
-  }
+  params: {
+    threadId?: number;
+    promptContextProjectionMarker?: TelegramPromptContextProjectionMarker;
+    resolvedMedia?: TelegramResolvedMedia;
+    threadBinding?: TelegramMessageThreadBinding;
+  },
+): TelegramCachedMessageNode {
   const media = resolveTelegramPrimaryMedia(msg);
   const fileId = media?.fileRef.file_id;
   const forwardedFrom = normalizeForwardedContext(msg);
   const replyMessage = resolveReplyMessage(msg);
-  const body = resolveMessageBody(msg);
+  const body = resolveMessageBody(msg, params.promptContextProjectionMarker !== undefined);
+  const threadBinding = normalizeTelegramMessageThreadBinding(params.threadBinding);
+  const threadId = parseTelegramMessageThreadId(threadBinding?.threadSpec.id ?? params.threadId);
+  const timestamp = resolveMessageTimestamp(msg);
   return {
     sourceMessage: msg,
     messageId: String(msg.message_id),
     sender: buildSenderName(msg) ?? "unknown sender",
     ...(msg.from?.id != null ? { senderId: String(msg.from.id) } : {}),
     ...(msg.from?.username ? { senderUsername: msg.from.username } : {}),
-    ...(msg.date ? { timestamp: msg.date * 1000 } : {}),
+    ...(timestamp !== undefined ? { timestamp } : {}),
     ...(body ? { body } : {}),
-    ...(media ? { mediaType: resolveMediaType(media.placeholder) ?? media.placeholder } : {}),
+    ...(media ? { mediaType: media.kind } : {}),
     ...(fileId ? { mediaRef: `telegram:file/${fileId}` } : {}),
     ...(replyMessage?.message_id != null ? { replyToId: String(replyMessage.message_id) } : {}),
     ...(forwardedFrom?.from ? { forwardedFrom: forwardedFrom.from } : {}),
     ...(forwardedFrom?.fromId ? { forwardedFromId: forwardedFrom.fromId } : {}),
     ...(forwardedFrom?.fromUsername ? { forwardedFromUsername: forwardedFrom.fromUsername } : {}),
     ...(forwardedFrom?.date ? { forwardedDate: forwardedFrom.date * 1000 } : {}),
-    ...(params.threadId != null ? { threadId: String(params.threadId) } : {}),
+    ...(threadId !== undefined ? { threadId: String(threadId) } : {}),
+    ...(params.promptContextProjectionMarker
+      ? { promptContextProjectionMarker: params.promptContextProjectionMarker }
+      : {}),
+    ...(params.resolvedMedia ? { resolvedMedia: params.resolvedMedia } : {}),
+    ...(threadBinding ? { threadBinding } : {}),
   };
 }
 
-function normalizeRequiredMessageNode(
-  msg: Message,
-  params: { threadId?: number },
-): TelegramCachedMessageNode {
-  const node = normalizeMessageNode(msg, params);
-  if (!node) {
-    throw new Error("Telegram message cache node missing message id");
+function normalizeTelegramMessageThreadBinding(
+  value: unknown,
+): TelegramMessageThreadBinding | undefined {
+  if (!isRecord(value) || value.kind !== "provider-observed-v1") {
+    return undefined;
   }
-  return node;
+  const threadSpec = value.threadSpec;
+  if (!isRecord(threadSpec)) {
+    return undefined;
+  }
+  const id = parseTelegramMessageThreadId(threadSpec.id);
+  if (
+    id === undefined ||
+    (threadSpec.scope !== "direct-messages" &&
+      threadSpec.scope !== "dm" &&
+      threadSpec.scope !== "forum")
+  ) {
+    return undefined;
+  }
+  return { kind: "provider-observed-v1", threadSpec: { scope: threadSpec.scope, id } };
 }
 
-function resolveMessageThreadId(msg: Message): number | undefined {
-  const threadId = (msg as { message_thread_id?: unknown }).message_thread_id;
-  return typeof threadId === "number" && Number.isFinite(threadId)
-    ? Math.trunc(threadId)
-    : undefined;
+function createTelegramMessageThreadBinding(
+  threadSpec: TelegramThreadSpec | undefined,
+): TelegramMessageThreadBinding | undefined {
+  return normalizeTelegramMessageThreadBinding({ kind: "provider-observed-v1", threadSpec });
+}
+
+export function hasProviderObservedTelegramThreadBinding(
+  node: TelegramCachedMessageNode | null | undefined,
+  threadId: unknown,
+): boolean {
+  const normalizedThreadId = parseTelegramMessageThreadId(threadId);
+  return (
+    normalizedThreadId !== undefined &&
+    resolveProviderObservedTelegramThreadSpec(node)?.id === normalizedThreadId
+  );
+}
+
+export function resolveProviderObservedTelegramThreadSpec(
+  node: TelegramCachedMessageNode | null | undefined,
+): TelegramMessageThreadBinding["threadSpec"] | undefined {
+  return normalizeTelegramMessageThreadBinding(node?.threadBinding)?.threadSpec;
 }
 
 function normalizeMessageNodes(
   msg: Message,
-  params: { threadId?: number },
+  params: {
+    threadId?: number;
+    promptContextProjectionMarker?: TelegramPromptContextProjectionMarker;
+    resolvedMedia?: TelegramResolvedMedia;
+    threadBinding?: TelegramMessageThreadBinding;
+  },
 ): TelegramCachedMessageObservation[] {
   const observations: TelegramCachedMessageObservation[] = [];
   const visited = new Set<string>();
-  const nodeThreadId = (node: TelegramCachedMessageNode) => {
-    const threadId = Number(node.threadId);
-    return Number.isFinite(threadId) ? threadId : undefined;
-  };
+  const nodeThreadId = (node: TelegramCachedMessageNode) =>
+    parseTelegramMessageThreadId(node.threadId);
   const visit = (
     message: Message,
     inheritedThreadId: number | undefined,
     mode: TelegramMessageObservationMode,
+    promptContextProjectionMarker?: TelegramPromptContextProjectionMarker,
+    threadBinding?: TelegramMessageThreadBinding,
+    resolvedMedia?: TelegramResolvedMedia,
   ) => {
+    const embeddedThreadId = parseTelegramMessageThreadId(
+      (message as { message_thread_id?: unknown }).message_thread_id,
+    );
+    const inheritedThread = parseTelegramMessageThreadId(inheritedThreadId);
+    const observedBinding = normalizeTelegramMessageThreadBinding(threadBinding);
+    const threadId =
+      mode === "authoritative"
+        ? (observedBinding?.threadSpec.id ?? inheritedThread ?? embeddedThreadId)
+        : (embeddedThreadId ?? inheritedThread);
+    const matchingBinding =
+      observedBinding?.threadSpec.id === threadId ? observedBinding : undefined;
     const node = normalizeMessageNode(message, {
-      threadId: resolveMessageThreadId(message) ?? inheritedThreadId,
+      ...(threadId !== undefined ? { threadId } : {}),
+      ...(promptContextProjectionMarker ? { promptContextProjectionMarker } : {}),
+      ...(resolvedMedia ? { resolvedMedia } : {}),
+      ...(matchingBinding ? { threadBinding: matchingBinding } : {}),
     });
-    if (!node?.messageId || visited.has(node.messageId)) {
+    if (visited.has(node.messageId)) {
       return;
     }
     visited.add(node.messageId);
     const replyMessage = resolveEmbeddedReplyMessage(message);
     if (replyMessage?.message_id != null) {
-      visit(replyMessage, nodeThreadId(node) ?? inheritedThreadId, "partial");
+      visit(
+        replyMessage,
+        nodeThreadId(node) ?? inheritedThreadId,
+        "partial",
+        undefined,
+        node.threadBinding,
+        undefined,
+      );
     }
     observations.push({ node, mode });
   };
-  visit(msg, params.threadId, "authoritative");
+  visit(
+    msg,
+    params.threadId,
+    "authoritative",
+    params.promptContextProjectionMarker,
+    params.threadBinding,
+    params.resolvedMedia,
+  );
   return observations;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function parseSafeMessageId(value: string | undefined): number | undefined {
+  return value === undefined ? undefined : parseStrictPositiveInteger(value);
 }
 
-function isString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
-
-function readOptionalString(record: Record<string, unknown>, key: string): string | undefined {
-  const value = record[key];
-  return isString(value) ? value : undefined;
-}
-
-function isTelegramSourceMessage(value: unknown): value is Message {
-  return (
-    isRecord(value) &&
-    typeof value.message_id === "number" &&
-    Number.isFinite(value.message_id) &&
-    typeof value.date === "number" &&
-    Number.isFinite(value.date)
-  );
-}
-
-function parsePersistedEntry(value: unknown): Array<{
-  key: string;
-  node: TelegramCachedMessageNode;
-  mode: TelegramMessageObservationMode;
-}> {
-  if (!isRecord(value) || !isString(value.key)) {
-    return [];
-  }
-  const separatorIndex = value.key.lastIndexOf(":");
+function parsePersistedCacheValue(key: string, value: unknown) {
   if (
-    separatorIndex === -1 ||
-    !isRecord(value.node) ||
-    !isTelegramSourceMessage(value.node.sourceMessage)
+    !isRecord(value) ||
+    (value.version !== undefined && value.version !== TELEGRAM_MESSAGE_CACHE_PERSISTED_VERSION)
   ) {
     return [];
   }
-  const keyPrefix = value.key.slice(0, separatorIndex + 1);
-  const threadId = Number(readOptionalString(value.node, "threadId"));
-  const sourceMessageId = String(value.node.sourceMessage.message_id);
-  return normalizeMessageNodes(
-    value.node.sourceMessage,
-    Number.isFinite(threadId) ? { threadId } : {},
-  ).map(({ node, mode }) => ({
-    key: `${keyPrefix}${node.messageId}`,
+  const separatorIndex = key.lastIndexOf(":");
+  if (separatorIndex === -1 || !isTelegramMessageCacheSourceMessage(value.sourceMessage)) {
+    return [];
+  }
+  const threadId = parseTelegramMessageThreadId(value.threadId);
+  const botUserId = parseStrictPositiveInteger(value.botUserId);
+  const promptContextProjectionMarker =
+    value.version === TELEGRAM_MESSAGE_CACHE_PERSISTED_VERSION &&
+    isTelegramMessageFromCurrentBot(value.sourceMessage, botUserId)
+      ? parseTelegramPromptContextProjection(value.promptContextProjection)
+      : undefined;
+  const threadBinding =
+    value.version === TELEGRAM_MESSAGE_CACHE_PERSISTED_VERSION
+      ? normalizeTelegramMessageThreadBinding(value.threadBinding)
+      : undefined;
+  const resolvedMedia = parseTelegramResolvedMedia(value.resolvedMedia);
+  return normalizeMessageNodes(value.sourceMessage, {
+    ...(threadId !== undefined ? { threadId } : {}),
+    ...(promptContextProjectionMarker ? { promptContextProjectionMarker } : {}),
+    ...(threadBinding ? { threadBinding } : {}),
+    ...(resolvedMedia ? { resolvedMedia } : {}),
+  }).map(({ node, mode }) => ({
+    key: `${key.slice(0, separatorIndex + 1)}${node.messageId}`,
     node,
-    mode: node.messageId === sourceMessageId ? "authoritative" : mode,
+    mode,
   }));
-}
-
-function findJsonArrayEnd(text: string): number {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  let started = false;
-  for (let index = 0; index < text.length; index++) {
-    const char = text[index];
-    if (!started) {
-      if (char.trim() === "") {
-        continue;
-      }
-      if (char !== "[") {
-        return -1;
-      }
-      started = true;
-      depth = 1;
-      continue;
-    }
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-    } else if (char === "[") {
-      depth++;
-    } else if (char === "]") {
-      depth--;
-      if (depth === 0) {
-        return index + 1;
-      }
-    }
-  }
-  return -1;
-}
-
-function readPersistedEntryValues(raw: string): { values: unknown[]; needsRewrite: boolean } {
-  const values: unknown[] = [];
-  let needsRewrite = false;
-  const readLines = (text: string) => {
-    for (const line of text.split("\n")) {
-      if (!line.trim()) {
-        continue;
-      }
-      try {
-        const value: unknown = JSON.parse(line);
-        values.push(value);
-      } catch {
-        needsRewrite = true;
-      }
-    }
-  };
-  const trimmedStart = raw.trimStart();
-  if (trimmedStart.startsWith("[")) {
-    const startOffset = raw.length - trimmedStart.length;
-    const arrayEnd = findJsonArrayEnd(raw.slice(startOffset));
-    if (arrayEnd === -1) {
-      needsRewrite = true;
-      readLines(raw);
-      return { values, needsRewrite };
-    }
-    const legacyValue: unknown = JSON.parse(raw.slice(startOffset, startOffset + arrayEnd));
-    if (Array.isArray(legacyValue)) {
-      values.push(...legacyValue);
-    }
-    needsRewrite = true;
-    readLines(raw.slice(startOffset + arrayEnd));
-    return { values, needsRewrite };
-  }
-  readLines(raw);
-  return { values, needsRewrite };
 }
 
 function trimMessages(messages: Map<string, TelegramCachedMessageNode>, maxMessages: number): void {
@@ -376,12 +435,37 @@ function mergeCachedMessageNode(
   incoming: TelegramCachedMessageNode,
   mode: TelegramMessageObservationMode,
 ): TelegramCachedMessageNode {
-  const threadId = Number(incoming.threadId ?? existing.threadId);
-  const sourceMessage =
+  const mergedSourceMessage =
     mode === "authoritative"
       ? mergeAuthoritativeTelegramSourceMessage(existing.sourceMessage, incoming.sourceMessage)
       : mergeTelegramSourceMessage(existing.sourceMessage, incoming.sourceMessage);
-  return normalizeRequiredMessageNode(sourceMessage, Number.isFinite(threadId) ? { threadId } : {});
+  const syntheticOutboundFrom =
+    existing.senderId === "0" && incoming.sourceMessage.sender_chat
+      ? existing.sourceMessage.from
+      : undefined;
+  // sender_chat pairs with a fake `from`; preserve our outbound-only id=0 sentinel.
+  const sourceMessage = syntheticOutboundFrom
+    ? ({ ...mergedSourceMessage, from: syntheticOutboundFrom } as Message)
+    : mergedSourceMessage;
+  const promptContextProjectionMarker =
+    incoming.promptContextProjectionMarker ?? existing.promptContextProjectionMarker;
+  const threadBinding =
+    normalizeTelegramMessageThreadBinding(incoming.threadBinding) ??
+    normalizeTelegramMessageThreadBinding(existing.threadBinding);
+  const threadId = parseTelegramMessageThreadId(
+    threadBinding?.threadSpec.id ?? incoming.threadId ?? existing.threadId,
+  );
+  const primaryMedia = resolveTelegramPrimaryMedia(sourceMessage);
+  const resolvedMedia =
+    existing.resolvedMedia?.fileUniqueId === primaryMedia?.fileRef.file_unique_id
+      ? existing.resolvedMedia
+      : undefined;
+  return normalizeMessageNode(sourceMessage, {
+    ...(threadId !== undefined ? { threadId } : {}),
+    ...(promptContextProjectionMarker ? { promptContextProjectionMarker } : {}),
+    ...(threadBinding ? { threadBinding } : {}),
+    ...(resolvedMedia ? { resolvedMedia } : {}),
+  });
 }
 
 function upsertCachedMessageNode(params: {
@@ -397,135 +481,159 @@ function upsertCachedMessageNode(params: {
   return node;
 }
 
-function readPersistedMessages(filePath: string, maxMessages: number): PersistedMessageReadResult {
-  const messages = new Map<string, TelegramCachedMessageNode>();
-  let persistedEntryCount = 0;
-  let needsRewrite = false;
-  if (!fs.existsSync(filePath)) {
-    return { messages, persistedEntryCount, needsRewrite };
+function resolveDefaultPersistentStore(): TelegramMessageCachePersistentStore | undefined {
+  const runtime = getOptionalTelegramRuntime();
+  if (!runtime) {
+    return undefined;
   }
   try {
-    const persisted = readPersistedEntryValues(fs.readFileSync(filePath, "utf-8"));
-    needsRewrite = persisted.needsRewrite;
-    for (const value of persisted.values) {
-      for (const entry of parsePersistedEntry(value)) {
-        persistedEntryCount++;
+    return runtime.state.openKeyedStore<PersistedTelegramMessageCacheValue>({
+      namespace: TELEGRAM_MESSAGE_CACHE_PERSISTENT_NAMESPACE,
+      maxEntries: TELEGRAM_MESSAGE_CACHE_PERSISTENT_MAX_MESSAGES,
+    });
+  } catch (error) {
+    logVerbose(`telegram: failed to open message cache plugin state: ${String(error)}`);
+    return undefined;
+  }
+}
+
+function resolveMessageCacheBucket(params: {
+  bucketKey?: string;
+  persistentStore?: TelegramMessageCachePersistentStore;
+}): TelegramMessageCacheBucket {
+  const { bucketKey } = params;
+  if (!bucketKey) {
+    return {
+      messages: new Map<string, TelegramCachedMessageNode>(),
+      hydrated: true,
+    };
+  }
+  const persistedMessageCacheBuckets = getPersistedMessageCacheBuckets();
+  const existing = persistedMessageCacheBuckets.get(bucketKey);
+  if (existing) {
+    existing.persistentStore = params.persistentStore ?? existing.persistentStore;
+    return existing;
+  }
+  const bucket = {
+    messages: new Map<string, TelegramCachedMessageNode>(),
+    hydrated: false,
+    ...(params.persistentStore ? { persistentStore: params.persistentStore } : {}),
+  };
+  persistedMessageCacheBuckets.set(bucketKey, bucket);
+  return bucket;
+}
+
+async function hydrateMessageCacheBucket(
+  bucket: TelegramMessageCacheBucket,
+  maxMessages: number,
+  scopeKey?: string,
+): Promise<void> {
+  if (bucket.hydrated) {
+    return;
+  }
+  if (bucket.hydratePromise) {
+    await bucket.hydratePromise;
+    return;
+  }
+  bucket.hydratePromise = (async () => {
+    let storeEntries: Array<{ key: string; value: unknown }> = [];
+    try {
+      storeEntries = (await bucket.persistentStore?.entries()) ?? [];
+    } catch (error) {
+      logVerbose(`telegram: failed to hydrate message cache from plugin state: ${String(error)}`);
+    }
+    const scopedStoreEntries = scopeKey
+      ? storeEntries.filter(({ key }) => key.startsWith(`${scopeKey}:`))
+      : storeEntries;
+
+    for (const { key, value } of scopedStoreEntries) {
+      for (const entry of parsePersistedCacheValue(key, value)) {
         upsertCachedMessageNode({
-          messages,
+          messages: bucket.messages,
           key: entry.key,
           node: entry.node,
           mode: entry.mode,
         });
-        trimMessages(messages, maxMessages);
+        trimMessages(bucket.messages, maxMessages);
       }
     }
-  } catch (error) {
-    logVerbose(`telegram: failed to read message cache: ${String(error)}`);
-    needsRewrite = true;
-  }
-  return { messages, persistedEntryCount, needsRewrite };
-}
-
-function serializePersistedEntry(key: string, node: TelegramCachedMessageNode): string {
-  return `${JSON.stringify({
-    key,
-    node: {
-      sourceMessage: node.sourceMessage,
-      ...(node.threadId ? { threadId: node.threadId } : {}),
-    },
-  })}\n`;
-}
-
-function replacePersistedMessages(params: {
-  messages: Map<string, TelegramCachedMessageNode>;
-  persistedPath?: string;
-}): number {
-  const { persistedPath, messages } = params;
-  if (!persistedPath) {
-    return messages.size;
-  }
-  if (messages.size === 0) {
-    fs.rmSync(persistedPath, { force: true });
-    return 0;
-  }
-  const serialized = Array.from(messages, ([key, node]) => serializePersistedEntry(key, node)).join(
-    "",
-  );
-  replaceFileAtomicSync({
-    filePath: persistedPath,
-    content: serialized,
-    tempPrefix: ".telegram-message-cache",
+    bucket.hydrated = true;
+  })().finally(() => {
+    bucket.hydratePromise = undefined;
   });
-  return messages.size;
+  await bucket.hydratePromise;
 }
 
-function appendPersistedMessage(params: {
+async function persistCachedNode(params: {
+  bucket: TelegramMessageCacheBucket;
   key: string;
   node: TelegramCachedMessageNode;
-  persistedPath?: string;
-}): number {
-  const { persistedPath } = params;
-  if (!persistedPath) {
-    return 0;
+  botUserId?: number;
+}): Promise<void> {
+  const { persistentStore } = params.bucket;
+  if (!persistentStore) {
+    return;
   }
-  appendRegularFileSync({
-    filePath: persistedPath,
-    content: serializePersistedEntry(params.key, params.node),
-  });
-  return 1;
-}
-
-function resolveMessageCacheBucket(params: {
-  persistedPath?: string;
-  maxMessages: number;
-}): TelegramMessageCacheBucket {
-  const { persistedPath, maxMessages } = params;
-  if (!persistedPath) {
-    return { messages: new Map<string, TelegramCachedMessageNode>(), persistedEntryCount: 0 };
-  }
-  const existing = persistedMessageCacheBuckets.get(persistedPath);
-  if (existing) {
-    if (!fs.existsSync(persistedPath)) {
-      existing.messages.clear();
-      existing.persistedEntryCount = 0;
-    }
-    return existing;
-  }
-  const persisted = readPersistedMessages(persistedPath, maxMessages);
-  const bucket = {
-    messages: persisted.messages,
-    persistedEntryCount: persisted.persistedEntryCount,
-  };
-  if (persisted.needsRewrite) {
-    try {
-      bucket.persistedEntryCount = replacePersistedMessages({
-        messages: bucket.messages,
-        persistedPath,
-      });
-    } catch (error) {
-      logVerbose(`telegram: failed to compact message cache: ${String(error)}`);
+  try {
+    const marker = params.node.promptContextProjectionMarker;
+    const promptContextProjection =
+      marker?.kind === "valid"
+        ? marker.projection
+        : marker
+          ? { transcriptMessageId: marker.transcriptMessageId }
+          : undefined;
+    await persistentStore.register(params.key, {
+      version: TELEGRAM_MESSAGE_CACHE_PERSISTED_VERSION,
+      sourceMessage: params.node.sourceMessage,
+      ...(params.botUserId !== undefined ? { botUserId: params.botUserId } : {}),
+      ...(promptContextProjection ? { promptContextProjection } : {}),
+      ...(params.node.resolvedMedia ? { resolvedMedia: params.node.resolvedMedia } : {}),
+      ...(params.node.threadBinding ? { threadBinding: params.node.threadBinding } : {}),
+      ...(params.node.threadId ? { threadId: params.node.threadId } : {}),
+    });
+  } catch (error) {
+    logVerbose(`telegram: failed to persist message cache: ${String(error)}`);
+    const marker = params.node.promptContextProjectionMarker;
+    if (marker) {
+      params.node.promptContextProjectionMarker = {
+        kind: "invalid",
+        transcriptMessageId:
+          marker.kind === "valid"
+            ? marker.projection.transcriptMessageId
+            : marker.transcriptMessageId,
+      };
+      throw error;
     }
   }
-  persistedMessageCacheBuckets.set(persistedPath, bucket);
-  return bucket;
 }
 
 export function createTelegramMessageCache(params?: {
   maxMessages?: number;
-  persistedPath?: string;
+  scope?: string;
+  persistentStore?: TelegramMessageCachePersistentStore;
+  bucketKey?: string;
 }): TelegramMessageCache {
-  const maxMessages = params?.maxMessages ?? DEFAULT_MAX_MESSAGES;
+  const persistentStore = params?.persistentStore ?? resolveDefaultPersistentStore();
+  const maxMessages =
+    params?.maxMessages ??
+    (persistentStore ? TELEGRAM_MESSAGE_CACHE_PERSISTENT_MAX_MESSAGES : DEFAULT_MAX_MESSAGES);
+  const scopeKey = persistentStore
+    ? resolveTelegramMessageCachePersistentScopeKey(params?.scope ?? "default")
+    : undefined;
+  const bucketKey =
+    params?.bucketKey ?? (persistentStore ? `${PERSISTENT_BUCKET_KEY}:${scopeKey}` : undefined);
   const bucket = resolveMessageCacheBucket({
-    persistedPath: params?.persistedPath,
-    maxMessages,
+    bucketKey,
+    ...(persistentStore ? { persistentStore } : {}),
   });
   const { messages } = bucket;
 
-  const get: TelegramMessageCache["get"] = ({ accountId, chatId, messageId }) => {
+  const get: TelegramMessageCache["get"] = async ({ accountId, chatId, messageId }) => {
+    await hydrateMessageCacheBucket(bucket, maxMessages, scopeKey);
     if (!messageId) {
       return null;
     }
-    const key = telegramMessageCacheKey({ accountId, chatId, messageId });
+    const key = telegramMessageCacheKey({ scopeKey, accountId, chatId, messageId });
     const entry = messages.get(key);
     if (!entry) {
       return null;
@@ -535,13 +643,18 @@ export function createTelegramMessageCache(params?: {
     return entry;
   };
 
-  const listChatMessages = (params: {
+  const listChatMessages = async (paramsLocal: {
     accountId: string;
     chatId: string | number;
     threadId?: number;
   }) => {
-    const prefix = telegramMessageCacheKeyPrefix(params);
-    const threadId = params.threadId != null ? String(params.threadId) : undefined;
+    await hydrateMessageCacheBucket(bucket, maxMessages, scopeKey);
+    const prefix = telegramMessageCacheKeyPrefix({ scopeKey, ...paramsLocal });
+    const normalizedThreadId = parseTelegramMessageThreadId(paramsLocal.threadId);
+    if (paramsLocal.threadId != null && normalizedThreadId === undefined) {
+      return [];
+    }
+    const threadId = normalizedThreadId !== undefined ? String(normalizedThreadId) : undefined;
     return Array.from(messages, ([key, node]) => ({ key, node }))
       .filter(({ key, node }) => {
         if (!key.startsWith(prefix)) {
@@ -554,63 +667,90 @@ export function createTelegramMessageCache(params?: {
   };
 
   return {
-    record: ({ accountId, chatId, msg, threadId }) => {
-      const observations = normalizeMessageNodes(msg, { threadId });
-      const currentObservation = observations.at(-1);
-      if (!currentObservation) {
-        return null;
-      }
-      let recordedEntry: TelegramCachedMessageNode | null = null;
+    record: async ({
+      accountId,
+      botUserId,
+      chatId,
+      msg,
+      promptContextProjection,
+      providerObservedThread,
+      threadId,
+    }) => {
+      await hydrateMessageCacheBucket(bucket, maxMessages, scopeKey);
+      const threadBinding = createTelegramMessageThreadBinding(providerObservedThread);
+      const observations = normalizeMessageNodes(msg, {
+        threadId,
+        ...(promptContextProjection && isTelegramMessageFromCurrentBot(msg, botUserId)
+          ? {
+              promptContextProjectionMarker: {
+                kind: "valid",
+                projection: promptContextProjection,
+              },
+            }
+          : {}),
+        ...(threadBinding ? { threadBinding } : {}),
+      });
+      const currentObservation = observations.at(-1)!;
+      let recordedEntry = currentObservation.node;
       for (const { node, mode } of observations) {
         const { messageId } = node;
-        if (!messageId) {
-          continue;
-        }
-        const key = telegramMessageCacheKey({ accountId, chatId, messageId });
+        const key = telegramMessageCacheKey({ scopeKey, accountId, chatId, messageId });
         const cachedNode = upsertCachedMessageNode({ messages, key, node, mode });
         if (messageId === currentObservation.node.messageId) {
           recordedEntry = cachedNode;
         }
         trimMessages(messages, maxMessages);
-        try {
-          bucket.persistedEntryCount += appendPersistedMessage({
-            key,
-            node: cachedNode,
-            persistedPath: params?.persistedPath,
-          });
-          if (bucket.persistedEntryCount > maxMessages * COMPACT_THRESHOLD_RATIO) {
-            bucket.persistedEntryCount = replacePersistedMessages({
-              messages,
-              persistedPath: params?.persistedPath,
-            });
-          }
-        } catch (error) {
-          logVerbose(`telegram: failed to persist message cache: ${String(error)}`);
-        }
+        await persistCachedNode({
+          bucket,
+          key,
+          node: cachedNode,
+          ...(botUserId !== undefined ? { botUserId } : {}),
+        });
       }
-      return recordedEntry ?? currentObservation.node;
+      return recordedEntry;
+    },
+    recordResolvedMedia: async ({ accountId, botUserId, chatId, messageId, media }) => {
+      await hydrateMessageCacheBucket(bucket, maxMessages, scopeKey);
+      const key = telegramMessageCacheKey({ scopeKey, accountId, chatId, messageId });
+      const node = messages.get(key);
+      if (!node) {
+        throw new Error(`Telegram message ${messageId} was not recorded before media resolution`);
+      }
+      const fileUniqueId = resolveTelegramPrimaryMedia(node.sourceMessage)?.fileRef.file_unique_id;
+      if (fileUniqueId !== media.fileUniqueId) {
+        throw new Error(`Telegram message ${messageId} media changed during resolution`);
+      }
+      const resolvedNode = { ...node, resolvedMedia: media };
+      messages.delete(key);
+      messages.set(key, resolvedNode);
+      await persistCachedNode({
+        bucket,
+        key,
+        node: resolvedNode,
+        ...(botUserId !== undefined ? { botUserId } : {}),
+      });
     },
     get,
-    recentBefore: ({ accountId, chatId, messageId, threadId, limit }) => {
+    recentBefore: async ({ accountId, chatId, messageId, threadId, limit }) => {
       if (!messageId || limit <= 0) {
         return [];
       }
-      const targetId = Number(messageId);
-      if (!Number.isFinite(targetId)) {
+      const targetId = parseSafeMessageId(messageId);
+      if (targetId === undefined) {
         return [];
       }
-      return listChatMessages({ accountId, chatId, threadId })
+      return (await listChatMessages({ accountId, chatId, threadId }))
         .filter((entry) => {
-          const entryId = Number(entry.messageId);
-          return Number.isFinite(entryId) && entryId < targetId;
+          const entryId = parseSafeMessageId(entry.messageId);
+          return entryId !== undefined && entryId < targetId;
         })
         .slice(-limit);
     },
-    around: ({ accountId, chatId, messageId, threadId, before, after }) => {
+    around: async ({ accountId, chatId, messageId, threadId, before, after }) => {
       if (!messageId) {
         return [];
       }
-      const entries = listChatMessages({ accountId, chatId, threadId });
+      const entries = await listChatMessages({ accountId, chatId, threadId });
       const targetIndex = entries.findIndex((entry) => entry.messageId === messageId);
       if (targetIndex === -1) {
         return [];
@@ -620,6 +760,40 @@ export function createTelegramMessageCache(params?: {
         targetIndex + Math.max(0, after) + 1,
       );
     },
+    latestMatchingAtOrBefore: async ({ accountId, chatId, messageId, threadId, matches }) => {
+      if (!messageId) {
+        return null;
+      }
+      const targetId = parseSafeMessageId(messageId);
+      if (targetId === undefined) {
+        return null;
+      }
+      await hydrateMessageCacheBucket(bucket, maxMessages, scopeKey);
+      const prefix = telegramMessageCacheKeyPrefix({ scopeKey, accountId, chatId });
+      const normalizedThreadId = parseTelegramMessageThreadId(threadId);
+      if (threadId != null && normalizedThreadId === undefined) {
+        return null;
+      }
+      const normalizedThread =
+        normalizedThreadId !== undefined ? String(normalizedThreadId) : undefined;
+      let latest: TelegramCachedMessageNode | null = null;
+      for (const [key, entry] of messages) {
+        if (!key.startsWith(prefix)) {
+          continue;
+        }
+        if (normalizedThread !== undefined && entry.threadId !== normalizedThread) {
+          continue;
+        }
+        const entryId = parseSafeMessageId(entry.messageId);
+        if (entryId === undefined || entryId > targetId || !matches(entry)) {
+          continue;
+        }
+        if (!latest || compareCachedMessageNodes(entry, latest) > 0) {
+          latest = entry;
+        }
+      }
+      return latest;
+    },
   };
 }
 
@@ -627,9 +801,9 @@ function compareCachedMessageNodes(
   left: TelegramCachedMessageNode,
   right: TelegramCachedMessageNode,
 ) {
-  const leftId = Number(left.messageId);
-  const rightId = Number(right.messageId);
-  if (Number.isFinite(leftId) && Number.isFinite(rightId)) {
+  const leftId = parseSafeMessageId(left.messageId);
+  const rightId = parseSafeMessageId(right.messageId);
+  if (leftId !== undefined && rightId !== undefined) {
     return leftId - rightId;
   }
   return (left.messageId ?? "").localeCompare(right.messageId ?? "");
@@ -638,11 +812,15 @@ function compareCachedMessageNodes(
 const SESSION_BOUNDARY_COMMAND_RE = /^\/(?:new|reset)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i;
 const SOFT_RESET_COMMAND_RE = /^\/reset(?:@[A-Za-z0-9_]+)?\s+soft(?:\s|$)/i;
 
-function isSessionBoundaryCommandNode(node: TelegramCachedMessageNode): boolean {
-  const body = node.body?.trim();
+function isTelegramSessionBoundaryCommandText(text: string | undefined): boolean {
+  const body = text?.trim();
   return Boolean(
     body && SESSION_BOUNDARY_COMMAND_RE.test(body) && !SOFT_RESET_COMMAND_RE.test(body),
   );
+}
+
+function isSessionBoundaryCommandNode(node: TelegramCachedMessageNode): boolean {
+  return isTelegramSessionBoundaryCommandText(node.body);
 }
 
 function isAfterSessionBoundary(
@@ -652,9 +830,9 @@ function isAfterSessionBoundary(
   if (!boundary) {
     return true;
   }
-  const nodeId = Number(node.messageId);
-  const boundaryId = Number(boundary.messageId);
-  if (Number.isFinite(nodeId) && Number.isFinite(boundaryId)) {
+  const nodeId = parseSafeMessageId(node.messageId);
+  const boundaryId = parseSafeMessageId(boundary.messageId);
+  if (nodeId !== undefined && boundaryId !== undefined) {
     return nodeId > boundaryId;
   }
   if (
@@ -687,62 +865,59 @@ function isAtOrAfterSessionBoundaryTimestamp(
     : node.timestamp >= boundaryTimestampMs;
 }
 
-function resolveSessionBoundaryNode(params: {
+async function resolveSessionBoundaryNode(params: {
   cache: TelegramMessageCache;
   accountId: string;
   chatId: string | number;
   messageId?: string;
   threadId?: number;
-}): TelegramCachedMessageNode | undefined {
+}): Promise<TelegramCachedMessageNode | undefined> {
   if (!params.messageId) {
     return undefined;
   }
-  const { messageId } = params;
-  const candidates = params.cache
-    .recentBefore({
+  return (
+    (await params.cache.latestMatchingAtOrBefore({
       accountId: params.accountId,
       chatId: params.chatId,
-      messageId,
+      messageId: params.messageId,
       ...(params.threadId !== undefined ? { threadId: params.threadId } : {}),
-      limit: Number.MAX_SAFE_INTEGER,
-    })
-    .filter(isSessionBoundaryCommandNode);
-  const current = params.cache.get({
-    accountId: params.accountId,
-    chatId: params.chatId,
-    messageId,
-  });
-  if (current && isSessionBoundaryCommandNode(current)) {
-    candidates.push(current);
-  }
-  return candidates.toSorted(compareCachedMessageNodes).at(-1);
+      matches: isSessionBoundaryCommandNode,
+    })) ?? undefined
+  );
 }
 
-export function buildTelegramReplyChain(params: {
+/**
+ * Hard cap on reply-chain nodes rendered into the prompt. Model-visible context
+ * must be bounded; every producer that appends chain entries shares this ceiling
+ * so a busy chat cannot grow the turn past its budget.
+ */
+export const TELEGRAM_REPLY_CHAIN_MAX_DEPTH = 4;
+
+export async function buildTelegramReplyChain(params: {
   cache: TelegramMessageCache;
   accountId: string;
   chatId: string | number;
   msg: Message;
   maxDepth?: number;
-}): TelegramCachedMessageNode[] {
+}): Promise<TelegramCachedMessageNode[]> {
   const replyMessage = resolveReplyMessage(params.msg);
   if (!replyMessage?.message_id) {
     return [];
   }
-  const maxDepth = params.maxDepth ?? 4;
+  const maxDepth = params.maxDepth ?? TELEGRAM_REPLY_CHAIN_MAX_DEPTH;
   const visited = new Set<string>();
   const chain: TelegramCachedMessageNode[] = [];
-  let current =
-    params.cache.get({
+  let current: TelegramCachedMessageNode | null =
+    (await params.cache.get({
       accountId: params.accountId,
       chatId: params.chatId,
       messageId: String(replyMessage.message_id),
-    }) ?? normalizeMessageNode(replyMessage, {});
+    })) ?? normalizeMessageNode(replyMessage, {});
 
   while (current?.messageId && chain.length < maxDepth && !visited.has(current.messageId)) {
     visited.add(current.messageId);
     chain.push(current);
-    current = params.cache.get({
+    current = await params.cache.get({
       accountId: params.accountId,
       chatId: params.chatId,
       messageId: current.replyToId,
@@ -752,7 +927,7 @@ export function buildTelegramReplyChain(params: {
   return chain;
 }
 
-export function buildTelegramConversationContext(params: {
+export async function buildTelegramConversationContext(params: {
   cache: TelegramMessageCache;
   accountId: string;
   chatId: string | number;
@@ -762,20 +937,24 @@ export function buildTelegramConversationContext(params: {
   recentLimit: number;
   replyTargetWindowSize: number;
   minTimestampMs?: number;
-}): TelegramConversationContextNode[] {
+  includeNode?: (node: TelegramCachedMessageNode, flags?: { replyTarget?: boolean }) => boolean;
+}): Promise<TelegramConversationContextNode[]> {
   const selected = new Map<string, TelegramConversationContextNode>();
   const replyTargetIds = new Set<string>();
-  const sessionBoundary = resolveSessionBoundaryNode(params);
+  const sessionBoundary = await resolveSessionBoundaryNode(params);
   const sessionBoundaryTimestamp = normalizeSessionBoundaryTimestamp(params.minTimestampMs);
   const addNode = (node: TelegramCachedMessageNode, flags?: { replyTarget?: boolean }) => {
     if (!node.messageId || node.messageId === params.messageId) {
-      return;
+      return false;
     }
     if (!isAfterSessionBoundary(node, sessionBoundary)) {
-      return;
+      return false;
     }
     if (!isAtOrAfterSessionBoundaryTimestamp(node, sessionBoundaryTimestamp)) {
-      return;
+      return false;
+    }
+    if (params.includeNode && !params.includeNode(node, flags)) {
+      return false;
     }
     const existing = selected.get(node.messageId);
     const isReplyTarget = existing?.isReplyTarget === true || flags?.replyTarget === true;
@@ -783,10 +962,11 @@ export function buildTelegramConversationContext(params: {
       node: existing?.node ?? node,
       isReplyTarget: isReplyTarget ? true : undefined,
     });
+    return true;
   };
-  const addReplyTargetWindow = (messageId: string) => {
+  const addReplyTargetWindow = async (messageId: string) => {
     replyTargetIds.add(messageId);
-    for (const node of params.cache.around({
+    for (const node of await params.cache.around({
       accountId: params.accountId,
       chatId: params.chatId,
       messageId,
@@ -798,7 +978,7 @@ export function buildTelegramConversationContext(params: {
     }
   };
 
-  const currentWindow = params.cache.recentBefore({
+  const currentWindow = await params.cache.recentBefore({
     accountId: params.accountId,
     chatId: params.chatId,
     messageId: params.messageId,
@@ -806,24 +986,24 @@ export function buildTelegramConversationContext(params: {
     limit: params.recentLimit,
   });
   for (const node of currentWindow) {
-    addNode(node);
-    if (node.replyToId) {
-      addReplyTargetWindow(node.replyToId);
+    const added = addNode(node);
+    if (added && node.replyToId) {
+      await addReplyTargetWindow(node.replyToId);
     }
   }
 
-  params.replyChainNodes.forEach((node, index) => {
-    addNode(node, { replyTarget: index === 0 });
-    if (index === 0 && node.messageId) {
-      addReplyTargetWindow(node.messageId);
+  for (const [index, node] of params.replyChainNodes.entries()) {
+    const added = addNode(node, { replyTarget: index === 0 });
+    if (added && index === 0 && node.messageId) {
+      await addReplyTargetWindow(node.messageId);
     }
-    if (node.replyToId) {
+    if (added && node.replyToId) {
       replyTargetIds.add(node.replyToId);
     }
-  });
+  }
 
   for (const messageId of replyTargetIds) {
-    const node = params.cache.get({
+    const node = await params.cache.get({
       accountId: params.accountId,
       chatId: params.chatId,
       messageId,
@@ -837,3 +1017,4 @@ export function buildTelegramConversationContext(params: {
     compareCachedMessageNodes(left.node, right.node),
   );
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

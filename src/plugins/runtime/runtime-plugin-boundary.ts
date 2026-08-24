@@ -1,7 +1,9 @@
+// Runtime plugin boundary helpers enforce package and source boundaries for runtime loading.
 import fs from "node:fs";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { getRuntimeConfig } from "../../config/config.js";
-import { loadPluginManifestRegistry } from "../manifest-registry.js";
+import { loadPluginManifestRegistryCore } from "../manifest-registry.js";
 import {
   isJavaScriptModulePath,
   tryNativeRequireJavaScriptModule,
@@ -18,40 +20,18 @@ type PluginRuntimeRecord = {
   source: string;
 };
 
-export function readPluginBoundaryConfigSafely() {
+function readPluginBoundaryConfigSafely() {
   try {
     return getRuntimeConfig();
   } catch {
     return {};
   }
 }
-
-export function resolvePluginRuntimeRecord(
-  pluginId: string,
-  onMissing?: () => never,
-): PluginRuntimeRecord | null {
-  const manifestRegistry = loadPluginManifestRegistry({
-    config: readPluginBoundaryConfigSafely(),
-  });
-  const record = manifestRegistry.plugins.find((plugin) => plugin.id === pluginId);
-  if (!record?.source) {
-    if (onMissing) {
-      onMissing();
-    }
-    return null;
-  }
-  return {
-    ...(record.origin ? { origin: record.origin } : {}),
-    rootDir: record.rootDir,
-    source: record.source,
-  };
-}
-
 export function resolvePluginRuntimeRecordByEntryBaseNames(
   entryBaseNames: string[],
   onMissing?: () => never,
 ): PluginRuntimeRecord | null {
-  const manifestRegistry = loadPluginManifestRegistry({
+  const manifestRegistry = loadPluginManifestRegistryCore({
     config: readPluginBoundaryConfigSafely(),
   });
   const matches = manifestRegistry.plugins.filter((plugin) => {
@@ -78,7 +58,7 @@ export function resolvePluginRuntimeRecordByEntryBaseNames(
       `plugin runtime boundary is ambiguous for entries [${entryBaseNames.join(", ")}]: ${pluginIds}`,
     );
   }
-  const record = matches[0];
+  const record = expectDefined(matches[0], "matches capture group 0");
   return {
     ...(record.origin ? { origin: record.origin } : {}),
     rootDir: record.rootDir,

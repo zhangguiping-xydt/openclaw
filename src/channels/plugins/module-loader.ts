@@ -1,25 +1,23 @@
+/**
+ * Channel plugin module loader.
+ *
+ * Loads JavaScript or source plugin modules through native require or cached TS loaders.
+ */
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { openRootFileSync } from "../../infra/boundary-file-read.js";
+import { describeRootFileOpenFailure, openRootFileSync } from "../../infra/boundary-file-read.js";
+import { hasErrnoCode } from "../../infra/errno.js";
 import { isJavaScriptModulePath } from "../../plugins/native-module-require.js";
 import {
   getCachedPluginModuleLoader,
   type PluginModuleLoaderCache,
-  type PluginModuleLoaderFactory,
 } from "../../plugins/plugin-module-loader-cache.js";
 
 const nodeRequire = createRequire(import.meta.url);
 const SOURCE_MODULE_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts"]);
+const SOURCE_MODULE_RESOLUTION_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts"] as const;
 const jitiLoaders: PluginModuleLoaderCache = new Map();
-let channelPluginModuleLoaderFactoryForTest: PluginModuleLoaderFactory | undefined;
-
-export function setChannelPluginModuleLoaderFactoryForTest(
-  factory?: PluginModuleLoaderFactory,
-): void {
-  channelPluginModuleLoaderFactoryForTest = factory;
-  jitiLoaders.clear();
-}
 
 function hasNativeSourceRequireHook(modulePath: string): boolean {
   const extension = path.extname(modulePath).toLowerCase();
@@ -41,9 +39,6 @@ function loadModuleWithJiti(modulePath: string): unknown {
     loaderFilename: import.meta.url,
     tryNative: false,
     cacheScopeKey: "channel-plugin-module-loader",
-    ...(channelPluginModuleLoaderFactoryForTest
-      ? { createLoader: channelPluginModuleLoaderFactoryForTest }
-      : {}),
   });
   return loadWithJiti(modulePath);
 }
@@ -51,6 +46,8 @@ function loadModuleWithJiti(modulePath: string): unknown {
 function loadModule(modulePath: string): unknown {
   if (!isJavaScriptModulePath(modulePath) && !hasNativeSourceRequireHook(modulePath)) {
     if (isSourceModulePath(modulePath)) {
+      // Local source plugins need the TS loader unless the current runtime has
+      // installed a native source require hook for that extension.
       return loadModuleWithJiti(modulePath);
     }
     throw new Error(`channel plugin module must be built JavaScript: ${modulePath}`);
@@ -59,6 +56,8 @@ function loadModule(modulePath: string): unknown {
     return nodeRequire(modulePath);
   } catch (error) {
     if (isSourceModulePath(modulePath)) {
+      // Native source hooks can still fail on ESM/TS edge cases; fall back to
+      // the cached loader before surfacing the error.
       return loadModuleWithJiti(modulePath);
     }
     throw new Error(`failed to load channel plugin module with native require: ${modulePath}`, {
@@ -67,52 +66,66 @@ function loadModule(modulePath: string): unknown {
   }
 }
 
-function resolvePluginModuleCandidates(rootDir: string, specifier: string): string[] {
+function resolveSourceModuleCandidates(rootDir: string, specifier: string): string[] {
   const normalizedSpecifier = specifier.replace(/\\/g, "/");
   const resolvedPath = path.resolve(rootDir, normalizedSpecifier);
-  const ext = path.extname(resolvedPath);
-  if (ext) {
-    return [resolvedPath];
+  if (path.extname(resolvedPath)) {
+    return [];
   }
-  return [
-    resolvedPath,
-    `${resolvedPath}.ts`,
-    `${resolvedPath}.mts`,
-    `${resolvedPath}.js`,
-    `${resolvedPath}.mjs`,
-    `${resolvedPath}.cts`,
-    `${resolvedPath}.cjs`,
-  ];
+  return SOURCE_MODULE_RESOLUTION_EXTENSIONS.map((extension) => `${resolvedPath}${extension}`);
 }
 
+/**
+ * Resolves a plugin-relative module specifier to an existing candidate path.
+ */
 export function resolveExistingPluginModulePath(rootDir: string, specifier: string): string {
-  for (const candidate of resolvePluginModuleCandidates(rootDir, specifier)) {
+  const resolvedPath = path.resolve(rootDir, specifier.replace(/\\/g, "/"));
+  try {
+    // Match Node package semantics for explicit files, extensionless JavaScript,
+    // package mains, and directory indexes before applying source-only fallbacks.
+    return nodeRequire.resolve(resolvedPath);
+  } catch (error) {
+    if (!hasErrnoCode(error, "MODULE_NOT_FOUND")) {
+      throw error;
+    }
+  }
+  for (const candidate of resolveSourceModuleCandidates(rootDir, specifier)) {
     if (fs.existsSync(candidate)) {
       return candidate;
     }
   }
-  return path.resolve(rootDir, specifier);
+  return resolvedPath;
 }
 
-export function loadChannelPluginModule(params: {
-  modulePath: string;
-  rootDir: string;
-  boundaryRootDir?: string;
-  boundaryLabel?: string;
-}): unknown {
+/**
+ * Loads a channel plugin module after enforcing plugin-root file boundaries.
+ *
+ * `rootDir` is always the plugin's own directory, so the containment failure is
+ * reported against that one root; no caller boundary override exists.
+ */
+export function loadChannelPluginModule(params: { modulePath: string; rootDir: string }): unknown {
+  const boundaryLabel = "plugin root";
   const opened = openRootFileSync({
     absolutePath: params.modulePath,
-    rootPath: params.boundaryRootDir ?? params.rootDir,
-    boundaryLabel: params.boundaryLabel ?? "plugin root",
+    rootPath: params.rootDir,
+    boundaryLabel,
     rejectHardlinks: false,
     skipLexicalRootCheck: true,
   });
   if (!opened.ok) {
     throw new Error(
-      `${params.boundaryLabel ?? "plugin"} module path escapes plugin root or fails alias checks`,
+      describeRootFileOpenFailure({
+        failure: opened,
+        subject: "plugin module path",
+        boundaryLabel,
+        filePath: params.modulePath,
+      }),
+      { cause: opened.error },
     );
   }
   const safePath = opened.path;
+  // The boundary check opens the file to verify the path; close before loading
+  // through require/jiti so module evaluation owns its own descriptor lifecycle.
   fs.closeSync(opened.fd);
   return loadModule(safePath);
 }

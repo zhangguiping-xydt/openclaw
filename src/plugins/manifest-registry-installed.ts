@@ -1,28 +1,78 @@
+/** Builds manifest registry records from installed plugin index snapshots. */
 import fs from "node:fs";
 import path from "node:path";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { normalizeOptionalTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
+import {
+  resolveChannelSetupFieldCliAttributeName,
+  type ChannelSetupFieldMetadata,
+} from "../channels/plugins/setup-contract.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { tryReadJsonSync } from "../infra/json-files.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
-import { normalizeOptionalTrimmedStringList } from "../shared/string-normalization.js";
+import { pruneMapToMaxSize } from "../infra/map-size.js";
+import { recordPluginCandidateInstallOwner } from "./candidate-install-owner.js";
 import type { PluginCandidate } from "./discovery.js";
-import { hashJson } from "./installed-plugin-index-hash.js";
+import { hashJson, hashStableJson } from "./installed-plugin-index-hash.js";
+import {
+  isInstalledPluginIndexInstallOwnerAmbiguous,
+  resolveInstalledPluginIndexInstallOwner,
+} from "./installed-plugin-index-install-owner.js";
 import type { InstalledPluginIndex, InstalledPluginIndexRecord } from "./installed-plugin-index.js";
 import { extractPluginInstallRecordsFromInstalledPluginIndex } from "./installed-plugin-index.js";
-import { loadPluginManifestRegistry, type PluginManifestRegistry } from "./manifest-registry.js";
-import type { BundledChannelConfigCollector } from "./manifest-registry.js";
+import {
+  loadPluginManifestRegistryCore,
+  type PluginManifestRecord,
+  type PluginManifestRegistry,
+  type BundledChannelConfigCollector,
+} from "./manifest-registry.js";
 import {
   DEFAULT_PLUGIN_ENTRY_CANDIDATES,
   getPackageManifestMetadata,
+  normalizeManifestChannelCommandDefaults,
   type OpenClawPackageManifest,
   type PackageManifest,
   type PluginPackageChannel,
+  type PluginPackageChannelCliOption,
 } from "./manifest.js";
-import { isPathInsideWithRealpath, safeRealpathSync } from "./path-safety.js";
+import { isPathInside, safeRealpathSync } from "./path-safety.js";
 import { tracePluginLifecyclePhase } from "./plugin-lifecycle-trace.js";
+import { registerPluginMetadataProcessMemoLifecycleClear } from "./plugin-metadata-lifecycle.js";
 import {
   normalizePluginDependencySpecs,
   type PluginDependencySpecMap,
-} from "./status-dependencies.js";
+} from "./status-dependencies-core.js";
+
+const installedManifestRegistryIndexFingerprintCache = new WeakMap<InstalledPluginIndex, string>();
+const installedPackageMetadataCache = new Map<string, InstalledPackageMetadata>();
+const MAX_INSTALLED_PACKAGE_METADATA_CACHE_ENTRIES = 256;
+
+type InstalledPackageMetadata = {
+  packageManifest?: OpenClawPackageManifest;
+  packageDependencies?: PluginDependencySpecMap;
+  packageOptionalDependencies?: PluginDependencySpecMap;
+};
+
+function clearInstalledManifestRegistryProcessCaches(): void {
+  installedPackageMetadataCache.clear();
+}
+
+registerPluginMetadataProcessMemoLifecycleClear(clearInstalledManifestRegistryProcessCaches);
+
+function isDeepFrozenJsonLike(value: unknown, seen = new WeakSet<object>()): boolean {
+  if (!value || typeof value !== "object") {
+    return true;
+  }
+  const object = value;
+  if (seen.has(object)) {
+    return true;
+  }
+  if (!Object.isFrozen(object)) {
+    return false;
+  }
+  seen.add(object);
+  return Object.values(value).every((entry) => isDeepFrozenJsonLike(entry, seen));
+}
 
 function isRelativePathInsideOrEqual(relativePath: string): boolean {
   return (
@@ -33,37 +83,61 @@ function isRelativePathInsideOrEqual(relativePath: string): boolean {
   );
 }
 
-function resolvePackageJsonPath(record: InstalledPluginIndexRecord): string | undefined {
+function resolvePackageJsonPath(
+  record: InstalledPluginIndexRecord,
+  realpathCache: Map<string, string>,
+): string | undefined {
   if (!record.packageJson?.path) {
     return undefined;
   }
   const rootDir = resolveInstalledPluginRootDir(record);
-  const realRootDir = safeRealpathSync(rootDir) ?? path.resolve(rootDir);
+  const realRootDir = safeRealpathSync(rootDir, realpathCache) ?? path.resolve(rootDir);
   const packageJsonPath = path.resolve(realRootDir, record.packageJson.path);
   const relative = path.relative(realRootDir, packageJsonPath);
   if (!isRelativePathInsideOrEqual(relative)) {
     return undefined;
   }
-  if (!isPathInsideWithRealpath(realRootDir, packageJsonPath)) {
+  const packageJsonRealPath = safeRealpathSync(packageJsonPath, realpathCache);
+  if (!packageJsonRealPath || !isPathInside(realRootDir, packageJsonRealPath)) {
     return undefined;
   }
   return packageJsonPath;
 }
 
-function safeFileSignature(filePath: string | undefined): string | undefined {
-  if (!filePath) {
-    return undefined;
+function rememberInstalledPackageMetadata(
+  key: string | undefined,
+  metadata: InstalledPackageMetadata,
+): InstalledPackageMetadata {
+  if (key) {
+    installedPackageMetadataCache.set(key, metadata);
+    pruneMapToMaxSize(installedPackageMetadataCache, MAX_INSTALLED_PACKAGE_METADATA_CACHE_ENTRIES);
   }
-  try {
-    const stat = fs.statSync(filePath);
-    return `${filePath}:${stat.size}:${stat.mtimeMs}`;
-  } catch {
-    return `${filePath}:missing`;
-  }
+  return metadata;
 }
 
-function buildInstalledManifestRegistryIndexKey(index: InstalledPluginIndex) {
-  return {
+function buildInstalledPackageMetadataCacheKey(
+  record: InstalledPluginIndexRecord,
+): string | undefined {
+  if (!record.packageJson?.path || !record.packageJson.hash) {
+    return undefined;
+  }
+  return hashJson({
+    rootDir: path.resolve(resolveInstalledPluginRootDir(record)),
+    packageJson: record.packageJson,
+    packageChannel: record.packageChannel ?? null,
+  });
+}
+
+export function resolveInstalledManifestRegistryIndexFingerprint(
+  index: InstalledPluginIndex,
+): string {
+  const cached = installedManifestRegistryIndexFingerprintCache.get(index);
+  if (cached) {
+    return cached;
+  }
+  // The immutable installed inventory owns freshness; lifecycle clears publish
+  // a replacement instead of polling manifests or package paths on hot reads.
+  const fingerprint = hashStableJson({
     version: index.version,
     hostContractVersion: index.hostContractVersion,
     compatRegistryVersion: index.compatRegistryVersion,
@@ -71,44 +145,24 @@ function buildInstalledManifestRegistryIndexKey(index: InstalledPluginIndex) {
     policyHash: index.policyHash,
     installRecords: index.installRecords,
     diagnostics: index.diagnostics,
-    plugins: index.plugins.map((record) => {
-      const packageJsonPath = resolvePackageJsonPath(record);
-      return {
-        pluginId: record.pluginId,
-        packageName: record.packageName,
-        packageVersion: record.packageVersion,
-        installRecord: record.installRecord,
-        installRecordHash: record.installRecordHash,
-        packageInstall: record.packageInstall,
-        packageChannel: record.packageChannel,
-        manifestPath: record.manifestPath,
-        manifestHash: record.manifestHash,
-        manifestFile: safeFileSignature(record.manifestPath),
-        format: record.format,
-        bundleFormat: record.bundleFormat,
-        source: record.source,
-        setupSource: record.setupSource,
-        packageJson: record.packageJson,
-        packageJsonFile: safeFileSignature(packageJsonPath),
-        rootDir: record.rootDir,
-        origin: record.origin,
-        enabled: record.enabled,
-        enabledByDefault: record.enabledByDefault,
-        enabledByDefaultOnPlatforms: record.enabledByDefaultOnPlatforms
-          ? [...record.enabledByDefaultOnPlatforms]
-          : undefined,
-        syntheticAuthRefs: record.syntheticAuthRefs,
-        startup: record.startup,
-        compat: record.compat,
-      };
-    }),
-  };
-}
-
-export function resolveInstalledManifestRegistryIndexFingerprint(
-  index: InstalledPluginIndex,
-): string {
-  return hashJson(buildInstalledManifestRegistryIndexKey(index));
+    plugins: index.plugins.map(
+      ({ doctorContractFile: _doctorContractFile, packageBuild, ...plugin }) => ({
+        ...plugin,
+        ...(packageBuild
+          ? {
+              packageBuild:
+                packageBuild.bundledDist === undefined
+                  ? {}
+                  : { bundledDist: packageBuild.bundledDist },
+            }
+          : {}),
+      }),
+    ),
+  });
+  if (isDeepFrozenJsonLike(index)) {
+    installedManifestRegistryIndexFingerprintCache.set(index, fingerprint);
+  }
+  return fingerprint;
 }
 
 function resolveInstalledPluginRootDir(record: InstalledPluginIndexRecord): string {
@@ -126,48 +180,19 @@ function resolveFallbackPluginSource(record: InstalledPluginIndexRecord): string
   return path.join(rootDir, DEFAULT_PLUGIN_ENTRY_CANDIDATES[0]);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function normalizePackageChannelCommands(
-  commands: unknown,
-): PluginPackageChannel["commands"] | undefined {
-  if (!isRecord(commands)) {
-    return undefined;
-  }
-  const nativeCommandsAutoEnabled =
-    typeof commands.nativeCommandsAutoEnabled === "boolean"
-      ? commands.nativeCommandsAutoEnabled
-      : undefined;
-  const nativeSkillsAutoEnabled =
-    typeof commands.nativeSkillsAutoEnabled === "boolean"
-      ? commands.nativeSkillsAutoEnabled
-      : undefined;
-  return nativeCommandsAutoEnabled !== undefined || nativeSkillsAutoEnabled !== undefined
-    ? {
-        ...(nativeCommandsAutoEnabled !== undefined ? { nativeCommandsAutoEnabled } : {}),
-        ...(nativeSkillsAutoEnabled !== undefined ? { nativeSkillsAutoEnabled } : {}),
-      }
-    : undefined;
-}
-
 function normalizePackageChannelExposure(
   exposure: unknown,
 ): PluginPackageChannel["exposure"] | undefined {
   if (!isRecord(exposure)) {
     return undefined;
   }
-  const configured = typeof exposure.configured === "boolean" ? exposure.configured : undefined;
-  const setup = typeof exposure.setup === "boolean" ? exposure.setup : undefined;
-  const docs = typeof exposure.docs === "boolean" ? exposure.docs : undefined;
-  return configured !== undefined || setup !== undefined || docs !== undefined
-    ? {
-        ...(configured !== undefined ? { configured } : {}),
-        ...(setup !== undefined ? { setup } : {}),
-        ...(docs !== undefined ? { docs } : {}),
-      }
-    : undefined;
+  const normalized: NonNullable<PluginPackageChannel["exposure"]> = {};
+  for (const key of ["configured", "setup", "docs"] as const) {
+    if (typeof exposure[key] === "boolean") {
+      normalized[key] = exposure[key];
+    }
+  }
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
 function normalizePackageChannelConfiguredState(
@@ -219,41 +244,28 @@ function normalizePackageChannelDoctorCapabilities(
   if (!isRecord(doctorCapabilities)) {
     return undefined;
   }
-  const dmAllowFromMode =
-    doctorCapabilities.dmAllowFromMode === "topOnly" ||
-    doctorCapabilities.dmAllowFromMode === "topOrNested" ||
-    doctorCapabilities.dmAllowFromMode === "nestedOnly"
-      ? doctorCapabilities.dmAllowFromMode
-      : undefined;
-  const groupModel =
-    doctorCapabilities.groupModel === "sender" ||
-    doctorCapabilities.groupModel === "route" ||
-    doctorCapabilities.groupModel === "hybrid"
-      ? doctorCapabilities.groupModel
-      : undefined;
-  const groupAllowFromFallbackToAllowFrom =
-    typeof doctorCapabilities.groupAllowFromFallbackToAllowFrom === "boolean"
-      ? doctorCapabilities.groupAllowFromFallbackToAllowFrom
-      : undefined;
-  const warnOnEmptyGroupSenderAllowlist =
-    typeof doctorCapabilities.warnOnEmptyGroupSenderAllowlist === "boolean"
-      ? doctorCapabilities.warnOnEmptyGroupSenderAllowlist
-      : undefined;
-  return dmAllowFromMode ||
-    groupModel ||
-    groupAllowFromFallbackToAllowFrom !== undefined ||
-    warnOnEmptyGroupSenderAllowlist !== undefined
-    ? {
-        ...(dmAllowFromMode ? { dmAllowFromMode } : {}),
-        ...(groupModel ? { groupModel } : {}),
-        ...(groupAllowFromFallbackToAllowFrom !== undefined
-          ? { groupAllowFromFallbackToAllowFrom }
-          : {}),
-        ...(warnOnEmptyGroupSenderAllowlist !== undefined
-          ? { warnOnEmptyGroupSenderAllowlist }
-          : {}),
-      }
-    : undefined;
+  const normalized: NonNullable<PluginPackageChannel["doctorCapabilities"]> = {};
+  const { dmAllowFromMode, groupModel } = doctorCapabilities;
+  if (
+    dmAllowFromMode === "topOnly" ||
+    dmAllowFromMode === "topOrNested" ||
+    dmAllowFromMode === "nestedOnly"
+  ) {
+    normalized.dmAllowFromMode = dmAllowFromMode;
+  }
+  if (groupModel === "sender" || groupModel === "route" || groupModel === "hybrid") {
+    normalized.groupModel = groupModel;
+  }
+  for (const key of [
+    "openDmRequiresAllowFromWildcard",
+    "groupAllowFromFallbackToAllowFrom",
+    "warnOnEmptyGroupSenderAllowlist",
+  ] as const) {
+    if (typeof doctorCapabilities[key] === "boolean") {
+      normalized[key] = doctorCapabilities[key];
+    }
+  }
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
 function normalizePackageChannelCliOptions(
@@ -262,7 +274,7 @@ function normalizePackageChannelCliOptions(
   if (!Array.isArray(cliAddOptions)) {
     return undefined;
   }
-  const normalized = cliAddOptions.flatMap((option) => {
+  const normalized = cliAddOptions.flatMap<PluginPackageChannelCliOption>((option) => {
     if (!isRecord(option)) {
       return [];
     }
@@ -275,15 +287,100 @@ function normalizePackageChannelCliOptions(
       typeof option.defaultValue === "boolean" || typeof option.defaultValue === "string"
         ? option.defaultValue
         : undefined;
+    const valueType =
+      option.valueType === "int" || option.valueType === "list" ? option.valueType : undefined;
     return [
       {
         flags,
         description,
         ...(defaultValue !== undefined ? { defaultValue } : {}),
+        ...(valueType ? { valueType } : {}),
       },
     ];
   });
   return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizePackageChannelSetup(setup: unknown): PluginPackageChannel["setup"] | undefined {
+  if (!isRecord(setup) || !Array.isArray(setup.fields)) {
+    return undefined;
+  }
+  const fields: ChannelSetupFieldMetadata[] = [];
+  for (const value of setup.fields) {
+    if (!isRecord(value) || !isRecord(value.cli)) {
+      continue;
+    }
+    const key = normalizeOptionalString(value.key);
+    const kind = normalizeOptionalString(value.kind);
+    const flags = normalizeOptionalString(value.cli.flags);
+    const negatedFlags = normalizeOptionalString(value.cli.negatedFlags);
+    const description = normalizeOptionalString(value.cli.description);
+    if (
+      !key ||
+      !flags ||
+      !description ||
+      !kind ||
+      (kind !== "string" &&
+        kind !== "boolean" &&
+        kind !== "integer" &&
+        kind !== "string-list" &&
+        kind !== "choice")
+    ) {
+      continue;
+    }
+    try {
+      if (
+        resolveChannelSetupFieldCliAttributeName(flags) !== key ||
+        (negatedFlags && resolveChannelSetupFieldCliAttributeName(negatedFlags) !== key)
+      ) {
+        continue;
+      }
+    } catch {
+      continue;
+    }
+    const defaultValue =
+      typeof value.cli.defaultValue === "boolean" || typeof value.cli.defaultValue === "string"
+        ? value.cli.defaultValue
+        : undefined;
+    const cli = {
+      flags,
+      ...(negatedFlags ? { negatedFlags } : {}),
+      description,
+      ...(defaultValue !== undefined ? { defaultValue } : {}),
+    };
+    if (kind === "choice") {
+      const choices = normalizeOptionalTrimmedStringList(value.choices);
+      if (!choices?.length) {
+        continue;
+      }
+      fields.push({ key, kind, choices, cli });
+      continue;
+    }
+    if (kind === "string" || kind === "string-list") {
+      fields.push({
+        key,
+        kind,
+        ...(value.sensitive === true ? { sensitive: true } : {}),
+        cli,
+      });
+      continue;
+    }
+    if (kind === "boolean") {
+      const envVars = normalizeOptionalTrimmedStringList(value.envVars);
+      const envVarMode =
+        value.envVarMode === "any" || value.envVarMode === "all" ? value.envVarMode : undefined;
+      fields.push({
+        key,
+        kind,
+        ...(envVars?.length ? { envVars } : {}),
+        ...(envVars?.length && envVarMode ? { envVarMode } : {}),
+        cli,
+      });
+      continue;
+    }
+    fields.push({ key, kind, cli });
+  }
+  return { fields };
 }
 
 function normalizePersistedPackageChannel(value: unknown): PluginPackageChannel | undefined {
@@ -319,11 +416,12 @@ function normalizePersistedPackageChannel(value: unknown): PluginPackageChannel 
       channel[key] = normalized;
     }
   }
+  if (Array.isArray(value.approvalFlags) && value.approvalFlags.includes("native")) {
+    channel.approvalFlags = ["native"];
+  }
   for (const key of [
     "selectionDocsOmitLabel",
     "markdownCapable",
-    "showConfigured",
-    "showInSetup",
     "quickstartAllowFrom",
     "forceAccountBinding",
     "preferSessionLookupForAnnounceTarget",
@@ -332,47 +430,69 @@ function normalizePersistedPackageChannel(value: unknown): PluginPackageChannel 
       channel[key] = value[key];
     }
   }
-  const exposure = normalizePackageChannelExposure(value.exposure);
-  if (exposure) {
-    channel.exposure = exposure;
-  }
-  const commands = normalizePackageChannelCommands(value.commands);
-  if (commands) {
-    channel.commands = commands;
-  }
-  const configuredState = normalizePackageChannelConfiguredState(value.configuredState);
-  if (configuredState) {
-    channel.configuredState = configuredState;
-  }
-  const persistedAuthState = normalizePackageChannelPersistedAuthState(value.persistedAuthState);
-  if (persistedAuthState) {
-    channel.persistedAuthState = persistedAuthState;
-  }
-  const doctorCapabilities = normalizePackageChannelDoctorCapabilities(value.doctorCapabilities);
-  if (doctorCapabilities) {
-    channel.doctorCapabilities = doctorCapabilities;
-  }
-  const cliAddOptions = normalizePackageChannelCliOptions(value.cliAddOptions);
-  if (cliAddOptions) {
-    channel.cliAddOptions = cliAddOptions;
+  for (const [key, normalize] of [
+    ["exposure", normalizePackageChannelExposure],
+    ["commands", normalizeManifestChannelCommandDefaults],
+    ["configuredState", normalizePackageChannelConfiguredState],
+    ["persistedAuthState", normalizePackageChannelPersistedAuthState],
+    ["doctorCapabilities", normalizePackageChannelDoctorCapabilities],
+    ["setup", normalizePackageChannelSetup],
+    ["cliAddOptions", normalizePackageChannelCliOptions],
+  ] as const) {
+    const normalized = normalize(value[key]);
+    if (normalized) {
+      Object.assign(channel, { [key]: normalized });
+    }
   }
   return channel;
 }
 
-function resolveInstalledPackageMetadata(record: InstalledPluginIndexRecord): {
-  packageManifest?: OpenClawPackageManifest;
-  packageDependencies?: PluginDependencySpecMap;
-  packageOptionalDependencies?: PluginDependencySpecMap;
-} {
+function normalizePreparedManifestRecord(record: PluginManifestRecord): PluginManifestRecord {
+  if (!record.packageManifest?.channel && !record.packageChannel) {
+    return record;
+  }
+  const packageChannel = normalizePersistedPackageChannel(
+    record.packageManifest?.channel ?? record.packageChannel,
+  );
+  const { channel: _ignoredChannel, ...packageManifest } = record.packageManifest ?? {};
+  return {
+    ...record,
+    packageChannel,
+    ...(record.packageManifest
+      ? {
+          packageManifest: {
+            ...packageManifest,
+            ...(packageChannel ? { channel: packageChannel } : {}),
+          },
+        }
+      : {}),
+    ...(!packageChannel && record.channelCatalogMeta ? { channelCatalogMeta: undefined } : {}),
+  };
+}
+
+function resolveInstalledPackageMetadata(
+  record: InstalledPluginIndexRecord,
+  realpathCache: Map<string, string>,
+): InstalledPackageMetadata {
+  const cacheKey = buildInstalledPackageMetadataCacheKey(record);
+  const cached = cacheKey ? installedPackageMetadataCache.get(cacheKey) : undefined;
+  if (cached) {
+    return cached;
+  }
   const recordPackageChannel = normalizePersistedPackageChannel(record.packageChannel);
   const fallbackPackageManifest = recordPackageChannel
     ? {
         channel: recordPackageChannel,
       }
     : undefined;
-  const packageJsonPath = record.packageJson?.path ? resolvePackageJsonPath(record) : undefined;
+  const packageJsonPath = record.packageJson?.path
+    ? resolvePackageJsonPath(record, realpathCache)
+    : undefined;
   if (!packageJsonPath) {
-    return fallbackPackageManifest ? { packageManifest: fallbackPackageManifest } : {};
+    return rememberInstalledPackageMetadata(
+      cacheKey,
+      fallbackPackageManifest ? { packageManifest: fallbackPackageManifest } : {},
+    );
   }
   const packageJson = tryReadJsonSync<PackageManifest>(packageJsonPath);
   if (packageJson) {
@@ -382,11 +502,11 @@ function resolveInstalledPackageMetadata(record: InstalledPluginIndexRecord): {
       optionalDependencies: packageJson.optionalDependencies,
     });
     if (!packageManifest) {
-      return {
+      return rememberInstalledPackageMetadata(cacheKey, {
         ...(fallbackPackageManifest ? { packageManifest: fallbackPackageManifest } : {}),
         packageDependencies: dependencies.dependencies,
         packageOptionalDependencies: dependencies.optionalDependencies,
-      };
+      });
     }
     const packageChannel = normalizePersistedPackageChannel(packageManifest.channel);
     const channel =
@@ -397,46 +517,58 @@ function resolveInstalledPackageMetadata(record: InstalledPluginIndexRecord): {
           }
         : undefined;
     const { channel: _ignoredChannel, ...packageManifestWithoutChannel } = packageManifest;
-    return {
+    return rememberInstalledPackageMetadata(cacheKey, {
       packageManifest: {
         ...packageManifestWithoutChannel,
         ...(channel ? { channel } : {}),
       },
       packageDependencies: dependencies.dependencies,
       packageOptionalDependencies: dependencies.optionalDependencies,
-    };
+    });
   }
-  return fallbackPackageManifest ? { packageManifest: fallbackPackageManifest } : {};
+  return rememberInstalledPackageMetadata(
+    cacheKey,
+    fallbackPackageManifest ? { packageManifest: fallbackPackageManifest } : {},
+  );
 }
 
-function toPluginCandidate(record: InstalledPluginIndexRecord): PluginCandidate {
+function toPluginCandidate(
+  record: InstalledPluginIndexRecord,
+  realpathCache: Map<string, string>,
+): PluginCandidate {
   const rootDir = resolveInstalledPluginRootDir(record);
-  const packageMetadata = resolveInstalledPackageMetadata(record);
-  return {
-    idHint: record.pluginId,
-    source: record.source ?? resolveFallbackPluginSource(record),
-    ...(record.setupSource ? { setupSource: record.setupSource } : {}),
-    rootDir,
-    origin: record.origin,
-    ...(record.format ? { format: record.format } : {}),
-    ...(record.bundleFormat ? { bundleFormat: record.bundleFormat } : {}),
-    ...(record.packageName ? { packageName: record.packageName } : {}),
-    ...(record.packageVersion ? { packageVersion: record.packageVersion } : {}),
-    ...(packageMetadata.packageManifest
-      ? { packageManifest: packageMetadata.packageManifest }
-      : {}),
-    ...(packageMetadata.packageDependencies
-      ? { packageDependencies: packageMetadata.packageDependencies }
-      : {}),
-    ...(packageMetadata.packageOptionalDependencies
-      ? { packageOptionalDependencies: packageMetadata.packageOptionalDependencies }
-      : {}),
-    packageDir: rootDir,
-  };
+  const packageMetadata = resolveInstalledPackageMetadata(record, realpathCache);
+  return recordPluginCandidateInstallOwner(
+    {
+      idHint: record.pluginId,
+      effectivePluginId: record.pluginId,
+      source: record.source ?? resolveFallbackPluginSource(record),
+      ...(record.setupSource ? { setupSource: record.setupSource } : {}),
+      rootDir,
+      origin: record.origin,
+      ...(record.format ? { format: record.format } : {}),
+      ...(record.bundleFormat ? { bundleFormat: record.bundleFormat } : {}),
+      ...(record.packageName ? { packageName: record.packageName } : {}),
+      ...(record.packageVersion ? { packageVersion: record.packageVersion } : {}),
+      ...(packageMetadata.packageManifest
+        ? { packageManifest: packageMetadata.packageManifest }
+        : {}),
+      ...(packageMetadata.packageDependencies
+        ? { packageDependencies: packageMetadata.packageDependencies }
+        : {}),
+      ...(packageMetadata.packageOptionalDependencies
+        ? { packageOptionalDependencies: packageMetadata.packageOptionalDependencies }
+        : {}),
+      packageDir: rootDir,
+    },
+    resolveInstalledPluginIndexInstallOwner(record),
+    isInstalledPluginIndexInstallOwnerAmbiguous(record),
+  );
 }
 
 export function loadPluginManifestRegistryForInstalledIndex(params: {
   index: InstalledPluginIndex;
+  manifestRegistry?: PluginManifestRegistry;
   config?: OpenClawConfig;
   workspaceDir?: string;
   env?: NodeJS.ProcessEnv;
@@ -452,17 +584,32 @@ export function loadPluginManifestRegistryForInstalledIndex(params: {
       }
       const env = params.env ?? process.env;
       const pluginIdSet = params.pluginIds?.length ? new Set(params.pluginIds) : null;
+      const realpathCache = new Map<string, string>();
       const diagnostics = pluginIdSet
         ? params.index.diagnostics.filter((diagnostic) => {
             const pluginId = diagnostic.pluginId;
             return !pluginId || pluginIdSet.has(pluginId);
           })
         : params.index.diagnostics;
+      if (params.manifestRegistry && !params.bundledChannelConfigCollector) {
+        const enabledPluginIds = new Set(
+          params.index.plugins
+            .filter((plugin) => params.includeDisabled || plugin.enabled)
+            .map((plugin) => plugin.pluginId),
+        );
+        return {
+          plugins: params.manifestRegistry.plugins
+            .filter((plugin) => enabledPluginIds.has(plugin.id))
+            .filter((plugin) => !pluginIdSet || pluginIdSet.has(plugin.id))
+            .map(normalizePreparedManifestRecord),
+          diagnostics: [...diagnostics],
+        };
+      }
       const candidates = params.index.plugins
         .filter((plugin) => params.includeDisabled || plugin.enabled)
         .filter((plugin) => !pluginIdSet || pluginIdSet.has(plugin.pluginId))
-        .map(toPluginCandidate);
-      return loadPluginManifestRegistry({
+        .map((plugin) => toPluginCandidate(plugin, realpathCache));
+      return loadPluginManifestRegistryCore({
         config: params.config,
         workspaceDir: params.workspaceDir,
         env,

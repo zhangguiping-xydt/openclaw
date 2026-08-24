@@ -1,3 +1,4 @@
+// Covers heartbeat model override routing.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { resolveAgentMainSessionKey, resolveMainSessionKey } from "../config/sessions.js";
@@ -96,8 +97,9 @@ describe("runHeartbeatOnce – heartbeat model override", () => {
   }
 
   async function runDefaultsHeartbeat(params: {
+    every?: string;
+    defaultTimeoutSeconds?: number;
     model?: string;
-    suppressToolErrorWarnings?: boolean;
     timeoutSeconds?: number;
     lightContext?: boolean;
     isolatedSession?: boolean;
@@ -107,11 +109,11 @@ describe("runHeartbeatOnce – heartbeat model override", () => {
         agents: {
           defaults: {
             workspace: tmpDir,
+            timeoutSeconds: params.defaultTimeoutSeconds,
             heartbeat: {
-              every: "5m",
+              every: params.every ?? "5m",
               target: "whatsapp",
               model: params.model,
-              suppressToolErrorWarnings: params.suppressToolErrorWarnings,
               timeoutSeconds: params.timeoutSeconds,
               lightContext: params.lightContext,
               isolatedSession: params.isolatedSession,
@@ -193,11 +195,11 @@ describe("runHeartbeatOnce – heartbeat model override", () => {
     });
   });
 
-  it("passes suppressToolErrorWarnings when configured", async () => {
-    const replyOpts = await runDefaultsHeartbeat({ suppressToolErrorWarnings: true });
+  it("keeps heartbeat tool-error warnings enabled", async () => {
+    const replyOpts = await runDefaultsHeartbeat({});
     expectReplyOptions(replyOpts, {
       isHeartbeat: true,
-      suppressToolErrorWarnings: true,
+      suppressToolErrorWarnings: false,
     });
   });
 
@@ -208,6 +210,33 @@ describe("runHeartbeatOnce – heartbeat model override", () => {
       timeoutOverrideSeconds: 45,
     });
   });
+
+  it("uses heartbeat cadence as the default reply-run timeout override", async () => {
+    const replyOpts = await runDefaultsHeartbeat({});
+    expectReplyOptions(replyOpts, {
+      isHeartbeat: true,
+      timeoutOverrideSeconds: 300,
+    });
+  });
+
+  it("caps the default heartbeat reply-run timeout override", async () => {
+    const replyOpts = await runDefaultsHeartbeat({ every: "30m" });
+    expectReplyOptions(replyOpts, {
+      isHeartbeat: true,
+      timeoutOverrideSeconds: 600,
+    });
+  });
+
+  it.each([0, 60])(
+    "preserves explicit default agent timeout %d for heartbeat runs",
+    async (defaultTimeoutSeconds) => {
+      const replyOpts = await runDefaultsHeartbeat({ defaultTimeoutSeconds, every: "30m" });
+      expectReplyOptions(replyOpts, {
+        isHeartbeat: true,
+        timeoutOverrideSeconds: defaultTimeoutSeconds,
+      });
+    },
+  );
 
   it("passes bootstrapContextMode when heartbeat lightContext is enabled", async () => {
     const replyOpts = await runDefaultsHeartbeat({ lightContext: true });

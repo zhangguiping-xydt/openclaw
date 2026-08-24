@@ -1,3 +1,18 @@
+// Push gateway methods send APNs/web-push test notifications and manage web
+// push subscriptions/VAPID public-key access for UI clients.
+import {
+  normalizeOptionalString,
+  normalizeStringifiedOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import {
+  ErrorCodes,
+  errorShape,
+  validatePushTestParams,
+  validateWebPushSubscribeParams,
+  validateWebPushTestParams,
+  validateWebPushUnsubscribeParams,
+  validateWebPushVapidPublicKeyParams,
+} from "../../../packages/gateway-protocol/src/index.js";
 import {
   clearApnsRegistrationIfCurrent,
   loadApnsRegistration,
@@ -13,18 +28,7 @@ import {
   registerWebPushSubscription,
   resolveVapidKeys,
 } from "../../infra/push-web.js";
-import { normalizeStringifiedOptionalString } from "../../shared/string-coerce.js";
-import {
-  ErrorCodes,
-  errorShape,
-  validatePushTestParams,
-  validateWebPushSubscribeParams,
-  validateWebPushTestParams,
-  validateWebPushUnsubscribeParams,
-  validateWebPushVapidPublicKeyParams,
-} from "../protocol/index.js";
 import { respondInvalidParams, respondUnavailableOnThrow } from "./nodes.helpers.js";
-import { normalizeTrimmedString } from "./record-shared.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
 export const pushHandlers: GatewayRequestHandlers = {
@@ -44,8 +48,8 @@ export const pushHandlers: GatewayRequestHandlers = {
       return;
     }
 
-    const title = normalizeTrimmedString(params.title) ?? "OpenClaw";
-    const body = normalizeTrimmedString(params.body) ?? `Push test for node ${nodeId}`;
+    const title = normalizeOptionalString(params.title) ?? "OpenClaw";
+    const body = normalizeOptionalString(params.body) ?? `Push test for node ${nodeId}`;
 
     await respondUnavailableOnThrow(respond, async () => {
       const registration = await loadApnsRegistration(nodeId);
@@ -65,6 +69,8 @@ export const pushHandlers: GatewayRequestHandlers = {
       const result =
         registration.transport === "direct"
           ? await (async () => {
+              // Direct registrations require local APNs signing material at
+              // send time; relay registrations must not touch those secrets.
               const auth = await resolveApnsAuthConfigFromEnv(process.env);
               if (!auth.ok) {
                 respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, auth.error));
@@ -82,9 +88,12 @@ export const pushHandlers: GatewayRequestHandlers = {
               });
             })()
           : await (async () => {
+              // Relay registrations carry a grant from the node, so the gateway
+              // only needs relay config plus the origin bound at registration.
               const relay = resolveApnsRelayConfigFromEnv(
                 process.env,
                 context.getRuntimeConfig().gateway,
+                { registrationRelayOrigin: registration.relayOrigin },
               );
               if (!relay.ok) {
                 respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, relay.error));
@@ -108,6 +117,8 @@ export const pushHandlers: GatewayRequestHandlers = {
           overrideEnvironment,
         })
       ) {
+        // Clear only the exact registration we tested; a reconnect may have
+        // written a newer token while the push request was in flight.
         await clearApnsRegistrationIfCurrent({
           nodeId,
           registration,
@@ -178,8 +189,8 @@ export const pushHandlers: GatewayRequestHandlers = {
       return;
     }
 
-    const title = normalizeTrimmedString(params.title) ?? "OpenClaw";
-    const body = normalizeTrimmedString(params.body) ?? "Web push test notification";
+    const title = normalizeOptionalString(params.title) ?? "OpenClaw";
+    const body = normalizeOptionalString(params.body) ?? "Web push test notification";
 
     await respondUnavailableOnThrow(respond, async () => {
       const results = await broadcastWebPush({ title, body });
@@ -188,6 +199,16 @@ export const pushHandlers: GatewayRequestHandlers = {
           false,
           undefined,
           errorShape(ErrorCodes.INVALID_REQUEST, "no web push subscriptions registered"),
+        );
+        return;
+      }
+      if (!results.some((result) => result.ok)) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.UNAVAILABLE, "all web push deliveries failed", {
+            details: { results },
+          }),
         );
         return;
       }

@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
+// Doctor repair flow tests cover repair plan output and repair execution.
+import { describe, expect, expectTypeOf, it } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { runDoctorHealthRepairs } from "./doctor-repair-flow.js";
-import type { HealthCheck, HealthRepairContext } from "./health-checks.js";
+import { normalizeHealthCheck } from "./health-check-adapter.js";
+import type {
+  RegisteredHealthCheck,
+  RunnableHealthCheck,
+  SplitHealthCheckInput,
+} from "./health-check-runner-types.js";
+import type { HealthFinding, HealthRepairContext } from "./health-checks.js";
 
 function ctx(cfg: OpenClawConfig): HealthRepairContext {
   return {
@@ -15,19 +22,96 @@ function ctx(cfg: OpenClawConfig): HealthRepairContext {
   };
 }
 
+function warningFinding(checkId: string): HealthFinding {
+  return {
+    checkId,
+    severity: "warning",
+    message: `Unresolved finding from ${checkId}.`,
+    path: checkId,
+  };
+}
+
+function successfullyRepairedCheck(): RegisteredHealthCheck {
+  return normalizeHealthCheck({
+    sourceContract: "split",
+    id: "test/repaired-first",
+    kind: "core",
+    description: "repairs before the unresolved check",
+    async detect(checkContext) {
+      return checkContext.cfg.gateway?.mode === "local"
+        ? []
+        : [warningFinding("test/repaired-first")];
+    },
+    async repair(checkContext) {
+      return {
+        config: { ...checkContext.cfg, gateway: { ...checkContext.cfg.gateway, mode: "local" } },
+        changes: ["Set gateway.mode to local."],
+      };
+    },
+  });
+}
+
 describe("runDoctorHealthRepairs", () => {
+  it("repairs single-run checks and validates through lint mode", async () => {
+    const runModes: string[] = [];
+    const scopes: unknown[] = [];
+    const runnable: RunnableHealthCheck = {
+      sourceContract: "run",
+      id: "test/run-repairable",
+      kind: "core",
+      description: "run repairable",
+      async run(ctxItem, scope) {
+        runModes.push(ctxItem.mode);
+        if (scope !== undefined) {
+          scopes.push(scope);
+        }
+        const findings =
+          ctxItem.cfg.gateway?.mode === "local"
+            ? []
+            : [
+                {
+                  checkId: "test/run-repairable",
+                  severity: "warning" as const,
+                  message: "gateway mode missing",
+                  path: "gateway.mode",
+                },
+              ];
+        if (!ctxItem.repair || findings.length === 0) {
+          return { findings };
+        }
+        return {
+          findings,
+          config: { ...ctxItem.cfg, gateway: { ...ctxItem.cfg.gateway, mode: "local" } },
+          changes: ["Set gateway.mode to local."],
+        };
+      },
+    };
+    const checks: RegisteredHealthCheck[] = [normalizeHealthCheck(runnable)];
+
+    const result = await runDoctorHealthRepairs(ctx({}), { checks });
+
+    expect(result.config.gateway?.mode).toBe("local");
+    expect(result.changes).toEqual(["Set gateway.mode to local."]);
+    expect(result.checksRepaired).toBe(1);
+    expect(result.checksValidated).toBe(1);
+    expect(result.remainingFindings).toEqual([]);
+    expect(runModes).toEqual(["fix", "lint"]);
+    expect(scopes).toMatchObject([{ paths: ["gateway.mode"] }]);
+  });
+
   it("repairs modern checks and threads updated config", async () => {
     const scopes: unknown[] = [];
-    const checks: HealthCheck[] = [
-      {
+    const checks: RegisteredHealthCheck[] = [
+      normalizeHealthCheck({
+        sourceContract: "split",
         id: "test/repairable",
         kind: "core",
         description: "repairable",
-        async detect(ctx, scope) {
+        async detect(ctxCandidate, scope) {
           if (scope !== undefined) {
             scopes.push(scope);
           }
-          return ctx.cfg.gateway?.mode === "local"
+          return ctxCandidate.cfg.gateway?.mode === "local"
             ? []
             : [
                 {
@@ -38,13 +122,13 @@ describe("runDoctorHealthRepairs", () => {
                 },
               ];
         },
-        async repair(ctx) {
+        async repair(ctxEntry) {
           return {
-            config: { ...ctx.cfg, gateway: { ...ctx.cfg.gateway, mode: "local" } },
+            config: { ...ctxEntry.cfg, gateway: { ...ctxEntry.cfg.gateway, mode: "local" } },
             changes: ["Set gateway.mode to local."],
           };
         },
-      },
+      }),
     ];
 
     const result = await runDoctorHealthRepairs(ctx({}), { checks });
@@ -57,9 +141,18 @@ describe("runDoctorHealthRepairs", () => {
     expect(scopes).toMatchObject([{ paths: ["gateway.mode"] }]);
   });
 
-  it("leaves non-repairable checks for legacy doctor behavior", async () => {
-    const checks: HealthCheck[] = [
-      {
+  it("keeps repairable out of split repair result types", () => {
+    type SplitRepair = NonNullable<SplitHealthCheckInput["repair"]>;
+    expectTypeOf(async () => ({
+      status: "repairable" as const,
+      changes: [],
+    })).not.toMatchTypeOf<SplitRepair>();
+  });
+
+  it("retains non-repairable findings for the legacy doctor owner", async () => {
+    const checks: RegisteredHealthCheck[] = [
+      normalizeHealthCheck({
+        sourceContract: "split",
         id: "test/legacy-only",
         kind: "core",
         description: "legacy only",
@@ -72,22 +165,60 @@ describe("runDoctorHealthRepairs", () => {
             },
           ];
         },
-      },
+      }),
     ];
 
     const result = await runDoctorHealthRepairs(ctx({}), { checks });
 
     expect(result.config).toEqual({});
     expect(result.findings).toHaveLength(1);
-    expect(result.remainingFindings).toEqual([]);
+    expect(result.remainingFindings).toEqual(result.findings);
     expect(result.changes).toEqual([]);
     expect(result.checksRepaired).toBe(0);
     expect(result.checksValidated).toBe(0);
   });
 
-  it("reports repair validation findings that remain after repair", async () => {
-    const checks: HealthCheck[] = [
+  it("keeps split check findings when repair throws", async () => {
+    const checks: RegisteredHealthCheck[] = [
+      normalizeHealthCheck({
+        sourceContract: "split",
+        id: "test/repair-throws",
+        kind: "core",
+        description: "repair throws",
+        async detect() {
+          return [
+            {
+              checkId: "test/repair-throws",
+              severity: "warning",
+              message: "needs repair",
+              path: "gateway.mode",
+            },
+          ];
+        },
+        async repair() {
+          throw new Error("repair exploded");
+        },
+      }),
+    ];
+
+    const result = await runDoctorHealthRepairs(ctx({}), { checks });
+
+    expect(result.findings).toMatchObject([
       {
+        checkId: "test/repair-throws",
+        path: "gateway.mode",
+      },
+    ]);
+    expect(result.warnings).toEqual(["test/repair-throws repair failed: repair exploded"]);
+    expect(result.remainingFindings).toEqual(result.findings);
+    expect(result.checksRepaired).toBe(0);
+    expect(result.checksValidated).toBe(0);
+  });
+
+  it("reports repair validation findings that remain after repair", async () => {
+    const checks: RegisteredHealthCheck[] = [
+      normalizeHealthCheck({
+        sourceContract: "split",
         id: "test/not-fixed",
         kind: "core",
         description: "not fixed",
@@ -106,7 +237,7 @@ describe("runDoctorHealthRepairs", () => {
             changes: ["Tried repair."],
           };
         },
-      },
+      }),
     ];
 
     const result = await runDoctorHealthRepairs(ctx({}), { checks });
@@ -122,10 +253,51 @@ describe("runDoctorHealthRepairs", () => {
     expect(result.warnings).toEqual(["test/not-fixed repair left 1 finding(s)"]);
   });
 
+  it("validates successful repairs by default", async () => {
+    let detectCalls = 0;
+    const checks: RegisteredHealthCheck[] = [
+      normalizeHealthCheck({
+        sourceContract: "split",
+        id: "test/no-default-validation",
+        kind: "core",
+        description: "no default validation",
+        async detect() {
+          detectCalls++;
+          return [
+            {
+              checkId: "test/no-default-validation",
+              severity: "warning",
+              message: "needs repair",
+            },
+          ];
+        },
+        async repair() {
+          return {
+            changes: ["Ran repair."],
+          };
+        },
+      }),
+    ];
+
+    const result = await runDoctorHealthRepairs(ctx({}), { checks });
+
+    expect(detectCalls).toBe(2);
+    expect(result.checksRepaired).toBe(1);
+    expect(result.checksValidated).toBe(1);
+    expect(result.remainingFindings).toEqual([
+      {
+        checkId: "test/no-default-validation",
+        severity: "warning",
+        message: "needs repair",
+      },
+    ]);
+  });
+
   it("does not validate skipped or failed repair results", async () => {
     let validationCalls = 0;
-    const checks: HealthCheck[] = [
-      {
+    const checks: RegisteredHealthCheck[] = [
+      normalizeHealthCheck({
+        sourceContract: "split",
         id: "test/skipped",
         kind: "core",
         description: "skipped",
@@ -143,10 +315,10 @@ describe("runDoctorHealthRepairs", () => {
           return {
             status: "skipped",
             reason: "manual confirmation required",
-            changes: [],
+            changes: ["Review required before changing gateway.mode."],
           };
         },
-      },
+      }),
     ];
 
     const result = await runDoctorHealthRepairs(ctx({}), { checks });
@@ -154,21 +326,104 @@ describe("runDoctorHealthRepairs", () => {
     expect(validationCalls).toBe(1);
     expect(result.checksRepaired).toBe(0);
     expect(result.checksValidated).toBe(0);
-    expect(result.remainingFindings).toEqual([]);
+    expect(result.remainingFindings).toEqual(result.findings);
+    expect(result.changes).toEqual(["Review required before changing gateway.mode."]);
     expect(result.warnings).toEqual(["test/skipped repair skipped: manual confirmation required"]);
   });
+
+  it.each(["skipped", "failed", "throws", "unavailable", "validation-failed"] as const)(
+    "preserves unresolved split findings after a successful sibling repair (%s)",
+    async (outcome) => {
+      const unresolvedId = `test/split-${outcome}`;
+      const unresolvedCheck = normalizeHealthCheck({
+        sourceContract: "split",
+        id: unresolvedId,
+        kind: "core",
+        description: "unresolved split check",
+        async detect(_checkContext, scope) {
+          if (outcome === "validation-failed" && scope !== undefined) {
+            throw new Error("validation unavailable");
+          }
+          return [warningFinding(unresolvedId)];
+        },
+        ...(outcome === "unavailable"
+          ? {}
+          : {
+              async repair() {
+                if (outcome === "throws") {
+                  throw new Error("repair unavailable");
+                }
+                if (outcome === "skipped" || outcome === "failed") {
+                  return { status: outcome, reason: "manual repair required", changes: [] };
+                }
+                return { changes: ["Attempted unresolved repair."] };
+              },
+            }),
+      });
+
+      const result = await runDoctorHealthRepairs(ctx({}), {
+        checks: [successfullyRepairedCheck(), unresolvedCheck],
+      });
+
+      expect(result.config.gateway?.mode).toBe("local");
+      expect(result.findings.map((finding) => finding.checkId)).toEqual([
+        "test/repaired-first",
+        unresolvedId,
+      ]);
+      expect(result.remainingFindings).toEqual([warningFinding(unresolvedId)]);
+      expect(result.checksRun).toBe(2);
+      expect(result.checksRepaired).toBe(outcome === "validation-failed" ? 2 : 1);
+      expect(result.checksValidated).toBe(1);
+    },
+  );
+
+  it.each(["skipped", "failed", "unavailable", "validation-failed"] as const)(
+    "preserves unresolved runnable findings after a successful split sibling repair (%s)",
+    async (outcome) => {
+      const unresolvedId = `test/runnable-${outcome}`;
+      const runnable: RunnableHealthCheck = {
+        sourceContract: "run",
+        id: unresolvedId,
+        kind: "core",
+        description: "unresolved runnable check",
+        async run(checkContext) {
+          if (checkContext.mode === "lint") {
+            throw new Error("validation unavailable");
+          }
+          const findings = [warningFinding(unresolvedId)];
+          if (outcome === "skipped" || outcome === "failed") {
+            return { status: outcome, reason: "manual repair required", findings };
+          }
+          return outcome === "validation-failed"
+            ? { findings, changes: ["Attempted unresolved repair."] }
+            : { findings };
+        },
+      };
+
+      const result = await runDoctorHealthRepairs(ctx({}), {
+        checks: [successfullyRepairedCheck(), normalizeHealthCheck(runnable)],
+      });
+
+      expect(result.config.gateway?.mode).toBe("local");
+      expect(result.remainingFindings).toEqual([warningFinding(unresolvedId)]);
+      expect(result.checksRun).toBe(2);
+      expect(result.checksRepaired).toBe(outcome === "validation-failed" ? 2 : 1);
+      expect(result.checksValidated).toBe(1);
+    },
+  );
 
   it("supports dry-run repairs without applying returned config or validating", async () => {
     const repairContexts: HealthRepairContext[] = [];
     let detectCalls = 0;
-    const checks: HealthCheck[] = [
-      {
+    const checks: RegisteredHealthCheck[] = [
+      normalizeHealthCheck({
+        sourceContract: "split",
         id: "test/dry-run",
         kind: "core",
         description: "dry run",
-        async detect(ctx) {
+        async detect(ctxResult) {
           detectCalls++;
-          return ctx.cfg.gateway?.mode === "local"
+          return ctxResult.cfg.gateway?.mode === "local"
             ? []
             : [
                 {
@@ -179,10 +434,10 @@ describe("runDoctorHealthRepairs", () => {
                 },
               ];
         },
-        async repair(ctx) {
-          repairContexts.push(ctx);
+        async repair(ctxValue) {
+          repairContexts.push(ctxValue);
           return {
-            config: { ...ctx.cfg, gateway: { ...ctx.cfg.gateway, mode: "local" } },
+            config: { ...ctxValue.cfg, gateway: { ...ctxValue.cfg.gateway, mode: "local" } },
             changes: ["Would set gateway.mode to local."],
             diffs: [
               {
@@ -202,7 +457,7 @@ describe("runDoctorHealthRepairs", () => {
             ],
           };
         },
-      },
+      }),
     ];
 
     const result = await runDoctorHealthRepairs(ctx({}), {
@@ -219,5 +474,60 @@ describe("runDoctorHealthRepairs", () => {
     expect(result.checksValidated).toBe(0);
     expect(detectCalls).toBe(1);
     expect(repairContexts[0]).toMatchObject({ dryRun: true, diff: true });
+  });
+
+  it("passes diff false and true through the repair API", async () => {
+    const repairContexts: HealthRepairContext[] = [];
+    const checks: RegisteredHealthCheck[] = [
+      normalizeHealthCheck({
+        sourceContract: "split",
+        id: "test/diff-preview",
+        kind: "core",
+        description: "diff preview",
+        async detect() {
+          return [
+            {
+              checkId: "test/diff-preview",
+              severity: "warning",
+              message: "config needs repair",
+              path: "gateway.mode",
+            },
+          ];
+        },
+        async repair(ctxLocal) {
+          repairContexts.push(ctxLocal);
+          return {
+            changes: ["Would set gateway.mode to local."],
+            diffs:
+              ctxLocal.diff === true
+                ? [
+                    {
+                      kind: "config",
+                      path: "gateway.mode",
+                      before: undefined,
+                      after: "local",
+                    },
+                  ]
+                : [],
+          };
+        },
+      }),
+    ];
+
+    const withoutDiff = await runDoctorHealthRepairs(ctx({}), {
+      checks,
+      dryRun: true,
+      diff: false,
+    });
+    const withDiff = await runDoctorHealthRepairs(ctx({}), {
+      checks,
+      dryRun: true,
+      diff: true,
+    });
+
+    expect(repairContexts[0]).toMatchObject({ dryRun: true, diff: false });
+    expect(withoutDiff.diffs).toEqual([]);
+    expect(repairContexts[1]).toMatchObject({ dryRun: true, diff: true });
+    expect(withDiff.diffs).toMatchObject([{ kind: "config", path: "gateway.mode" }]);
   });
 });

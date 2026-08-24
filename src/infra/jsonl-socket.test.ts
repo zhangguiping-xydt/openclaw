@@ -1,7 +1,8 @@
+// Covers JSONL socket request framing and response handling.
 import net from "node:net";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { withTempDir } from "../test-helpers/temp-dir.js";
+import { withTestDir } from "../test-helpers/temp-dir.js";
 import { requestJsonlSocket } from "./jsonl-socket.js";
 
 async function listenOnSocket(server: net.Server, socketPath: string): Promise<boolean> {
@@ -27,7 +28,7 @@ function acceptDoneValue(msg: unknown): number | null | undefined {
 
 describe.runIf(process.platform !== "win32")("requestJsonlSocket", () => {
   it("ignores malformed and non-accepted lines until one is accepted", async () => {
-    await withTempDir({ prefix: "openclaw-jsonl-socket-" }, async (dir) => {
+    await withTestDir({ prefix: "openclaw-jsonl-socket-" }, async (dir) => {
       const socketPath = path.join(dir, "socket.sock");
       const server = net.createServer((socket) => {
         socket.on("data", () => {
@@ -57,7 +58,7 @@ describe.runIf(process.platform !== "win32")("requestJsonlSocket", () => {
   });
 
   it("half-closes the write side after sending the request line", async () => {
-    await withTempDir({ prefix: "openclaw-jsonl-socket-" }, async (dir) => {
+    await withTestDir({ prefix: "openclaw-jsonl-socket-" }, async (dir) => {
       const socketPath = path.join(dir, "socket.sock");
       let receivedBuffer: string | null = null;
       const server = net.createServer((socket) => {
@@ -92,7 +93,7 @@ describe.runIf(process.platform !== "win32")("requestJsonlSocket", () => {
   });
 
   it("returns null on timeout and on socket errors", async () => {
-    await withTempDir({ prefix: "openclaw-jsonl-socket-" }, async (dir) => {
+    await withTestDir({ prefix: "openclaw-jsonl-socket-" }, async (dir) => {
       const socketPath = path.join(dir, "socket.sock");
       const server = net.createServer(() => {
         // Intentionally never reply.
@@ -123,6 +124,36 @@ describe.runIf(process.platform !== "win32")("requestJsonlSocket", () => {
           accept: () => undefined,
         }),
       ).resolves.toBeNull();
+    });
+  });
+
+  it("returns null when the socket closes without an accepted response", async () => {
+    await withTestDir({ prefix: "openclaw-jsonl-socket-" }, async (dir) => {
+      const socketPath = path.join(dir, "socket.sock");
+      const server = net.createServer((socket) => {
+        socket.on("data", () => {
+          socket.destroy();
+        });
+      });
+      const listening = await listenOnSocket(server, socketPath);
+      if (!listening) {
+        return;
+      }
+
+      try {
+        const startMs = Date.now();
+        const result = await requestJsonlSocket({
+          socketPath,
+          requestLine: "{}",
+          timeoutMs: 250,
+          accept: () => undefined,
+        });
+
+        expect(result).toBeNull();
+        expect(Date.now() - startMs).toBeLessThan(100);
+      } finally {
+        server.close();
+      }
     });
   });
 });

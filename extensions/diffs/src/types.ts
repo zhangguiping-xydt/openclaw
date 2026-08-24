@@ -1,3 +1,4 @@
+// Diffs type declarations define plugin contracts.
 import type { FileContents, FileDiffMetadata, SupportedLanguages } from "@pierre/diffs";
 
 export const DIFF_LAYOUTS = ["unified", "split"] as const;
@@ -67,6 +68,7 @@ export type DiffRenderOptions = {
     maxPixels: number;
   };
   expandUnchanged: boolean;
+  languagePackAvailable?: boolean;
 };
 
 export type DiffViewerOptions = {
@@ -99,6 +101,7 @@ export type RenderedDiffDocument = {
   title: string;
   fileCount: number;
   inputKind: DiffInput["kind"];
+  viewerRuntime: "base" | "language-pack";
 };
 
 export type DiffArtifactContext = {
@@ -107,6 +110,29 @@ export type DiffArtifactContext = {
   messageChannel?: string;
   agentAccountId?: string;
 };
+
+export type DiffViewerArtifactMetadata = {
+  version: 1;
+  kind: "viewer";
+  encoding: "gzip";
+  tokenHash: string;
+  title: string;
+  inputKind: DiffInput["kind"];
+  fileCount: number;
+  decodedBytes: number;
+  context?: DiffArtifactContext;
+};
+
+export type DiffRenderedFileArtifactMetadata = {
+  version: 1;
+  kind: "rendered_file";
+  format: DiffOutputFormat;
+  context?: DiffArtifactContext;
+};
+
+export type DiffArtifactBlobMetadata =
+  | DiffViewerArtifactMetadata
+  | DiffRenderedFileArtifactMetadata;
 
 export type DiffArtifactMeta = {
   id: string;
@@ -117,10 +143,7 @@ export type DiffArtifactMeta = {
   inputKind: DiffInput["kind"];
   fileCount: number;
   viewerPath: string;
-  htmlPath: string;
   context?: DiffArtifactContext;
-  filePath?: string;
-  imagePath?: string;
 };
 
 export const DIFF_ARTIFACT_ID_PATTERN = /^[0-9a-f]{20}$/;

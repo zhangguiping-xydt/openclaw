@@ -1,8 +1,12 @@
+// Routing account id helpers normalize account identifiers for route matching.
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { pruneMapToMaxSize } from "../infra/map-size.js";
 import { isBlockedObjectKey } from "../infra/prototype-keys.js";
-import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
 
 export const DEFAULT_ACCOUNT_ID = "default";
 
+// Account ids are config/session keys, not display names. Normalize them into
+// short lowercase safe keys and reject prototype-like object keys.
 const VALID_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 const INVALID_CHARS_RE = /[^a-z0-9_-]+/g;
 const LEADING_DASH_RE = /^-+/;
@@ -46,6 +50,8 @@ export function normalizeAccountId(value: string | undefined | null): string {
   return normalized;
 }
 
+// Optional variant for config fields where absence is meaningful. Invalid ids
+// return undefined instead of silently selecting the default account.
 export function normalizeOptionalAccountId(value: string | undefined | null): string | undefined {
   const trimmed = (value ?? "").trim();
   if (!trimmed) {
@@ -61,11 +67,7 @@ export function normalizeOptionalAccountId(value: string | undefined | null): st
 
 function setNormalizeCache<T>(cache: Map<string, T>, key: string, value: T): void {
   cache.set(key, value);
-  if (cache.size <= ACCOUNT_ID_CACHE_MAX) {
-    return;
-  }
-  const oldest = cache.keys().next();
-  if (!oldest.done) {
-    cache.delete(oldest.value);
-  }
+  // Bounded FIFO-ish cache avoids unbounded growth from user/channel input
+  // while keeping hot account ids cheap during routing.
+  pruneMapToMaxSize(cache, ACCOUNT_ID_CACHE_MAX);
 }

@@ -1,27 +1,53 @@
+/**
+ * Loads and renders persisted session history for CLI session reseeding and
+ * context-engine synchronization.
+ */
 import fsp from "node:fs/promises";
 import path from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { migrateSessionEntries, parseSessionEntries } from "@earendil-works/pi-coding-agent";
+import { timestampMsToIsoString } from "@openclaw/normalization-core/number-coercion";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { sliceUtf16Safe, truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import {
-  resolveSessionFilePath,
+  resolveSessionFilePathCore,
   resolveSessionFilePathOptions,
 } from "../../config/sessions/paths.js";
+import {
+  parseSessionTranscriptTreeEntry,
+  scanSessionTranscriptTree,
+  selectSessionTranscriptLeafControlledPath,
+} from "../../config/sessions/transcript-tree.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { formatErrorMessage } from "../../infra/errors.js";
+import { readFileWindowFully } from "../../infra/file-read.js";
 import { isPathInside } from "../../infra/path-guards.js";
 import { resolveSessionAgentIds } from "../agent-scope.js";
 import {
   limitAgentHookHistoryMessages,
   MAX_AGENT_HOOK_HISTORY_MESSAGES,
 } from "../harness/hook-history.js";
+import type { AgentMessage } from "../runtime/index.js";
+import { migrateSessionEntries, parseSessionEntries } from "../sessions/session-manager.js";
+import { cliBackendLog } from "./log.js";
 
-export const MAX_CLI_SESSION_HISTORY_FILE_BYTES = 5 * 1024 * 1024;
-export const MAX_CLI_SESSION_HISTORY_MESSAGES = MAX_AGENT_HOOK_HISTORY_MESSAGES;
-export const MAX_CLI_SESSION_RESEED_HISTORY_CHARS = 12 * 1024;
+/** Maximum transcript size read for CLI session history. */
+const MAX_CLI_SESSION_HISTORY_FILE_BYTES = 5 * 1024 * 1024;
+/** Maximum transcript messages exposed to CLI hook history. */
+const MAX_CLI_SESSION_HISTORY_MESSAGES = MAX_AGENT_HOOK_HISTORY_MESSAGES;
+/** Minimum reseed-history prompt budget for fresh CLI sessions. */
+const MAX_CLI_SESSION_RESEED_HISTORY_CHARS = 12 * 1024;
+/** Maximum automatic reseed-history prompt budget derived from context size. */
+const MAX_AUTO_CLI_SESSION_RESEED_HISTORY_CHARS = 256 * 1024;
+const CLI_SESSION_RESEED_HISTORY_CONTEXT_SHARE = 0.08;
+const CHARS_PER_TOKEN_ESTIMATE = 4;
+const CLI_SESSION_HISTORY_HEADER_READ_BYTES = 64 * 1024;
+const CLI_SESSION_RESEED_CURRENCY_GUIDANCE =
+  "[Recovered history may be stale; verify current and time-sensitive facts before acting.]";
 
 type HistoryMessage = {
   role?: unknown;
   content?: unknown;
   summary?: unknown;
+  timestamp?: unknown;
 };
 type HistoryEntry = {
   type?: unknown;
@@ -41,17 +67,37 @@ type HistoryEntry = {
 type RawTranscriptReseedReason =
   | "auth-profile"
   | "auth-epoch"
+  | "message-policy"
   | "system-prompt"
+  | "cwd"
   | "mcp"
   | "missing-transcript"
+  | "orphaned-tool-use"
   | "session-expired";
 
 const RAW_TRANSCRIPT_RESEED_ALLOWED_REASONS = new Set<RawTranscriptReseedReason>([
   "missing-transcript",
+  "orphaned-tool-use",
+  "message-policy",
   "system-prompt",
+  "cwd",
   "mcp",
   "session-expired",
 ]);
+
+/** Resolves how much prior transcript text may reseed a fresh CLI session. */
+export function resolveAutoCliSessionReseedHistoryChars(contextWindowTokens: number): number {
+  if (!Number.isFinite(contextWindowTokens) || contextWindowTokens <= 0) {
+    return MAX_CLI_SESSION_RESEED_HISTORY_CHARS;
+  }
+  const contextShareChars = Math.floor(
+    contextWindowTokens * CLI_SESSION_RESEED_HISTORY_CONTEXT_SHARE * CHARS_PER_TOKEN_ESTIMATE,
+  );
+  return Math.max(
+    MAX_CLI_SESSION_RESEED_HISTORY_CHARS,
+    Math.min(MAX_AUTO_CLI_SESSION_RESEED_HISTORY_CHARS, contextShareChars),
+  );
+}
 
 function coerceHistoryText(content: unknown): string {
   if (typeof content === "string") {
@@ -80,6 +126,20 @@ function coerceHistoryTimestamp(value: unknown): number | string {
     return value;
   }
   return 0;
+}
+
+function projectReseedMessage(message: unknown, timestamp: unknown): unknown {
+  // The transcript row owns persistence time; nested provider timestamps can
+  // be stale or absent when history is recovered into a fresh CLI session.
+  return isRecord(message) ? { ...message, timestamp } : message;
+}
+
+function formatHistoryTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const timestamp = timestampMsToIsoString(Date.parse(value));
+  return timestamp === value ? timestamp : undefined;
 }
 
 function historyEntryToContextEngineMessage(entry: HistoryEntry): AgentMessage | undefined {
@@ -114,41 +174,128 @@ function loadContextEngineMessagesFromEntries(entries: unknown[]): AgentMessage[
   });
 }
 
+function renderHistoryMessage(message: unknown): string | undefined {
+  if (!message || typeof message !== "object") {
+    return undefined;
+  }
+  const entry = message as HistoryMessage;
+  const role =
+    entry.role === "assistant"
+      ? "Assistant"
+      : entry.role === "user"
+        ? "User"
+        : entry.role === "compactionSummary"
+          ? "Compaction summary"
+          : undefined;
+  if (!role) {
+    return undefined;
+  }
+  const text =
+    entry.role === "compactionSummary" && typeof entry.summary === "string"
+      ? entry.summary.trim()
+      : coerceHistoryText(entry.content);
+  if (!text) {
+    return undefined;
+  }
+  const timestamp = formatHistoryTimestamp(entry.timestamp);
+  return `${timestamp ? `[${timestamp}] ` : ""}${role}: ${text}`;
+}
+
+/** Builds a reseed prompt that carries prior OpenClaw transcript context. */
 export function buildCliSessionHistoryPrompt(params: {
   messages: unknown[];
   prompt: string;
   maxHistoryChars?: number;
 }): string | undefined {
   const maxHistoryChars = params.maxHistoryChars ?? MAX_CLI_SESSION_RESEED_HISTORY_CHARS;
-  const renderedHistoryRaw = params.messages
+  const historyBudget = maxHistoryChars - CLI_SESSION_RESEED_CURRENCY_GUIDANCE.length - "\n".length;
+  if (historyBudget <= 0) {
+    return undefined;
+  }
+
+  // loadCliSessionReseedMessages deliberately places a `compactionSummary`
+  // entry first when the session was compacted, so the compacted prior
+  // context survives reseed. Pin that summary as a prefix and only
+  // tail-truncate the post-summary transcript — a blind tail-slice of the
+  // joined history would drop the summary whenever the post-summary tail
+  // alone exceeds the cap.
+  const firstEntry = params.messages[0];
+  const firstIsCompaction =
+    Boolean(firstEntry) &&
+    typeof firstEntry === "object" &&
+    (firstEntry as HistoryMessage).role === "compactionSummary";
+  const summaryRendered = firstIsCompaction ? renderHistoryMessage(firstEntry) : undefined;
+  const tailMessages = firstIsCompaction ? params.messages.slice(1) : params.messages;
+
+  const tailRaw = tailMessages
     .flatMap((message) => {
-      if (!message || typeof message !== "object") {
-        return [];
-      }
-      const entry = message as HistoryMessage;
-      const role =
-        entry.role === "assistant"
-          ? "Assistant"
-          : entry.role === "user"
-            ? "User"
-            : entry.role === "compactionSummary"
-              ? "Compaction summary"
-              : undefined;
-      if (!role) {
-        return [];
-      }
-      const text =
-        entry.role === "compactionSummary" && typeof entry.summary === "string"
-          ? entry.summary.trim()
-          : coerceHistoryText(entry.content);
-      return text ? [`${role}: ${text}`] : [];
+      const rendered = renderHistoryMessage(message);
+      return rendered ? [rendered] : [];
     })
     .join("\n\n")
     .trim();
-  const renderedHistory =
-    renderedHistoryRaw.length > maxHistoryChars
-      ? `${renderedHistoryRaw.slice(0, maxHistoryChars).trimEnd()}\n[OpenClaw reseed history truncated]`
-      : renderedHistoryRaw;
+
+  const truncationMarker = "[OpenClaw reseed history truncated; older turns dropped]";
+  const renderTruncatedTail = (raw: string, budget: number): string => {
+    if (budget <= truncationMarker.length + "\n".length) {
+      return sliceUtf16Safe(raw, -budget).trimStart();
+    }
+    const tailBudget = budget - truncationMarker.length - "\n".length;
+    return `${truncationMarker}\n${sliceUtf16Safe(raw, -tailBudget).trimStart()}`;
+  };
+  const renderTruncatedSummaryWithTail = (renderedSummary: string): string => {
+    if (historyBudget <= truncationMarker.length + "\n".length) {
+      return tailRaw.length > 0
+        ? sliceUtf16Safe(tailRaw, -historyBudget).trimStart()
+        : truncateUtf16Safe(renderedSummary, historyBudget).trimEnd();
+    }
+    const tailBudget =
+      tailRaw.length > 0 ? Math.min(tailRaw.length, Math.floor(historyBudget / 2)) : 0;
+    const separatorBudget = tailBudget > 0 ? 2 : 1;
+    const summaryBudget = Math.max(
+      0,
+      historyBudget - truncationMarker.length - separatorBudget - tailBudget,
+    );
+    const summaryTruncated = truncateUtf16Safe(renderedSummary, summaryBudget).trimEnd();
+    const tailTruncated = tailBudget > 0 ? sliceUtf16Safe(tailRaw, -tailBudget).trimStart() : "";
+    return [truncationMarker, summaryTruncated, tailTruncated].filter(Boolean).join("\n");
+  };
+
+  let renderedHistory: string;
+  if (summaryRendered) {
+    // Reserve the summary from the budget so the post-summary tail cap is
+    // the remaining headroom. If the summary alone meets or exceeds the
+    // cap, the summary itself must be truncated — pinning a summary that
+    // blows past `maxHistoryChars` would defeat the cap that prevents
+    // reseeding fresh CLI sessions with unexpectedly huge prompts.
+    if (summaryRendered.length >= historyBudget) {
+      // Truncate the summary to fit the budget (less the marker line),
+      // keeping the head. Still reserve budget for the post-summary tail so
+      // recent exact turns survive even when the summary itself is oversize.
+      renderedHistory = renderTruncatedSummaryWithTail(summaryRendered);
+    } else if (tailRaw.length === 0) {
+      renderedHistory = summaryRendered;
+    } else {
+      const summaryBlock = `${summaryRendered}\n\n`;
+      const remainingBudget = historyBudget - summaryBlock.length;
+      if (tailRaw.length <= remainingBudget) {
+        renderedHistory = `${summaryBlock}${tailRaw}`;
+      } else if (remainingBudget <= truncationMarker.length + "\n".length) {
+        // The summary leaves too little room to announce truncation. Reuse
+        // the oversize-summary path so the marker and recent exact turns
+        // both retain budget.
+        renderedHistory = renderTruncatedSummaryWithTail(summaryRendered);
+      } else {
+        renderedHistory = `${summaryBlock}${renderTruncatedTail(tailRaw, remainingBudget)}`;
+      }
+    }
+  } else {
+    // No compaction summary to pin: tail-slice the full rendered history
+    // and lead with the marker so it correctly describes what follows
+    // (older turns dropped, recent tail retained).
+    renderedHistory =
+      tailRaw.length > historyBudget ? renderTruncatedTail(tailRaw, historyBudget) : tailRaw;
+  }
 
   if (!renderedHistory) {
     return undefined;
@@ -159,6 +306,7 @@ export function buildCliSessionHistoryPrompt(params: {
     "Treat it as authoritative context for this fresh CLI session.",
     "",
     "<conversation_history>",
+    CLI_SESSION_RESEED_CURRENCY_GUIDANCE,
     renderedHistory,
     "</conversation_history>",
     "",
@@ -174,6 +322,129 @@ async function safeRealpath(filePath: string): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+function isFileNotFoundError(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT",
+  );
+}
+
+async function readCliSessionHeaderLine(filePath: string): Promise<string | undefined> {
+  const handle = await fsp.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(CLI_SESSION_HISTORY_HEADER_READ_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const firstChunk = buffer.subarray(0, bytesRead).toString("utf-8");
+    const lineEnd = firstChunk.indexOf("\n");
+    if (lineEnd < 0) {
+      return undefined;
+    }
+    const line = firstChunk.slice(0, lineEnd);
+    const parsed = JSON.parse(line) as { type?: unknown };
+    return parsed.type === "session" ? line : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readBoundedCliSessionTranscript(
+  filePath: string,
+): Promise<{ content: string; truncated: boolean }> {
+  const handle = await fsp.open(filePath, "r");
+  try {
+    let buffer = Buffer.alloc(0);
+    let bytesRead = 0;
+    let position = 0;
+    // Compaction can shrink the open file between stat and read. Retry from
+    // the new tail after EOF so a stale offset cannot discard valid history.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const currentSize = (await handle.stat()).size;
+      const readLength = Math.min(currentSize, MAX_CLI_SESSION_HISTORY_FILE_BYTES);
+      position = Math.max(0, currentSize - readLength);
+      buffer = Buffer.alloc(readLength);
+      bytesRead = await readFileWindowFully(handle, buffer, position);
+      if (bytesRead === buffer.length || position === 0) {
+        break;
+      }
+    }
+    const tail = buffer.subarray(0, bytesRead).toString("utf-8");
+    if (position === 0) {
+      return { content: tail, truncated: false };
+    }
+
+    cliBackendLog.warn(
+      `cli session history truncated to last ${MAX_CLI_SESSION_HISTORY_FILE_BYTES} bytes: ${filePath}`,
+    );
+    const firstLineEnd = tail.indexOf("\n");
+    const completeTail = firstLineEnd >= 0 ? tail.slice(firstLineEnd + 1) : "";
+    const headerLine = await readCliSessionHeaderLine(filePath);
+    return {
+      content: headerLine ? `${headerLine}\n${completeTail}` : completeTail,
+      truncated: true,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+function isSafeTruncatedCliSessionTail(entries: readonly unknown[]): boolean {
+  const tree = scanSessionTranscriptTree(entries);
+  if (tree.hasLeafControl) {
+    return !tree.hasInvalidLeafControl;
+  }
+  const rawIds = new Set<string>();
+  const childParentIds = new Set<string>();
+  let truncatedRootParentId: string | undefined;
+  for (const entry of entries) {
+    const node = parseSessionTranscriptTreeEntry(entry);
+    if (!node) {
+      continue;
+    }
+    if (node.appendMode === "side") {
+      return false;
+    }
+    if (node.parentId === null) {
+      rawIds.add(node.id);
+      continue;
+    }
+    if (!rawIds.has(node.parentId)) {
+      if (truncatedRootParentId !== undefined || childParentIds.size > 0) {
+        return false;
+      }
+      truncatedRootParentId = node.parentId;
+      rawIds.add(node.id);
+      continue;
+    }
+    if (childParentIds.has(node.parentId)) {
+      return false;
+    }
+    childParentIds.add(node.parentId);
+    rawIds.add(node.id);
+  }
+  return true;
+}
+
+function parseCliSessionEntries(
+  content: string,
+): ReturnType<typeof parseSessionEntries> | undefined {
+  for (const line of content.trim().split("\n")) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      JSON.parse(line);
+    } catch (error) {
+      cliBackendLog.warn(`cli session history parse failed: ${formatErrorMessage(error)}`);
+      return undefined;
+    }
+  }
+  return parseSessionEntries(content);
 }
 
 function resolveSafeCliSessionFile(params: {
@@ -192,7 +463,7 @@ function resolveSafeCliSessionFile(params: {
     agentId: sessionAgentId ?? defaultAgentId,
     storePath: params.config?.session?.store,
   });
-  const sessionFile = resolveSessionFilePath(
+  const sessionFile = resolveSessionFilePathCore(
     params.sessionId,
     { sessionFile: params.sessionFile },
     pathOptions,
@@ -226,17 +497,78 @@ async function loadCliSessionEntries(params: {
       return [];
     }
     const stat = await fsp.stat(realSessionFile);
-    if (!stat.isFile() || stat.size > MAX_CLI_SESSION_HISTORY_FILE_BYTES) {
+    if (!stat.isFile()) {
       return [];
     }
-    const entries = parseSessionEntries(await fsp.readFile(realSessionFile, "utf-8"));
+    const transcript = await readBoundedCliSessionTranscript(realSessionFile);
+    const entries = parseCliSessionEntries(transcript.content);
+    if (!entries) {
+      return [];
+    }
+    const rawSessionEntries = entries.filter((entry) => entry.type !== "session");
+    if (transcript.truncated && !isSafeTruncatedCliSessionTail(rawSessionEntries)) {
+      cliBackendLog.warn(
+        `cli session history truncated tail skipped because branch controls are incomplete: ${realSessionFile}`,
+      );
+      return [];
+    }
     migrateSessionEntries(entries);
-    return entries.filter((entry) => entry.type !== "session");
-  } catch {
+    const sessionEntries = entries.filter((entry) => entry.type !== "session");
+    if (transcript.truncated && !isSafeTruncatedCliSessionTail(sessionEntries)) {
+      cliBackendLog.warn(
+        `cli session history truncated tail skipped because branch controls are incomplete: ${realSessionFile}`,
+      );
+      return [];
+    }
+    return projectLatestCliHistoryBoundary(
+      selectSessionTranscriptLeafControlledPath(sessionEntries) ?? sessionEntries,
+    );
+  } catch (error) {
+    if (!isFileNotFoundError(error)) {
+      cliBackendLog.warn(`cli session history load failed: ${formatErrorMessage(error)}`);
+    }
     return [];
   }
 }
 
+function projectLatestCliHistoryBoundary(entries: unknown[]): unknown[] {
+  const boundaryIndex = entries.findLastIndex((entry) => {
+    const type = (entry as { type?: unknown } | null)?.type;
+    return type === "compaction" || type === "reset";
+  });
+  if (boundaryIndex < 0) {
+    return entries;
+  }
+  const boundary = entries[boundaryIndex] as {
+    type?: unknown;
+    firstKeptEntryId?: unknown;
+  };
+  if (boundary.type !== "reset") {
+    return entries;
+  }
+  const firstKeptIndex =
+    typeof boundary.firstKeptEntryId === "string"
+      ? entries.findIndex(
+          (entry, index) =>
+            index < boundaryIndex &&
+            (entry as { id?: unknown } | null)?.id === boundary.firstKeptEntryId,
+        )
+      : -1;
+  const kept =
+    firstKeptIndex < 0
+      ? []
+      : entries.slice(firstKeptIndex, boundaryIndex).filter((entry) => {
+          const candidate = entry as HistoryEntry;
+          const message = candidate.message as HistoryMessage | undefined;
+          return (
+            candidate.type === "message" &&
+            (message?.role === "user" || message?.role === "assistant")
+          );
+        });
+  return [...kept, ...entries.slice(boundaryIndex + 1)];
+}
+
+/** Checks whether a safe, bounded transcript file exists for a CLI session. */
 export async function hasCliSessionTranscript(params: {
   sessionId: string;
   sessionFile: string;
@@ -260,12 +592,13 @@ export async function hasCliSessionTranscript(params: {
       return false;
     }
     const stat = await fsp.stat(realSessionFile);
-    return stat.isFile() && stat.size <= MAX_CLI_SESSION_HISTORY_FILE_BYTES;
+    return stat.isFile();
   } catch {
     return false;
   }
 }
 
+/** Loads transcript messages for CLI lifecycle hook context. */
 export async function loadCliSessionHistoryMessages(params: {
   sessionId: string;
   sessionFile: string;
@@ -280,6 +613,7 @@ export async function loadCliSessionHistoryMessages(params: {
   return limitAgentHookHistoryMessages(history, MAX_CLI_SESSION_HISTORY_MESSAGES);
 }
 
+/** Loads transcript messages formatted for context-engine updates. */
 export async function loadCliSessionContextEngineMessages(params: {
   sessionId: string;
   sessionFile: string;
@@ -323,6 +657,7 @@ export async function loadCliSessionContextEngineMessages(params: {
   ];
 }
 
+/** Loads compacted/raw transcript messages eligible for CLI session reseeding. */
 export async function loadCliSessionReseedMessages(params: {
   sessionId: string;
   sessionFile: string;
@@ -343,7 +678,9 @@ export async function loadCliSessionReseedMessages(params: {
     }
     const rawTail = entries.flatMap((entry) => {
       const candidate = entry as HistoryEntry;
-      return candidate.type === "message" ? [candidate.message] : [];
+      return candidate.type === "message"
+        ? [projectReseedMessage(candidate.message, candidate.timestamp)]
+        : [];
     });
     return limitAgentHookHistoryMessages(rawTail, MAX_CLI_SESSION_HISTORY_MESSAGES);
   };
@@ -363,12 +700,15 @@ export async function loadCliSessionReseedMessages(params: {
 
   const tailMessages = entries.slice(latestCompactionIndex + 1).flatMap((entry) => {
     const candidate = entry as HistoryEntry;
-    return candidate.type === "message" ? [candidate.message] : [];
+    return candidate.type === "message"
+      ? [projectReseedMessage(candidate.message, candidate.timestamp)]
+      : [];
   });
   return [
     {
       role: "compactionSummary",
       summary,
+      timestamp: compaction.timestamp,
     },
     ...limitAgentHookHistoryMessages(tailMessages, MAX_CLI_SESSION_HISTORY_MESSAGES - 1),
   ];

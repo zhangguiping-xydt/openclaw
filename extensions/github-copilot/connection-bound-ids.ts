@@ -1,3 +1,4 @@
+// Github Copilot plugin module implements connection bound ids behavior.
 import { createHash } from "node:crypto";
 
 // Copilot's OpenAI-compatible `/responses` endpoint can emit replay item IDs
@@ -26,14 +27,14 @@ function deriveReplacementId(type: string | undefined, originalId: string): stri
 type InputItem = Record<string, unknown> & { id?: unknown; type?: unknown };
 
 function isInputItem(value: unknown): value is InputItem {
-  return !!value && typeof value === "object";
+  return Boolean(value) && typeof value === "object";
 }
 
 function isValidReasoningReplayId(id: unknown): id is string {
   return typeof id === "string" && id.length > 0 && id.length <= 64;
 }
 
-export function sanitizeCopilotReplayResponseIds(input: unknown): boolean {
+function sanitizeCopilotReplayResponseIds(input: unknown): boolean {
   if (!Array.isArray(input)) {
     return false;
   }
@@ -44,12 +45,15 @@ export function sanitizeCopilotReplayResponseIds(input: unknown): boolean {
       continue;
     }
     const id = item.id;
-    // Reasoning items always reference server-side encrypted state bound to the
-    // original item ID. Rewriting or stripping that ID can turn replay into an
-    // invalid or ambiguous server-state lookup, so drop unsafe reasoning items.
+    // Reasoning encrypted_content is tied to the Copilot connection token,
+    // which rotates per request. Drop items with unsafe IDs; strip
+    // encrypted_content from kept items so summary-only replay is sent.
     if (item.type === "reasoning") {
-      if (!isValidReasoningReplayId(id)) {
+      if (id !== undefined && !isValidReasoningReplayId(id)) {
         input.splice(index, 1);
+        rewrote = true;
+      } else if ("encrypted_content" in item) {
+        delete item.encrypted_content;
         rewrote = true;
       }
       continue;
@@ -65,17 +69,9 @@ export function sanitizeCopilotReplayResponseIds(input: unknown): boolean {
   return rewrote;
 }
 
-export function rewriteCopilotConnectionBoundResponseIds(input: unknown): boolean {
-  return sanitizeCopilotReplayResponseIds(input);
-}
-
-export function sanitizeCopilotReplayResponsePayloadIds(payload: unknown): boolean {
+export function sanitizeCopilotReplayResponsePayload(payload: unknown): boolean {
   if (!payload || typeof payload !== "object") {
     return false;
   }
   return sanitizeCopilotReplayResponseIds((payload as { input?: unknown }).input);
-}
-
-export function rewriteCopilotResponsePayloadConnectionBoundIds(payload: unknown): boolean {
-  return sanitizeCopilotReplayResponsePayloadIds(payload);
 }

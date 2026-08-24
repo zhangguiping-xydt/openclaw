@@ -1,4 +1,13 @@
+// Configure wizard Gateway port, bind, auth, and Tailscale prompts.
+import { validateDottedDecimalIPv4Input } from "@openclaw/net-policy/ipv4";
+import {
+  normalizeOptionalString,
+  readStringValue,
+} from "@openclaw/normalization-core/string-coerce";
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { note } from "../../packages/terminal-core/src/note.js";
 import { formatPortRangeHint } from "../cli/error-format.js";
+import { parsePort } from "../cli/shared/parse-port.js";
 import { resolveGatewayPort } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { isValidEnvSecretRefId, type SecretInput } from "../config/types.secrets.js";
@@ -11,12 +20,8 @@ import {
 import { findTailscaleBinary } from "../infra/tailscale.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { resolveDefaultSecretProviderAlias } from "../secrets/ref-contract.js";
-import { validateIPv4AddressInput } from "../shared/net/ipv4.js";
-import { normalizeOptionalString, readStringValue } from "../shared/string-coerce.js";
-import { normalizeStringEntries } from "../shared/string-normalization.js";
-import { note } from "../terminal/note.js";
 import { buildGatewayAuthConfig } from "./configure.gateway-auth.js";
-import { confirm, select, text } from "./configure.shared.js";
+import { password, select, text } from "./configure.shared.js";
 import {
   guardCancel,
   normalizeGatewayTokenInput,
@@ -28,13 +33,13 @@ type GatewayAuthChoice = "token" | "password" | "trusted-proxy";
 type GatewayTokenInputMode = "plaintext" | "ref";
 
 function validateGatewayPortInput(value: unknown): string | undefined {
-  const port = Number(typeof value === "string" ? value.trim() : value);
-  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+  if (parsePort(value) === null) {
     return formatPortRangeHint();
   }
   return undefined;
 }
 
+/** Prompt for local Gateway network/auth settings and return config plus call token. */
 export async function promptGatewayConfig(
   cfg: OpenClawConfig,
   runtime: RuntimeEnv,
@@ -50,8 +55,9 @@ export async function promptGatewayConfig(
       validate: validateGatewayPortInput,
     }),
     runtime,
+    1,
   );
-  const port = Number.parseInt(portRaw, 10);
+  const port = parsePort(portRaw) ?? resolveGatewayPort(cfg);
 
   let bind = guardCancel(
     await select({
@@ -65,7 +71,7 @@ export async function promptGatewayConfig(
         {
           value: "tailnet",
           label: "Tailnet (Tailscale IP)",
-          hint: "Bind to your Tailscale IP only (100.x.x.x)",
+          hint: "Bind to your Tailscale IP plus local loopback",
         },
         {
           value: "auto",
@@ -80,11 +86,12 @@ export async function promptGatewayConfig(
         {
           value: "custom",
           label: "Custom IP",
-          hint: "Specify a specific IP address, with 0.0.0.0 fallback if unavailable",
+          hint: "Specific IPv4s also bind 127.0.0.1",
         },
       ],
     }),
     runtime,
+    1,
   );
 
   let customBindHost: string | undefined;
@@ -93,9 +100,10 @@ export async function promptGatewayConfig(
       await text({
         message: "Custom IP address",
         placeholder: "192.168.1.100",
-        validate: validateIPv4AddressInput,
+        validate: validateDottedDecimalIPv4Input,
       }),
       runtime,
+      1,
     );
     customBindHost = readStringValue(input);
   }
@@ -115,6 +123,7 @@ export async function promptGatewayConfig(
       initialValue: "token",
     }),
     runtime,
+    1,
   ) as GatewayAuthChoice;
 
   let tailscaleMode = guardCancel(
@@ -123,6 +132,7 @@ export async function promptGatewayConfig(
       options: [...TAILSCALE_EXPOSURE_OPTIONS],
     }),
     runtime,
+    1,
   );
 
   // Detect Tailscale binary before proceeding with serve/funnel setup.
@@ -135,16 +145,8 @@ export async function promptGatewayConfig(
     }
   }
 
-  let tailscaleResetOnExit = false;
   if (tailscaleMode !== "off") {
     note(TAILSCALE_DOCS_LINES.join("\n"), "Tailscale");
-    tailscaleResetOnExit = guardCancel(
-      await confirm({
-        message: "Reset Tailscale serve/funnel on exit?",
-        initialValue: false,
-      }),
-      runtime,
-    );
   }
 
   if (tailscaleMode !== "off" && bind !== "loopback") {
@@ -165,7 +167,6 @@ export async function promptGatewayConfig(
       "Note",
     );
     tailscaleMode = "off";
-    tailscaleResetOnExit = false;
   }
 
   let gatewayToken: SecretInput | undefined;
@@ -196,6 +197,7 @@ export async function promptGatewayConfig(
         initialValue: "plaintext",
       }),
       runtime,
+      1,
     );
     if (tokenInputMode === "ref") {
       const envVar = guardCancel(
@@ -216,6 +218,7 @@ export async function promptGatewayConfig(
           },
         }),
         runtime,
+        1,
       );
       const envVarName = normalizeOptionalString(envVar) ?? "";
       gatewayToken = {
@@ -228,11 +231,11 @@ export async function promptGatewayConfig(
       note(`Validated ${envVarName}. OpenClaw will store a token SecretRef.`, "Gateway token");
     } else {
       const tokenInput = guardCancel(
-        await text({
+        await password({
           message: "Gateway token (blank to generate)",
-          initialValue: randomToken(),
         }),
         runtime,
+        1,
       );
       gatewayTokenForCalls = normalizeGatewayTokenInput(tokenInput) || randomToken();
       gatewayToken = gatewayTokenForCalls;
@@ -240,14 +243,15 @@ export async function promptGatewayConfig(
   }
 
   if (authMode === "password") {
-    const password = guardCancel(
-      await text({
+    const passwordInput = guardCancel(
+      await password({
         message: "Gateway password",
         validate: validateGatewayPasswordInput,
       }),
       runtime,
+      1,
     );
-    gatewayPassword = normalizeOptionalString(password) ?? "";
+    gatewayPassword = normalizeOptionalString(passwordInput) ?? "";
   }
 
   if (authMode === "trusted-proxy") {
@@ -271,6 +275,7 @@ export async function promptGatewayConfig(
         validate: (value) => (value?.trim() ? undefined : "User header is required"),
       }),
       runtime,
+      1,
     );
 
     const requiredHeadersRaw = guardCancel(
@@ -279,6 +284,7 @@ export async function promptGatewayConfig(
         placeholder: "x-forwarded-proto,x-forwarded-host",
       }),
       runtime,
+      1,
     );
     const requiredHeaders = requiredHeadersRaw
       ? normalizeStringEntries(requiredHeadersRaw.split(","))
@@ -290,6 +296,7 @@ export async function promptGatewayConfig(
         placeholder: "nick@example.com,admin@company.com",
       }),
       runtime,
+      1,
     );
     const allowUsers = allowUsersRaw ? normalizeStringEntries(allowUsersRaw.split(",")) : [];
 
@@ -305,6 +312,7 @@ export async function promptGatewayConfig(
         },
       }),
       runtime,
+      1,
     );
     trustedProxies = normalizeStringEntries(trustedProxiesRaw.split(","));
 
@@ -336,7 +344,6 @@ export async function promptGatewayConfig(
       tailscale: {
         ...next.gateway?.tailscale,
         mode: tailscaleMode,
-        resetOnExit: tailscaleResetOnExit,
       },
     },
   };

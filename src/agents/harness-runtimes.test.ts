@@ -1,6 +1,18 @@
+// Covers config scanning for agent harness runtime requirements.
 import { describe, expect, it } from "vitest";
+import { migratePersistedImplicitMainRoster } from "../config/legacy.roster.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { collectConfiguredAgentHarnessRuntimes } from "./harness-runtimes.js";
+import { collectConfiguredAgentHarnessRuntimes as collectConfiguredAgentHarnessRuntimesBase } from "./harness-runtimes.js";
+
+function collectConfiguredAgentHarnessRuntimes(
+  config: OpenClawConfig,
+  options?: Parameters<typeof collectConfiguredAgentHarnessRuntimesBase>[1],
+) {
+  return collectConfiguredAgentHarnessRuntimesBase(
+    migratePersistedImplicitMainRoster(config).config as OpenClawConfig,
+    options,
+  );
+}
 
 describe("collectConfiguredAgentHarnessRuntimes", () => {
   it("requires Codex for selectable default OpenAI agent models", () => {
@@ -15,9 +27,19 @@ describe("collectConfiguredAgentHarnessRuntimes", () => {
       },
     } as OpenClawConfig;
 
-    expect(collectConfiguredAgentHarnessRuntimes(config, {}, { includeEnvRuntime: false })).toEqual(
-      ["codex"],
-    );
+    expect(collectConfiguredAgentHarnessRuntimes(config)).toEqual(["codex"]);
+  });
+
+  it("requires Codex when OpenAI is only a default model fallback", () => {
+    const config = {
+      agents: {
+        defaults: {
+          model: { fallbacks: ["openai/gpt-5.5"] },
+        },
+      },
+    } as OpenClawConfig;
+
+    expect(collectConfiguredAgentHarnessRuntimes(config)).toEqual(["codex"]);
   });
 
   it("can ignore implicit OpenAI Codex runtime preferences", () => {
@@ -36,14 +58,9 @@ describe("collectConfiguredAgentHarnessRuntimes", () => {
     } as OpenClawConfig;
 
     expect(
-      collectConfiguredAgentHarnessRuntimes(
-        config,
-        {},
-        {
-          includeEnvRuntime: false,
-          includeImplicitRuntimePreferences: false,
-        },
-      ),
+      collectConfiguredAgentHarnessRuntimes(config, {
+        includeImplicitRuntimePreferences: false,
+      }),
     ).toEqual(["codex"]);
   });
 
@@ -64,29 +81,27 @@ describe("collectConfiguredAgentHarnessRuntimes", () => {
       },
     } as OpenClawConfig;
 
-    expect(collectConfiguredAgentHarnessRuntimes(config, {}, { includeEnvRuntime: false })).toEqual(
-      ["codex"],
-    );
+    expect(collectConfiguredAgentHarnessRuntimes(config)).toEqual(["codex"]);
   });
 
-  it("respects explicit Pi runtime policy on selectable OpenAI agent models", () => {
+  it("respects explicit OpenClaw runtime policy on selectable OpenAI agent models", () => {
     const config = {
       agents: {
         defaults: {
           model: { primary: "anthropic/claude-sonnet-4-6" },
           models: {
-            "openai/gpt-5.5": { agentRuntime: { id: "pi" } },
+            "openai/gpt-5.5": { agentRuntime: { id: "openclaw" } },
           },
         },
       },
     } as OpenClawConfig;
 
-    expect(collectConfiguredAgentHarnessRuntimes(config, {}, { includeEnvRuntime: false })).toEqual(
-      [],
-    );
+    expect(collectConfiguredAgentHarnessRuntimes(config)).toEqual([]);
   });
 
   it("does not infer Codex for custom OpenAI-compatible base URLs", () => {
+    // OpenAI provider id alone is not enough: custom compatible endpoints may
+    // not support Codex runtime assumptions or model contracts.
     const config = {
       models: {
         providers: {
@@ -105,12 +120,12 @@ describe("collectConfiguredAgentHarnessRuntimes", () => {
       },
     } as OpenClawConfig;
 
-    expect(collectConfiguredAgentHarnessRuntimes(config, {}, { includeEnvRuntime: false })).toEqual(
-      [],
-    );
+    expect(collectConfiguredAgentHarnessRuntimes(config)).toEqual([]);
   });
 
-  it("ignores malformed agents.list while scanning best-effort config", () => {
+  it("ignores a malformed legacy list when canonical entries are available", () => {
+    // Runtime collection is diagnostic/setup support, so malformed optional
+    // agent lists should not hide valid defaults-level runtime requirements.
     const config = {
       agents: {
         defaults: {
@@ -120,6 +135,7 @@ describe("collectConfiguredAgentHarnessRuntimes", () => {
             },
           },
         },
+        entries: { main: { default: true } },
         list: {
           ops: {
             id: "ops",
@@ -129,8 +145,6 @@ describe("collectConfiguredAgentHarnessRuntimes", () => {
       },
     } as unknown as OpenClawConfig;
 
-    expect(collectConfiguredAgentHarnessRuntimes(config, {}, { includeEnvRuntime: false })).toEqual(
-      ["claude"],
-    );
+    expect(collectConfiguredAgentHarnessRuntimes(config)).toEqual(["claude"]);
   });
 });

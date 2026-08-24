@@ -1,4 +1,9 @@
-import type { StreamFn } from "@earendil-works/pi-agent-core";
+import type { StreamFn } from "@openclaw/llm-core";
+/**
+ * Anthropic Vertex stream facade.
+ * Keeps Vertex-specific provider implementation in the bundled provider plugin
+ * while core imports a small stable factory.
+ */
 import { loadBundledPluginPublicSurfaceModuleSync } from "../plugin-sdk/facade-runtime.js";
 
 type AnthropicVertexStreamFacade = {
@@ -20,6 +25,7 @@ function loadAnthropicVertexStreamFacade(): AnthropicVertexStreamFacade {
   });
 }
 
+/** Creates an Anthropic Vertex stream function through the bundled provider facade. */
 export function createAnthropicVertexStreamFnForModel(
   model: { baseUrl?: string },
   env: NodeJS.ProcessEnv = process.env,

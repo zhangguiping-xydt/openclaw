@@ -1,3 +1,4 @@
+// Tests archive helper behavior for filesystem packaging.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -95,7 +96,9 @@ describe("archive helpers", () => {
 
   it("rejects when archive work exceeds the timeout", async () => {
     vi.useFakeTimers();
-    const late = new Promise<string>((resolve) => setTimeout(() => resolve("ok"), 50));
+    const late = new Promise<string>((resolve) => {
+      setTimeout(() => resolve("ok"), 50);
+    });
     const result = withTimeout(late, 1, "extract tar");
     const pending = expect(result).rejects.toThrow("extract tar timed out after 1ms");
     await vi.advanceTimersByTimeAsync(1);
@@ -103,26 +106,28 @@ describe("archive helpers", () => {
   });
 
   it("preflights tar entries for blocked link types, path escapes, and size budgets", () => {
-    const checker = createTarEntryPreflightChecker({
-      rootDir: "/tmp/dest",
-      limits: {
-        maxEntries: 1,
-        maxEntryBytes: 8,
-        maxExtractedBytes: 12,
-      },
-    });
+    const createChecker = () =>
+      createTarEntryPreflightChecker({
+        rootDir: "/tmp/dest",
+        limits: {
+          maxEntries: 1,
+          maxEntryBytes: 8,
+          maxExtractedBytes: 12,
+        },
+      });
 
     expectTarPreflightError(
-      checker,
+      createChecker(),
       { path: "package/link", type: "SymbolicLink", size: 0 },
       "tar entry is a link: package/link",
     );
     expectTarPreflightError(
-      checker,
+      createChecker(),
       { path: "../escape.txt", type: "File", size: 1 },
       /escapes destination|absolute/i,
     );
 
+    const checker = createChecker();
     checker({ path: "package/ok.txt", type: "File", size: 8 });
     expectTarPreflightError(
       checker,

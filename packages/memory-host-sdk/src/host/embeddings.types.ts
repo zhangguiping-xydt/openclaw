@@ -1,3 +1,4 @@
+// Memory Host SDK type module defines shared TypeScript contracts.
 import type { OpenClawConfig, SecretInput } from "../engine-foundation.js";
 import type { EmbeddingInput } from "./embedding-inputs.js";
 
@@ -18,11 +19,11 @@ export type EmbeddingProviderCallOptions = {
   signal?: AbortSignal;
 };
 
-export type EmbeddingProviderId = string;
-export type EmbeddingProviderRequest = string;
-export type EmbeddingProviderFallback = string;
+/** @public */ export type EmbeddingProviderId = string;
+/** @public */ export type EmbeddingProviderRequest = string;
+/** @public */ export type EmbeddingProviderFallback = string;
 
-export type GeminiTaskType =
+/** @public */ export type GeminiTaskType =
   | "RETRIEVAL_QUERY"
   | "RETRIEVAL_DOCUMENT"
   | "SEMANTIC_SIMILARITY"
@@ -48,14 +49,6 @@ export type EmbeddingProviderOptions = {
   local?: {
     modelPath?: string;
     modelCacheDir?: string;
-    /**
-     * Context size passed to node-llama-cpp `createEmbeddingContext`.
-     * Default: 4096, chosen to cover typical memory-search chunks (128–512 tokens)
-     * while keeping non-weight VRAM bounded.
-     * Set `"auto"` to let node-llama-cpp use the model's trained maximum — not
-     * recommended for 8B+ models (e.g. Qwen3-Embedding-8B: up to 40 960 tokens → ~32 GB VRAM).
-     */
-    contextSize?: number | "auto";
   };
   /** Provider-specific output vector dimensions for supported embedding families. */
   outputDimensionality?: number;

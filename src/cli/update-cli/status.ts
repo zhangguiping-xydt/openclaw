@@ -1,18 +1,19 @@
+// `openclaw update status`: combines install metadata, configured channel, and remote update checks.
+import { getTerminalTableWidth, renderTable } from "../../../packages/terminal-core/src/table.js";
+import { theme } from "../../../packages/terminal-core/src/theme.js";
 import {
   formatUpdateAvailableHint,
   formatUpdateOneLiner,
+  resolveStatusRegistryUpdateChannel,
   resolveUpdateAvailability,
 } from "../../commands/status.update.js";
 import { readSourceConfigBestEffort } from "../../config/config.js";
 import {
   normalizeUpdateChannel,
-  resolveRegistryUpdateChannel,
   resolveUpdateChannelDisplay,
 } from "../../infra/update-channels.js";
 import { checkUpdateStatus } from "../../infra/update-check.js";
 import { defaultRuntime } from "../../runtime.js";
-import { getTerminalTableWidth, renderTable } from "../../terminal/table.js";
-import { theme } from "../../terminal/theme.js";
 import { VERSION } from "../../version.js";
 import { parseTimeoutMsOrExit, resolveUpdateRoot, type UpdateStatusOptions } from "./shared.js";
 
@@ -32,6 +33,7 @@ function formatGitStatusLine(params: {
   return parts.join(" · ");
 }
 
+/** Print update status in JSON or table form for scripts and humans. */
 export async function updateStatusCommand(opts: UpdateStatusOptions): Promise<void> {
   const timeoutMs = parseTimeoutMsOrExit(opts.timeout);
   if (timeoutMs === null) {
@@ -46,11 +48,14 @@ export async function updateStatusCommand(opts: UpdateStatusOptions): Promise<vo
     root,
     timeoutMs: timeoutMs ?? 3500,
     fetchGit: true,
+    useDetachedDevUpstream: configChannel === "dev",
     includeRegistry: true,
-    registryChannel: resolveRegistryUpdateChannel({
-      configChannel,
-      currentVersion: VERSION,
-    }),
+    resolveRegistryChannel: ({ installKind, git }) =>
+      resolveStatusRegistryUpdateChannel({
+        configChannel,
+        installKind,
+        git,
+      }),
   });
 
   const channelInfo = resolveUpdateChannelDisplay({

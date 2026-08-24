@@ -1,8 +1,15 @@
+/**
+ * API-key resolution for non-interactive onboarding.
+ *
+ * The resolver keeps flag, environment, and auth-profile precedence consistent
+ * across provider setup paths while preserving secret-ref mode constraints.
+ */
 import {
   ensureAuthProfileStore,
   resolveApiKeyForProfile,
   resolveAuthProfileOrder,
 } from "../../agents/auth-profiles.js";
+import { isMalformedApiKeyInput } from "../../agents/auth-profiles/credential-state.js";
 import { resolveEnvApiKey } from "../../agents/model-auth.js";
 import { formatCliCommand } from "../../cli/command-format.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -10,7 +17,8 @@ import type { RuntimeEnv } from "../../runtime.js";
 import { normalizeOptionalSecretInput } from "../../utils/normalize-secret-input.js";
 import type { SecretInputMode } from "../onboard-types.js";
 
-export type NonInteractiveApiKeySource = "flag" | "env" | "profile";
+/** Source that supplied a non-interactive provider API key. */
+type NonInteractiveApiKeySource = "flag" | "env" | "profile";
 
 function parseEnvVarNameFromSourceLabel(source: string | undefined): string | undefined {
   if (!source) {
@@ -36,6 +44,8 @@ async function resolveApiKeyFromProfiles(params: {
     if (cred?.type !== "api_key") {
       continue;
     }
+    // Profile order already reflects config preference and store defaults; use
+    // the first resolvable API-key profile to match interactive auth behavior.
     const resolved = await resolveApiKeyForProfile({
       cfg: params.cfg,
       store,
@@ -49,6 +59,7 @@ async function resolveApiKeyFromProfiles(params: {
   return null;
 }
 
+/** Resolves an API key for non-interactive setup without prompting the user. */
 export async function resolveNonInteractiveApiKey(params: {
   provider: string;
   cfg: OpenClawConfig;
@@ -58,6 +69,7 @@ export async function resolveNonInteractiveApiKey(params: {
   envVarName?: string;
   runtime: RuntimeEnv;
   agentDir?: string;
+  workspaceDir?: string;
   allowProfile?: boolean;
   required?: boolean;
   secretInputMode?: SecretInputMode;
@@ -66,7 +78,10 @@ export async function resolveNonInteractiveApiKey(params: {
   const explicitEnvVar = params.envVarName?.trim() || params.envVar.trim();
   const resolveExplicitEnvKey = () => normalizeOptionalSecretInput(process.env[explicitEnvVar]);
   const resolveEnvKey = () => {
-    const envResolved = resolveEnvApiKey(params.provider);
+    const envResolved = resolveEnvApiKey(params.provider, process.env, {
+      config: params.cfg,
+      workspaceDir: params.workspaceDir,
+    });
     const explicitEnvKey = explicitEnvVar
       ? normalizeOptionalSecretInput(process.env[explicitEnvVar])
       : undefined;
@@ -75,13 +90,24 @@ export async function resolveNonInteractiveApiKey(params: {
       envVarName: parseEnvVarNameFromSourceLabel(envResolved?.source) ?? explicitEnvVar,
     };
   };
+  const returnOperatorKey = (key: string, source: "flag" | "env", envVarName?: string) => {
+    if (!isMalformedApiKeyInput(key)) {
+      return envVarName ? { key, source, envVarName } : { key, source };
+    }
+    const envHint = source === "env" ? ` Check ${envVarName ?? params.envVar}.` : "";
+    params.runtime.error(`Paste the API key value, not an OpenClaw onboarding command.${envHint}`);
+    params.runtime.exit(1);
+    return null;
+  };
 
   const useSecretRefMode = params.secretInputMode === "ref"; // pragma: allowlist secret
   if (useSecretRefMode && flagKey) {
     const explicitEnvKey = resolveExplicitEnvKey();
     if (explicitEnvKey) {
-      return { key: explicitEnvKey, source: "env", envVarName: explicitEnvVar };
+      return returnOperatorKey(explicitEnvKey, "env", explicitEnvVar);
     }
+    // A literal flag value cannot be converted into a durable secret reference;
+    // require an env var so the stored config can reference a stable name.
     params.runtime.error(
       [
         `${params.flagName} cannot be used with --secret-input-mode ref unless ${params.envVar} is set in env.`,
@@ -96,6 +122,8 @@ export async function resolveNonInteractiveApiKey(params: {
     const resolvedEnv = resolveEnvKey();
     if (resolvedEnv.key) {
       if (!resolvedEnv.envVarName) {
+        // Provider auto-detection can return a key without a concrete env var
+        // name; ref mode needs the name because the config stores the reference.
         params.runtime.error(
           [
             `--secret-input-mode ref requires an explicit environment variable for provider "${params.provider}".`,
@@ -105,19 +133,21 @@ export async function resolveNonInteractiveApiKey(params: {
         params.runtime.exit(1);
         return null;
       }
-      return { key: resolvedEnv.key, source: "env", envVarName: resolvedEnv.envVarName };
+      return returnOperatorKey(resolvedEnv.key, "env", resolvedEnv.envVarName);
     }
   }
 
   if (flagKey) {
-    return { key: flagKey, source: "flag" };
+    return returnOperatorKey(flagKey, "flag");
   }
 
   const resolvedEnv = resolveEnvKey();
   if (resolvedEnv.key) {
-    return { key: resolvedEnv.key, source: "env", envVarName: resolvedEnv.envVarName };
+    return returnOperatorKey(resolvedEnv.key, "env", resolvedEnv.envVarName);
   }
 
+  // Stored profiles are pre-existing state: doctor diagnoses them, while a new
+  // flag or env value must remain able to replace them during onboarding.
   if (params.allowProfile ?? true) {
     const profileKey = await resolveApiKeyFromProfiles({
       provider: params.provider,

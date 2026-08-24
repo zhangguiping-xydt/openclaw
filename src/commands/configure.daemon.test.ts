@@ -1,3 +1,6 @@
+// Configure daemon tests cover daemon install prompts, progress labels, and runtime install calls.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { maybeInstallDaemon } from "./configure.daemon.js";
 
@@ -37,7 +40,7 @@ vi.mock("./daemon-install-helpers.js", () => ({
   gatewayInstallErrorHint: vi.fn(() => "hint"),
 }));
 
-vi.mock("../terminal/note.js", () => ({
+vi.mock("../../packages/terminal-core/src/note.js", () => ({
   note,
 }));
 
@@ -100,7 +103,13 @@ describe("maybeInstallDaemon", () => {
 
     expect(resolveGatewayInstallToken).toHaveBeenCalledTimes(1);
     expect(buildGatewayInstallPlan).toHaveBeenCalledTimes(1);
-    expect("token" in buildGatewayInstallPlan.mock.calls[0]?.[0]).toBe(false);
+    expect(
+      "token" in
+        expectDefined(
+          buildGatewayInstallPlan.mock.calls[0],
+          "buildGatewayInstallPlan.mock.calls[0] test invariant",
+        )[0],
+    ).toBe(false);
     expect(serviceInstall).toHaveBeenCalledTimes(1);
   });
 
@@ -112,11 +121,12 @@ describe("maybeInstallDaemon", () => {
       warnings: [],
     });
 
-    await maybeInstallDaemon({
+    const outcome = await maybeInstallDaemon({
       runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
       port: 18789,
     });
 
+    expect(outcome).toBe("failed");
     expect(note).toHaveBeenCalledWith(
       "Gateway service install failed: Gateway install blocked: gateway.auth.token SecretRef is configured but unresolved (boom). Fix gateway auth config/token input and rerun configure.",
       "Gateway",
@@ -130,12 +140,10 @@ describe("maybeInstallDaemon", () => {
       new Error("systemctl is-enabled unavailable: Failed to connect to bus"),
     );
 
-    await expect(
-      maybeInstallDaemon({
-        runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
-        port: 18789,
-      }),
-    ).resolves.toBeUndefined();
+    await maybeInstallDaemon({
+      runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+      port: 18789,
+    });
 
     expect(serviceInstall).toHaveBeenCalledTimes(1);
   });
@@ -160,12 +168,10 @@ describe("maybeInstallDaemon", () => {
       new Error("systemctl --user unavailable: Failed to connect to bus: No medium found"),
     );
 
-    await expect(
-      maybeInstallDaemon({
-        runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
-        port: 18789,
-      }),
-    ).resolves.toBeUndefined();
+    await maybeInstallDaemon({
+      runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+      port: 18789,
+    });
 
     expect(serviceInstall).toHaveBeenCalledTimes(1);
   });

@@ -1,14 +1,22 @@
+// Tasks JSON tests cover structured task command output and managed task flow state.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runCommandWithRuntime } from "../cli/cli-utils.js";
 import type { RuntimeEnv } from "../runtime.js";
+import * as taskRuntime from "../tasks/runtime-internal.js";
+import { createManagedTaskFlow as createManagedTaskFlowOrNull } from "../tasks/task-flow-registry.js";
+import type { TaskFlowRecord } from "../tasks/task-flow-registry.types.js";
+import { createTaskRecord as createTaskRecordOrNull } from "../tasks/task-registry.js";
+import type { TaskRecord } from "../tasks/task-registry.types.js";
 import {
-  createManagedTaskFlow,
+  configureTaskFlowRegistryRuntime,
   resetTaskFlowRegistryForTests,
-} from "../tasks/task-flow-registry.js";
-import {
-  createTaskRecord,
   resetTaskRegistryDeliveryRuntimeForTests,
   resetTaskRegistryForTests,
-} from "../tasks/task-registry.js";
+} from "../tasks/task-runtime.test-helpers.js";
+import type {
+  TaskSystemAuditCode,
+  TaskSystemAuditSeverity,
+} from "../tasks/task-system-audit.types.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { tasksAuditJsonCommand, tasksListJsonCommand } from "./tasks-json.js";
 
@@ -20,12 +28,35 @@ function createRuntime(): RuntimeEnv {
   };
 }
 
+function createTaskRecord(params: Parameters<typeof createTaskRecordOrNull>[0]): TaskRecord {
+  const task = createTaskRecordOrNull(params);
+  if (!task) {
+    throw new Error("expected task creation to succeed");
+  }
+  return task;
+}
+
+function createManagedTaskFlow(
+  params: Parameters<typeof createManagedTaskFlowOrNull>[0],
+): TaskFlowRecord {
+  const flow = createManagedTaskFlowOrNull(params);
+  if (!flow) {
+    throw new Error("expected managed TaskFlow creation to succeed");
+  }
+  return flow;
+}
+
 function readJsonLog(runtime: RuntimeEnv): unknown {
   const [call] = vi.mocked(runtime.log).mock.calls;
   if (!call) {
     throw new Error("expected runtime log call");
   }
   return JSON.parse(String(call[0]));
+}
+
+function jsonRoundTrip<T>(value: T): T {
+  const serialized = JSON.stringify(value);
+  return JSON.parse(serialized) as T;
 }
 
 async function withTaskJsonStateDir(run: () => Promise<void>): Promise<void> {
@@ -84,7 +115,39 @@ describe("tasks JSON commands", () => {
         count: 1,
         runtime: "cli",
         status: "running",
-        tasks: [JSON.parse(JSON.stringify(cliTask))],
+        tasks: [jsonRoundTrip(cliTask)],
+      });
+
+      const emptyRuntime = createRuntime();
+      await tasksListJsonCommand({ json: true, runtime: "subagent" }, emptyRuntime);
+      expect(readJsonLog(emptyRuntime)).toStrictEqual({
+        count: 0,
+        runtime: "subagent",
+        status: null,
+        tasks: [],
+      });
+    });
+  });
+
+  it("reports blank list filters as absent in JSON output", async () => {
+    await withTaskJsonStateDir(async () => {
+      const task = createTaskRecord({
+        runtime: "cli",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        runId: "run-cli",
+        status: "running",
+        task: "Inspect issue backlog",
+      });
+
+      const runtime = createRuntime();
+      await tasksListJsonCommand({ json: true, runtime: "   ", status: "\t" }, runtime);
+
+      expect(readJsonLog(runtime)).toStrictEqual({
+        count: 1,
+        runtime: null,
+        status: null,
+        tasks: [jsonRoundTrip(task)],
       });
     });
   });
@@ -170,10 +233,107 @@ describe("tasks JSON commands", () => {
             ageMs: 45 * 60_000,
             status: "running",
             token: runningFlow.flowId,
-            flow: JSON.parse(JSON.stringify(runningFlow)),
+            flow: jsonRoundTrip(runningFlow),
           },
         ],
       });
+    });
+  });
+
+  it("reports blank audit filters as absent in JSON output", async () => {
+    await withTaskJsonStateDir(async () => {
+      const runtime = createRuntime();
+      await tasksAuditJsonCommand({ json: true, severity: "  ", code: "\t" }, runtime);
+
+      expect(readJsonLog(runtime)).toMatchObject({
+        filters: {
+          severity: null,
+          code: null,
+        },
+      });
+    });
+  });
+
+  it.each([
+    {
+      run: (runtime: RuntimeEnv) => tasksListJsonCommand({ json: true, runtime: "bogus" }, runtime),
+      message: "--runtime must be subagent, acp, cron, or cli.",
+    },
+    {
+      run: (runtime: RuntimeEnv) =>
+        tasksListJsonCommand({ json: true, status: "RUNNING" }, runtime),
+      message:
+        "--status must be queued, running, succeeded, failed, timed_out, cancelled, or lost.",
+    },
+    {
+      run: (runtime: RuntimeEnv) =>
+        tasksAuditJsonCommand(
+          { json: true, severity: "bogus" as TaskSystemAuditSeverity },
+          runtime,
+        ),
+      message: "--severity must be warn or error.",
+    },
+    {
+      run: (runtime: RuntimeEnv) =>
+        tasksAuditJsonCommand({ json: true, code: "bogus-code" as TaskSystemAuditCode }, runtime),
+      message:
+        "--code must be stale_queued, stale_running, lost, delivery_failed, missing_cleanup, inconsistent_timestamps, restore_failed, stale_waiting, stale_blocked, cancel_stuck, missing_linked_tasks, or blocked_task_missing.",
+    },
+  ])("rejects invalid routed filters before reading task state", async ({ run, message }) => {
+    const query = vi.spyOn(taskRuntime, "listTaskRecords").mockImplementation(() => {
+      throw new Error("task JSON query performed");
+    });
+    const runtime = createRuntime();
+
+    try {
+      await runCommandWithRuntime(runtime, () => run(runtime));
+
+      expect(runtime.error).toHaveBeenCalledWith(message);
+      expect(runtime.exit).toHaveBeenCalledWith(1);
+      expect(query).not.toHaveBeenCalled();
+      expect(runtime.log).not.toHaveBeenCalled();
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  it("keeps task-flow restore failures inspectable in audit JSON", async () => {
+    await withTaskJsonStateDir(async () => {
+      const loadSnapshot = vi.fn(() => {
+        throw new Error("SQLITE_IOERR: task-flow audit restore failed");
+      });
+      configureTaskFlowRegistryRuntime({
+        store: {
+          loadSnapshot,
+          saveSnapshot: () => {},
+        },
+      });
+      const runtime = createRuntime();
+
+      await tasksAuditJsonCommand({ json: true }, runtime);
+
+      expect(readJsonLog(runtime)).toMatchObject({
+        count: 1,
+        summary: {
+          taskFlows: {
+            total: 1,
+            errors: 1,
+            byCode: {
+              restore_failed: 1,
+            },
+          },
+        },
+        findings: [
+          {
+            kind: "task_flow",
+            severity: "error",
+            code: "restore_failed",
+            detail:
+              "task-flow registry restore failed: SQLITE_IOERR: task-flow audit restore failed",
+          },
+        ],
+      });
+      expect(loadSnapshot).toHaveBeenCalledTimes(1);
     });
   });
 });

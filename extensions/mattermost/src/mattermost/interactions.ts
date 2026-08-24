@@ -1,5 +1,7 @@
+// Mattermost plugin module implements interactions behavior.
 import { createHmac } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { resolveGatewayPort } from "openclaw/plugin-sdk/core";
 import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
 import {
   normalizeOptionalString,
@@ -63,10 +65,6 @@ const callbackUrls = new Map<string, string>();
 
 export function setInteractionCallbackUrl(accountId: string, url: string): void {
   callbackUrls.set(accountId, url);
-}
-
-export function getInteractionCallbackUrl(accountId: string): string | undefined {
-  return callbackUrls.get(accountId);
 }
 
 type InteractionCallbackConfig = Pick<OpenClawConfig, "gateway" | "channels"> & {
@@ -137,7 +135,7 @@ export function computeInteractionCallbackUrl(
   if (callbackBaseUrl) {
     return `${normalizeCallbackBaseUrl(callbackBaseUrl)}${path}`;
   }
-  const port = typeof cfg?.gateway?.port === "number" ? cfg.gateway.port : 18789;
+  const port = resolveGatewayPort(cfg);
   let host =
     cfg?.gateway?.customBindHost && !isWildcardBindHost(cfg.gateway.customBindHost)
       ? cfg.gateway.customBindHost.trim()
@@ -186,7 +184,7 @@ export function setInteractionSecret(accountIdOrBotToken: string, botToken?: str
   defaultInteractionSecret = deriveInteractionSecret(accountIdOrBotToken);
 }
 
-export function getInteractionSecret(accountId?: string): string {
+function getInteractionSecret(accountId?: string): string {
   const scoped = accountId ? interactionSecrets.get(accountId) : undefined;
   if (scoped) {
     return scoped;
@@ -220,16 +218,13 @@ function canonicalizeInteractionContext(value: unknown): unknown {
   return value;
 }
 
-export function generateInteractionToken(
-  context: Record<string, unknown>,
-  accountId?: string,
-): string {
+function generateInteractionToken(context: Record<string, unknown>, accountId?: string): string {
   const secret = getInteractionSecret(accountId);
   const payload = JSON.stringify(canonicalizeInteractionContext(context));
   return createHmac("sha256", secret).update(payload).digest("hex");
 }
 
-export function verifyInteractionToken(
+function verifyInteractionToken(
   context: Record<string, unknown>,
   token: string,
   accountId?: string,
@@ -503,8 +498,8 @@ export function createMattermostInteractionHandler(params: {
     }
 
     const userName = payload.user_name ?? payload.user_id;
-    let originalMessage = "";
-    let originalPost: MattermostPost | null = null;
+    let originalMessage;
+    let originalPost: MattermostPost | null;
     let clickedButtonName: string | null = null;
     try {
       originalPost = await client.request<MattermostPost>(`/posts/${payload.post_id}`);

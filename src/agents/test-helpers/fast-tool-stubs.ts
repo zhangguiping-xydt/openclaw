@@ -1,6 +1,11 @@
+/**
+ * Fast generic tool stubs.
+ *
+ * Provides lightweight tool records and shared mocks for media/web/plugin tool imports.
+ */
 import { vi } from "vitest";
 
-export type StubTool = {
+type StubTool = {
   name: string;
   description: string;
   parameters: { type: "object"; properties: Record<string, unknown> };
@@ -16,7 +21,7 @@ export const stubTool = (name: string): StubTool => ({
 });
 
 vi.mock("../tools/image-tool.js", () => ({
-  createImageTool: () => stubTool("image"),
+  createImageTool: () => stubTool("view_image"),
 }));
 
 vi.mock("../tools/image-generate-tool.js", () => ({

@@ -1,3 +1,4 @@
+// Live session model switch tests cover model changes during isolated cron runs.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LiveSessionModelSwitchError } from "../../agents/live-model-switch-error.js";
 import {
@@ -9,11 +10,11 @@ import {
   resolveAllowedModelRefMock,
   resolveConfiguredModelRefMock,
   resolveCronSessionMock,
-  resolveSessionAuthProfileOverrideMock,
+  resolveSessionAuthSelectionMock,
   resetRunCronIsolatedAgentTurnHarness,
-  runEmbeddedPiAgentMock,
+  runEmbeddedAgentMock,
   runWithModelFallbackMock,
-  updateSessionStoreMock,
+  patchSessionEntryMock,
 } from "./run.test-harness.js";
 
 const runCronIsolatedAgentTurn = await loadRunCronIsolatedAgentTurn();
@@ -68,19 +69,29 @@ function makeSuccessfulRunResult(modelUsed = "claude-sonnet-4-6") {
 function requireEmbeddedAgentCall(index: number): {
   provider?: string;
   model?: string;
+  agentHarnessRuntimeOverride?: string;
   authProfileId?: string;
   authProfileIdSource?: string;
+  suppressNextUserMessagePersistence?: boolean;
+  userTurnTranscriptRecorder?: {
+    markRuntimePersisted: (message: { role: "user"; content: string }) => void;
+  };
 } {
-  const call = runEmbeddedPiAgentMock.mock.calls[index]?.[0] as
+  const call = runEmbeddedAgentMock.mock.calls[index]?.[0] as
     | {
         provider?: string;
         model?: string;
+        agentHarnessRuntimeOverride?: string;
         authProfileId?: string;
         authProfileIdSource?: string;
+        suppressNextUserMessagePersistence?: boolean;
+        userTurnTranscriptRecorder?: {
+          markRuntimePersisted: (message: { role: "user"; content: string }) => void;
+        };
       }
     | undefined;
   if (!call) {
-    throw new Error(`Expected embedded PI agent call ${index}`);
+    throw new Error(`Expected embedded OpenClaw agent call ${index}`);
   }
   return call;
 }
@@ -109,7 +120,6 @@ describe("runCronIsolatedAgentTurn — LiveSessionModelSwitchError retry (#57206
         isNewSession: true,
       }),
     );
-    updateSessionStoreMock.mockResolvedValue(undefined);
     logWarnMock.mockReturnValue(undefined);
   });
 
@@ -177,20 +187,90 @@ describe("runCronIsolatedAgentTurn — LiveSessionModelSwitchError retry (#57206
 
     expect(result.status).toBe("error");
     expect(String(result.error)).toContain("transient network error");
-    expect(updateSessionStoreMock).toHaveBeenCalled();
+    expect(patchSessionEntryMock).toHaveBeenCalled();
     expect(cronSession.sessionEntry.model).toBe("claude-sonnet-4-6");
     expect(cronSession.sessionEntry.modelProvider).toBe("anthropic");
   });
 
+  it("propagates a legacy source-less user auth profile into the run", async () => {
+    resolveSessionAuthSelectionMock.mockResolvedValue({
+      profileId: "profile-a",
+      source: "user",
+      routeRequirement: undefined,
+    });
+    resolveCronSessionMock.mockReturnValue(
+      makeCronSession({
+        sessionEntry: makeCronSessionEntry({
+          authProfileOverride: "profile-a",
+        }),
+        isNewSession: false,
+      }),
+    );
+    runWithModelFallbackMock.mockImplementation(async ({ provider, model, run }) => ({
+      result: await run(provider, model),
+      provider,
+      model,
+      attempts: [],
+    }));
+
+    const result = await runCronIsolatedAgentTurn(makeParams());
+
+    expect(result.status).toBe("ok");
+    expect(requireEmbeddedAgentCall(0)).toMatchObject({
+      authProfileId: "profile-a",
+      authProfileIdSource: "user",
+    });
+    expect(runWithModelFallbackMock).toHaveBeenCalledWith(
+      expect.objectContaining({ userLockedAuthProfileId: "profile-a" }),
+    );
+  });
+
+  it("keeps a resolved fallback profile automatic when it differs from the stored pin", async () => {
+    resolveSessionAuthSelectionMock.mockResolvedValue({
+      profileId: "profile-b",
+      source: "auto",
+      routeRequirement: undefined,
+    });
+    resolveCronSessionMock.mockReturnValue(
+      makeCronSession({
+        sessionEntry: makeCronSessionEntry({
+          authProfileOverride: "profile-a",
+        }),
+        isNewSession: false,
+      }),
+    );
+    runWithModelFallbackMock.mockImplementation(async ({ provider, model, run }) => ({
+      result: await run(provider, model),
+      provider,
+      model,
+      attempts: [],
+    }));
+
+    const result = await runCronIsolatedAgentTurn(makeParams());
+
+    expect(result.status).toBe("ok");
+    expect(requireEmbeddedAgentCall(0)).toMatchObject({
+      authProfileId: "profile-b",
+      authProfileIdSource: "auto",
+    });
+    expect(runWithModelFallbackMock).toHaveBeenCalledWith(
+      expect.objectContaining({ userLockedAuthProfileId: undefined }),
+    );
+  });
+
   it("retries with switched auth profile state from LiveSessionModelSwitchError", async () => {
-    resolveSessionAuthProfileOverrideMock.mockResolvedValue("profile-a");
+    resolveSessionAuthSelectionMock.mockResolvedValue({
+      profileId: "profile-a",
+      source: "auto",
+      routeRequirement: undefined,
+    });
     const cronSession = makeCronSession({
       sessionEntry: makeCronSessionEntry({
         model: undefined,
         modelProvider: undefined,
         authProfileOverride: "profile-a",
-        authProfileOverrideSource: "auto",
         compactionCount: 7,
+        authProfileOverrideCompactionCount: 7,
       }),
       isNewSession: true,
     });
@@ -201,15 +281,19 @@ describe("runCronIsolatedAgentTurn — LiveSessionModelSwitchError retry (#57206
       model,
       attempts: [],
     }));
-    runEmbeddedPiAgentMock
-      .mockRejectedValueOnce(
-        new LiveSessionModelSwitchError({
+    runEmbeddedAgentMock
+      .mockImplementationOnce(async (request) => {
+        request.userTurnTranscriptRecorder?.markRuntimePersisted({
+          role: "user",
+          content: "run task",
+        });
+        throw new LiveSessionModelSwitchError({
           provider: "anthropic",
           model: "claude-sonnet-4-6",
           authProfileId: "profile-b",
           authProfileIdSource: "user",
-        }),
-      )
+        });
+      })
       .mockResolvedValueOnce({
         payloads: [{ text: "task complete" }],
         meta: {
@@ -224,14 +308,92 @@ describe("runCronIsolatedAgentTurn — LiveSessionModelSwitchError retry (#57206
     const result = await runCronIsolatedAgentTurn(makeParams());
 
     expect(result.status).toBe("ok");
-    expect(runEmbeddedPiAgentMock).toHaveBeenCalledTimes(2);
+    expect(runEmbeddedAgentMock).toHaveBeenCalledTimes(2);
     const retryParams = requireEmbeddedAgentCall(1);
     expect(retryParams.provider).toBe("anthropic");
     expect(retryParams.model).toBe("claude-sonnet-4-6");
     expect(retryParams.authProfileId).toBe("profile-b");
     expect(retryParams.authProfileIdSource).toBe("user");
+    const firstParams = requireEmbeddedAgentCall(0);
+    expect(firstParams.authProfileIdSource).toBe("auto");
+    expect(runWithModelFallbackMock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ userLockedAuthProfileId: undefined }),
+    );
+    expect(runWithModelFallbackMock).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ userLockedAuthProfileId: "profile-b" }),
+    );
+    expect(retryParams.userTurnTranscriptRecorder).toBe(firstParams.userTurnTranscriptRecorder);
+    expect(firstParams.suppressNextUserMessagePersistence).toBe(false);
+    expect(retryParams.suppressNextUserMessagePersistence).toBe(true);
     expect(cronSession.sessionEntry.authProfileOverride).toBe("profile-b");
     expect(cronSession.sessionEntry.authProfileOverrideSource).toBe("user");
+  });
+
+  it("retries a same-model switch with the runtime carried by the error", async () => {
+    resolveConfiguredModelRefMock.mockReturnValue({
+      provider: "openai",
+      model: "gpt-5.6-luna",
+    });
+    const cronSession = makeCronSession({
+      sessionEntry: makeCronSessionEntry({
+        model: "gpt-5.6-luna",
+        modelProvider: "openai",
+        agentRuntimeOverride: "openclaw",
+        contextTokens: 272_000,
+        contextTokensSource: "runtime",
+        contextBudgetStatus: {} as NonNullable<
+          ReturnType<typeof makeCronSessionEntry>["contextBudgetStatus"]
+        >,
+      }),
+      isNewSession: false,
+    });
+    resolveCronSessionMock.mockReturnValue(cronSession);
+    runWithModelFallbackMock.mockImplementation(async ({ provider, model, run }) => ({
+      result: await run(provider, model),
+      provider,
+      model,
+      attempts: [],
+    }));
+    runEmbeddedAgentMock
+      .mockRejectedValueOnce(
+        new LiveSessionModelSwitchError({
+          provider: "openai",
+          model: "gpt-5.6-luna",
+          agentRuntimeOverride: "codex",
+        }),
+      )
+      .mockResolvedValueOnce({
+        payloads: [{ text: "task complete" }],
+        meta: {
+          agentMeta: {
+            provider: "openai",
+            model: "gpt-5.6-luna",
+            usage: { input: 100, output: 50 },
+          },
+        },
+      });
+
+    const result = await runCronIsolatedAgentTurn(
+      makeParams({
+        job: makeJob({
+          payload: {
+            kind: "agentTurn",
+            message: "run task",
+            model: "openai/gpt-5.6-luna",
+          },
+        }),
+      }),
+    );
+
+    expect(result.status).toBe("ok");
+    expect(requireEmbeddedAgentCall(0).agentHarnessRuntimeOverride).toBe("openclaw");
+    expect(requireEmbeddedAgentCall(1).agentHarnessRuntimeOverride).toBe("codex");
+    expect(cronSession.sessionEntry.agentRuntimeOverride).toBe("codex");
+    expect(cronSession.sessionEntry.contextTokens).toBe(128_000);
+    expect(cronSession.sessionEntry.contextTokensSource).toBe("resolved");
+    expect(cronSession.sessionEntry.contextBudgetStatus).toBeUndefined();
   });
 
   it("returns error (not infinite loop) when LiveSessionModelSwitchError is thrown repeatedly", async () => {

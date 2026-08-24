@@ -1,7 +1,15 @@
+/**
+ * Tests agent creation event emission from gateway agent methods.
+ */
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  forgetActiveSessionForShutdown,
+  listActiveSessionsForShutdown,
+} from "../active-sessions-shutdown-tracker.js";
 
 const configMocks = vi.hoisted(() => ({
   storePath: "",
@@ -29,6 +37,7 @@ vi.mock("../../config/config.js", () => ({
 }));
 
 vi.mock("../../commands/agent.js", () => ({
+  agentCommandFromGatewayIngress: agentIngressMocks.agentCommandFromIngress,
   agentCommandFromIngress: agentIngressMocks.agentCommandFromIngress,
 }));
 
@@ -62,6 +71,9 @@ describe("agent handler session create events", () => {
   });
 
   afterEach(async () => {
+    for (const entry of listActiveSessionsForShutdown()) {
+      forgetActiveSessionForShutdown(entry.sessionId);
+    }
     await fs.rm(tempDir, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
@@ -70,28 +82,31 @@ describe("agent handler session create events", () => {
     const broadcastToConnIds = vi.fn();
     const respond = vi.fn();
 
-    await agentHandlers.agent({
-      params: {
-        message: "hi",
-        sessionKey: "agent:main:subagent:create-test",
-        idempotencyKey: "idem-agent-create-event",
+    await expectDefined(agentHandlers.agent, "agentHandlers.agent test invariant").call(
+      agentHandlers,
+      {
+        params: {
+          message: "hi",
+          sessionKey: "agent:main:subagent:create-test",
+          idempotencyKey: "idem-agent-create-event",
+        },
+        respond,
+        context: {
+          dedupe: new Map(),
+          deps: {} as never,
+          logGateway: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() } as never,
+          chatAbortControllers: new Map(),
+          addChatRun: vi.fn(),
+          registerToolEventRecipient: vi.fn(),
+          getRuntimeConfig: configMocks.getRuntimeConfig,
+          getSessionEventSubscriberConnIds: () => new Set(["conn-1"]),
+          broadcastToConnIds,
+        } as never,
+        client: null,
+        isWebchatConnect: () => false,
+        req: { id: "req-agent-create-event" } as never,
       },
-      respond,
-      context: {
-        dedupe: new Map(),
-        deps: {} as never,
-        logGateway: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() } as never,
-        chatAbortControllers: new Map(),
-        addChatRun: vi.fn(),
-        registerToolEventRecipient: vi.fn(),
-        getRuntimeConfig: configMocks.getRuntimeConfig,
-        getSessionEventSubscriberConnIds: () => new Set(["conn-1"]),
-        broadcastToConnIds,
-      } as never,
-      client: null,
-      isWebchatConnect: () => false,
-      req: { id: "req-agent-create-event" } as never,
-    });
+    );
 
     const responseCall = firstMockCall(respond) as
       | [boolean, { status?: string; runId?: string }, unknown, { runId?: string }]
@@ -108,14 +123,18 @@ describe("agent handler session create events", () => {
               string,
               { sessionKey?: string; reason?: string },
               Set<string>,
-              { dropIfSlow?: boolean },
+              { dropIfSlow?: boolean; sessionKeys?: string[] },
             ]
           | undefined;
         expect(call?.[0]).toBe("sessions.changed");
         expect(call?.[1]?.sessionKey).toBe("agent:main:subagent:create-test");
         expect(call?.[1]?.reason).toBe("create");
         expect(call?.[2]).toEqual(new Set(["conn-1"]));
-        expect(call?.[3]).toEqual({ dropIfSlow: true });
+        expect(call?.[3]).toEqual({
+          agentId: "main",
+          dropIfSlow: true,
+          sessionKeys: ["agent:main:subagent:create-test"],
+        });
       },
       { timeout: 2_000, interval: 5 },
     );

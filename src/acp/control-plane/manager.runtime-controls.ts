@@ -1,11 +1,18 @@
-import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
-import { AcpRuntimeError, withAcpRuntimeErrorBoundary } from "../runtime/errors.js";
+/** Applies runtime mode/config controls to live ACP backend sessions. */
 import type {
   AcpRuntime,
   AcpRuntimeCapabilities,
   AcpRuntimeHandle,
   AcpRuntimeStatus,
-} from "../runtime/types.js";
+} from "@openclaw/acp-core/runtime/types";
+import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import {
+  AcpRuntimeError,
+  formatAcpErrorChain,
+  toAcpRuntimeError,
+  withAcpRuntimeErrorBoundary,
+} from "../runtime/errors.js";
 import type { SessionAcpMeta } from "./manager.types.js";
 import { createUnsupportedControlError } from "./manager.utils.js";
 import type { CachedRuntimeState } from "./runtime-cache.js";
@@ -17,12 +24,10 @@ import {
 } from "./runtime-options.js";
 
 const OPTIONAL_TIMEOUT_CONFIG_KEYS = new Set(["timeout", "timeout_seconds"]);
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
+const THINKING_CONFIG_KEYS = new Set(["thinking", "effort", "reasoning_effort", "thought_level"]);
+const ACP_CONFIG_REJECTION_CODE_RE = /-3260[23]/;
+const CONFIG_OPTION_REJECTION_RE =
+  /invalid params|unsupported|not supported|not implement|invalid value|unknown config option|unknown value|not a valid value|must be one of/;
 
 function extractConfigOptionKeys(value: unknown): string[] {
   if (!Array.isArray(value)) {
@@ -33,14 +38,14 @@ function extractConfigOptionKeys(value: unknown): string[] {
       if (typeof entry === "string") {
         return normalizeText(entry);
       }
-      const record = asRecord(entry);
+      const record = asNullableRecord(entry);
       return normalizeText(record?.id ?? record?.key);
     })
     .filter(Boolean) as string[];
 }
 
 function extractRuntimeStatusConfigOptionKeys(status: AcpRuntimeStatus | undefined): string[] {
-  const details = asRecord(status?.details);
+  const details = asNullableRecord(status?.details);
   return [
     ...extractConfigOptionKeys(details?.configOptions),
     ...extractConfigOptionKeys(details?.config_options),
@@ -51,12 +56,29 @@ function isOptionalTimeoutConfigKey(key: string): boolean {
   return OPTIONAL_TIMEOUT_CONFIG_KEYS.has(normalizeLowercaseStringOrEmpty(key));
 }
 
+function isThinkingConfigKey(key: string): boolean {
+  return THINKING_CONFIG_KEYS.has(normalizeLowercaseStringOrEmpty(key));
+}
+
+function isUnsupportedControlRejection(error: unknown): boolean {
+  const errorCode = error && typeof error === "object" ? (error as { code?: unknown }).code : null;
+  return errorCode === "ACP_BACKEND_UNSUPPORTED_CONTROL";
+}
+
+function describeConfigOptionRejection(error: unknown): string {
+  const described = toAcpRuntimeError({
+    error,
+    fallbackCode: "ACP_TURN_FAILED",
+    fallbackMessage: "",
+  });
+  return normalizeLowercaseStringOrEmpty(`${formatAcpErrorChain(error)} ${described.message}`);
+}
+
 function isUnsupportedOptionalTimeoutConfigRejection(key: string, error: unknown): boolean {
   if (!isOptionalTimeoutConfigKey(key)) {
     return false;
   }
-  const errorCode = error && typeof error === "object" ? (error as { code?: unknown }).code : null;
-  if (errorCode === "ACP_BACKEND_UNSUPPORTED_CONTROL") {
+  if (isUnsupportedControlRejection(error)) {
     return true;
   }
   const message =
@@ -72,6 +94,26 @@ function isUnsupportedOptionalTimeoutConfigRejection(key: string, error: unknown
   );
 }
 
+function isRejectedThinkingConfigOption(key: string, error: unknown): boolean {
+  if (!isThinkingConfigKey(key)) {
+    return false;
+  }
+  if (isUnsupportedControlRejection(error)) {
+    return true;
+  }
+  const description = describeConfigOptionRejection(error);
+  const describesConfigOption =
+    description.includes("session/set_config_option") ||
+    (description.includes("config option") &&
+      description.includes(normalizeLowercaseStringOrEmpty(key)));
+  return (
+    describesConfigOption &&
+    ACP_CONFIG_REJECTION_CODE_RE.test(description) &&
+    CONFIG_OPTION_REJECTION_RE.test(description)
+  );
+}
+
+/** Resolves backend-advertised controls plus locally inferred runtime control support. */
 export async function resolveManagerRuntimeCapabilities(params: {
   runtime: AcpRuntime;
   handle: AcpRuntimeHandle;
@@ -122,6 +164,7 @@ export async function resolveManagerRuntimeCapabilities(params: {
   };
 }
 
+/** Applies persisted runtime options to a live handle once per unique option signature. */
 export async function applyManagerRuntimeControls(params: {
   sessionKey: string;
   runtime: AcpRuntime;
@@ -193,7 +236,10 @@ export async function applyManagerRuntimeControls(params: {
               value,
             });
           } catch (error) {
-            if (isUnsupportedOptionalTimeoutConfigRejection(key, error)) {
+            if (
+              isUnsupportedOptionalTimeoutConfigRejection(key, error) ||
+              isRejectedThinkingConfigOption(key, error)
+            ) {
               continue;
             }
             throw error;

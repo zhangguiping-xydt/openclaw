@@ -1,7 +1,8 @@
+// Covers package.json metadata readers.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { withTempDir } from "../test-helpers/temp-dir.js";
+import { withTestDir } from "../test-helpers/temp-dir.js";
 import { readPackageManagerSpec, readPackageName, readPackageVersion } from "./package-json.js";
 
 async function expectPackageMeta(params: {
@@ -15,7 +16,7 @@ async function expectPackageMeta(params: {
 
 describe("package-json helpers", () => {
   it("reads package version and trims package name", async () => {
-    await withTempDir({ prefix: "openclaw-package-json-" }, async (root) => {
+    await withTestDir({ prefix: "openclaw-package-json-" }, async (root) => {
       await fs.writeFile(
         path.join(root, "package.json"),
         JSON.stringify({
@@ -77,7 +78,7 @@ describe("package-json helpers", () => {
   ])(
     "returns normalized nulls for $name",
     async ({ writePackageJson, expectedVersion, expectedName }) => {
-      await withTempDir({ prefix: "openclaw-package-json-" }, async (root) => {
+      await withTestDir({ prefix: "openclaw-package-json-" }, async (root) => {
         await writePackageJson(root);
         await expectPackageMeta({
           root,

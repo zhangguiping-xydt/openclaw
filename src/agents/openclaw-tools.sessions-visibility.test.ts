@@ -1,3 +1,4 @@
+// Verifies sessions_history visibility defaults and sandbox clamps.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createSessionsHistoryTool } from "./tools/sessions-history-tool.js";
 
@@ -29,6 +30,7 @@ function getSessionsHistoryTool(options?: { sandboxed?: boolean }) {
 function mockGatewayWithHistory(
   extra?: (req: { method?: string; params?: Record<string, unknown> }) => unknown,
 ) {
+  // Most visibility tests need chat.history plus optional session resolution/listing.
   callGatewayMock.mockClear();
   callGatewayMock.mockImplementation(async (opts: unknown) => {
     const req = opts as { method?: string; params?: Record<string, unknown> };
@@ -54,11 +56,11 @@ describe("sessions tools visibility", () => {
       tools: { agentToAgent: { enabled: false } },
     };
     mockGatewayWithHistory((req) => {
-      if (req.method === "sessions.list" && req.params?.spawnedBy === "main") {
-        return { sessions: [{ key: "subagent:child-1" }] };
-      }
       if (req.method === "sessions.resolve") {
         const key = typeof req.params?.key === "string" ? req.params.key : "";
+        if (req.params?.spawnedBy === "main" && key !== "subagent:child-1") {
+          return {};
+        }
         return { key };
       }
       return undefined;
@@ -98,8 +100,8 @@ describe("sessions tools visibility", () => {
       agents: { defaults: { sandbox: { sessionToolsVisibility: "spawned" } } },
     };
     mockGatewayWithHistory((req) => {
-      if (req.method === "sessions.list" && req.params?.spawnedBy === "main") {
-        return { sessions: [] };
+      if (req.method === "sessions.resolve" && req.params?.spawnedBy === "main") {
+        return {};
       }
       return undefined;
     });

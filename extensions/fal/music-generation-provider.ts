@@ -1,3 +1,5 @@
+// Fal provider module implements model/runtime integration.
+import { resolveGeneratedMediaMaxBytes } from "openclaw/plugin-sdk/media-generation-runtime";
 import {
   downloadGeneratedMusicAsset,
   extractGeneratedMusicFileCandidates,
@@ -5,15 +7,14 @@ import {
   type MusicGenerationRequest,
 } from "openclaw/plugin-sdk/music-generation";
 import { isProviderApiKeyConfigured } from "openclaw/plugin-sdk/provider-auth";
-import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
 import {
   assertOkOrThrowHttpError,
   postJsonRequest,
-  resolveProviderHttpRequestConfig,
+  readProviderJsonResponse,
 } from "openclaw/plugin-sdk/provider-http";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveFalHttpRequestConfig } from "./http-config.js";
 
-const DEFAULT_FAL_BASE_URL = "https://fal.run";
 const DEFAULT_FAL_MUSIC_MODEL = "fal-ai/minimax-music/v2.6";
 const FAL_ACE_STEP_MODEL = "fal-ai/ace-step/prompt-to-audio";
 const FAL_STABLE_AUDIO_MODEL = "fal-ai/stable-audio-25/text-to-audio";
@@ -27,10 +28,6 @@ const FAL_MUSIC_MODELS = [
 
 function resolveFalMusicModel(model: string | undefined): string {
   return normalizeOptionalString(model) ?? DEFAULT_FAL_MUSIC_MODEL;
-}
-
-function resolveFalMusicBaseUrl(req: MusicGenerationRequest): string | undefined {
-  return normalizeOptionalString(req.cfg?.models?.providers?.fal?.baseUrl);
 }
 
 function buildFalMinimaxBody(req: MusicGenerationRequest): Record<string, unknown> {
@@ -109,11 +106,7 @@ export function buildFalMusicGenerationProvider(): MusicGenerationProvider {
     label: "fal",
     defaultModel: DEFAULT_FAL_MUSIC_MODEL,
     models: [...FAL_MUSIC_MODELS],
-    isConfigured: ({ agentDir }) =>
-      isProviderApiKeyConfigured({
-        provider: "fal",
-        agentDir,
-      }),
+    isConfigured: (ctx) => isProviderApiKeyConfigured({ provider: "fal", ...ctx }),
     capabilities: {
       generate: {
         maxTracks: 1,
@@ -145,29 +138,8 @@ export function buildFalMusicGenerationProvider(): MusicGenerationProvider {
         throw new Error("fal music generation does not support image reference inputs.");
       }
 
-      const auth = await resolveApiKeyForProvider({
-        provider: "fal",
-        cfg: req.cfg,
-        agentDir: req.agentDir,
-        store: req.authStore,
-      });
-      if (!auth.apiKey) {
-        throw new Error("fal API key missing");
-      }
-
       const { baseUrl, allowPrivateNetwork, headers, dispatcherPolicy } =
-        resolveProviderHttpRequestConfig({
-          baseUrl: resolveFalMusicBaseUrl(req),
-          defaultBaseUrl: DEFAULT_FAL_BASE_URL,
-          allowPrivateNetwork: false,
-          defaultHeaders: {
-            Authorization: `Key ${auth.apiKey}`,
-            "Content-Type": "application/json",
-          },
-          provider: "fal",
-          capability: "audio",
-          transport: "http",
-        });
+        await resolveFalHttpRequestConfig({ req, capability: "audio" });
       const model = resolveFalMusicModel(req.model);
       const { response, release } = await postJsonRequest({
         url: `${baseUrl}/${model}`,
@@ -181,7 +153,7 @@ export function buildFalMusicGenerationProvider(): MusicGenerationProvider {
 
       try {
         await assertOkOrThrowHttpError(response, "fal music generation failed");
-        const payload = await response.json();
+        const payload = await readProviderJsonResponse<unknown>(response, "fal music generation");
         const [candidate] = extractGeneratedMusicFileCandidates(payload);
         if (!candidate) {
           throw new Error("fal music generation response missing audio output");
@@ -192,6 +164,7 @@ export function buildFalMusicGenerationProvider(): MusicGenerationProvider {
           fetchFn: fetch,
           provider: "fal",
           requestFailedMessage: "fal generated music download failed",
+          maxBytes: resolveGeneratedMediaMaxBytes(req.cfg, "audio"),
         });
         const lyrics =
           typeof payload === "object" && payload && !Array.isArray(payload)

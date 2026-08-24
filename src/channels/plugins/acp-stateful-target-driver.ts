@@ -1,13 +1,19 @@
+/**
+ * ACP stateful target driver for configured bindings.
+ *
+ * Ensures ACP-backed bound sessions exist, are ready, and can be reset by Gateway.
+ */
 import {
-  ensureConfiguredAcpBindingReady,
+  ensureConfiguredAcpBindingReadyCore,
   ensureConfiguredAcpBindingSession,
 } from "../../acp/persistent-bindings.lifecycle.js";
 import { resolveConfiguredAcpBindingSpecBySessionKey } from "../../acp/persistent-bindings.resolve.js";
 import { resolveConfiguredAcpBindingSpecFromRecord } from "../../acp/persistent-bindings.types.js";
 import { readAcpSessionEntry } from "../../acp/runtime/session-meta.js";
+import { resolveSessionEntryAccessTarget } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { performGatewaySessionReset } from "../../gateway/session-reset-service.js";
 import { isAcpSessionKey, resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
-import { performGatewaySessionReset } from "./acp-stateful-target-reset.runtime.js";
 import type {
   ConfiguredBindingResolution,
   StatefulBindingTargetDescriptor,
@@ -80,7 +86,7 @@ async function ensureAcpTargetReady(params: {
       error: "Configured ACP binding unavailable",
     };
   }
-  return await ensureConfiguredAcpBindingReady({
+  return await ensureConfiguredAcpBindingReadyCore({
     cfg: params.cfg,
     configuredBinding: {
       spec: configuredBinding,
@@ -114,13 +120,28 @@ async function resetAcpTargetInPlace(params: {
   reason: "new" | "reset";
   commandSource?: string;
 }): Promise<StatefulBindingTargetResetResult> {
+  if (
+    resolveSessionEntryAccessTarget({ cfg: params.cfg, sessionKey: params.sessionKey }).entry
+      ?.incognito === true
+  ) {
+    return { ok: false, error: "Incognito sessions cannot reset in place." };
+  }
   const result = await performGatewaySessionReset({
     key: params.sessionKey,
     reason: params.reason,
     commandSource: params.commandSource ?? "stateful-target:acp-reset-in-place",
+    armSessionDiffBaselineCapture: true,
   });
   if (result.ok) {
-    return { ok: true };
+    if ("incognitoDeleted" in result) {
+      return { ok: true, sessionKey: result.key, storePath: result.storePath };
+    }
+    return {
+      ok: true,
+      sessionKey: result.key,
+      sessionId: result.entry.sessionId,
+      storePath: result.storePath,
+    };
   }
   return {
     ok: false,

@@ -1,7 +1,9 @@
+// Slack lifecycle status reaction tests cover reaction updates around channel session state changes.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createStatusReactionController,
   DEFAULT_EMOJIS,
+  DEFAULT_TIMING,
   type StatusReactionAdapter,
 } from "./status-reactions.js";
 
@@ -66,7 +68,9 @@ describe("Slack status reaction lifecycle", () => {
     expect(active.has(WEB_SEARCH_TOOL_EMOJI)).toBe(true);
     expect(active.has(DEFAULT_EMOJIS.thinking)).toBe(true);
 
-    await ctrl.setDone();
+    const donePromise = ctrl.setDone();
+    await vi.advanceTimersByTimeAsync(DEFAULT_TIMING.doneHoldMs);
+    await donePromise;
     expect(active.has(DEFAULT_EMOJIS.done)).toBe(true);
     expect(active.has(WEB_SEARCH_TOOL_EMOJI)).toBe(false);
     expect(active.has(DEFAULT_EMOJIS.thinking)).toBe(false);
@@ -89,7 +93,9 @@ describe("Slack status reaction lifecycle", () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(active.has("eyes")).toBe(true);
 
-    await ctrl.setError();
+    const errorPromise = ctrl.setError();
+    await vi.advanceTimersByTimeAsync(DEFAULT_TIMING.errorHoldMs);
+    await errorPromise;
     expect(active.has(DEFAULT_EMOJIS.error)).toBe(true);
     expect(active.has("eyes")).toBe(false);
 
@@ -154,7 +160,9 @@ describe("Slack status reaction lifecycle", () => {
 
     void ctrl.setQueued();
     await vi.advanceTimersByTimeAsync(10);
-    await ctrl.setDone();
+    const donePromise = ctrl.setDone();
+    await vi.advanceTimersByTimeAsync(DEFAULT_TIMING.doneHoldMs);
+    await donePromise;
 
     await ctrl.restoreInitial();
 

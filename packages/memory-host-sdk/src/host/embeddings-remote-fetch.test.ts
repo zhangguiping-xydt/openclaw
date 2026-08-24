@@ -1,3 +1,4 @@
+// Memory Host SDK tests cover embeddings remote fetch behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchRemoteEmbeddingVectors } from "./embeddings-remote-fetch.js";
 
@@ -121,6 +122,39 @@ describe("fetchRemoteEmbeddingVectors", () => {
         errorPrefix: "embedding fetch failed",
       }),
     ).rejects.toThrow("embedding fetch failed: malformed JSON response");
+  });
+
+  it.each([
+    { name: "query", input: ["query"], data: [{ embedding: [] }] },
+    {
+      name: "document batch",
+      input: ["first", "second"],
+      data: [{ embedding: [0.1] }, { embedding: [] }],
+    },
+  ])("rejects empty vectors in a $name response", async ({ input, data }) => {
+    postJsonMock.mockImplementationOnce(async (params) => await params.parse({ data }));
+
+    await expect(
+      fetchRemoteEmbeddingVectors({
+        url: "https://memory.example/v1/embeddings",
+        headers: {},
+        body: { input },
+        errorPrefix: "embedding fetch failed",
+      }),
+    ).rejects.toThrow("embedding fetch failed: malformed JSON response");
+  });
+
+  it("preserves an empty response for an empty submitted input batch", async () => {
+    postJsonMock.mockImplementationOnce(async (params) => await params.parse({ data: [] }));
+
+    await expect(
+      fetchRemoteEmbeddingVectors({
+        url: "https://memory.example/v1/embeddings",
+        headers: {},
+        body: { input: [] },
+        errorPrefix: "embedding fetch failed",
+      }),
+    ).resolves.toEqual([]);
   });
 
   it("rejects wrong nested embedding vector types", async () => {

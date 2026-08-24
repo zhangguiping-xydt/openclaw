@@ -1,3 +1,4 @@
+// Targeted Docker Lane Groups tests cover targeted docker lane groups script behavior.
 import { describe, expect, it } from "vitest";
 import { planTargetedDockerLaneGroups } from "../../scripts/plan-targeted-docker-lane-groups.mjs";
 
@@ -64,5 +65,43 @@ describe("scripts/plan-targeted-docker-lane-groups", () => {
     ).toEqual([
       { docker_lanes: "published-upgrade-survivor", label: "published-upgrade-survivor" },
     ]);
+  });
+
+  it("extends only groups containing expanded survivor lanes", () => {
+    expect(
+      planTargetedDockerLaneGroups({
+        groupSize: 2,
+        lanes:
+          "doctor-switch published-upgrade-survivor plugins-offline update-migration plugin-update",
+        upgradeSurvivorScenarios: "base plugin-deps-cleanup",
+      }),
+    ).toEqual([
+      {
+        docker_lanes: "doctor-switch published-upgrade-survivor",
+        label: "doctor-switch--published-upgrade-survivor",
+        timeout_minutes: 90,
+      },
+      {
+        docker_lanes: "plugins-offline update-migration",
+        label: "plugins-offline--update-migration",
+        timeout_minutes: 90,
+      },
+      { docker_lanes: "plugin-update", label: "plugin-update" },
+    ]);
+  });
+
+  it("rejects malformed group size values", () => {
+    expect(() =>
+      planTargetedDockerLaneGroups({
+        groupSize: "2x",
+        lanes: "doctor-switch update-channel-switch",
+      }),
+    ).toThrow("groupSize must be a positive integer");
+    expect(() =>
+      planTargetedDockerLaneGroups({
+        groupSize: 0,
+        lanes: "doctor-switch update-channel-switch",
+      }),
+    ).toThrow("groupSize must be a positive integer");
   });
 });

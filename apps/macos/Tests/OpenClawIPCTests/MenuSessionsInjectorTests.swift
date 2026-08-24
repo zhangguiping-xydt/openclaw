@@ -51,10 +51,6 @@ struct MenuSessionsInjectorTests {
                 key: "main",
                 kind: .direct,
                 displayName: nil,
-                provider: nil,
-                subject: nil,
-                room: nil,
-                space: nil,
                 updatedAt: Date(),
                 sessionId: "s1",
                 thinkingLevel: "low",
@@ -68,10 +64,6 @@ struct MenuSessionsInjectorTests {
                 key: "discord:group:alpha",
                 kind: .group,
                 displayName: nil,
-                provider: nil,
-                subject: nil,
-                room: nil,
-                space: nil,
                 updatedAt: Date(timeIntervalSinceNow: -60),
                 sessionId: "s2",
                 thinkingLevel: "high",
@@ -94,16 +86,14 @@ struct MenuSessionsInjectorTests {
                     provider: "anthropic",
                     displayName: "Claude",
                     windows: [GatewayUsageWindow(label: "5h", usedPercent: 12, resetAt: nil)],
-                    plan: "Pro",
-                    error: nil),
+                    plan: "Pro"),
                 GatewayUsageProvider(
-                    provider: "openai-codex",
+                    provider: "openai",
                     displayName: "Codex",
                     windows: [GatewayUsageWindow(label: "day", usedPercent: 3, resetAt: nil)],
-                    plan: nil,
-                    error: nil),
+                    plan: nil),
             ])
-        injector.setTestingUsageSummary(usage, errorText: nil)
+        injector.setTestingUsageSummary(usage)
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Header", action: nil, keyEquivalent: ""))

@@ -1,3 +1,4 @@
+// Matrix tests cover route plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { matrixPlugin } from "../../channel.js";
 import {
@@ -43,6 +44,11 @@ function senderPeer(id = "@alice:example.org"): RoutePeer {
 function dmRoomPeer(id = "!dm:example.org"): RoutePeer {
   return { kind: "channel", id };
 }
+
+const threadCfg = {
+  ...baseCfg,
+  bindings: [matrixBinding("main")],
+} satisfies OpenClawConfig;
 
 function resolveDmRoute(
   cfg: OpenClawConfig,
@@ -212,7 +218,7 @@ describe("resolveMatrixInboundRoute thread-isolated sessions", () => {
 
   it("scopes session key to thread when a thread id is provided", () => {
     const { route } = resolveMatrixInboundRoute({
-      cfg: baseCfg as never,
+      cfg: threadCfg as never,
       accountId: "ops",
       roomId: "!room:example.org",
       senderId: "@alice:example.org",
@@ -228,7 +234,7 @@ describe("resolveMatrixInboundRoute thread-isolated sessions", () => {
 
   it("preserves mixed-case matrix thread ids in session keys", () => {
     const { route } = resolveMatrixInboundRoute({
-      cfg: baseCfg as never,
+      cfg: threadCfg as never,
       accountId: "ops",
       roomId: "!room:example.org",
       senderId: "@alice:example.org",
@@ -242,7 +248,7 @@ describe("resolveMatrixInboundRoute thread-isolated sessions", () => {
 
   it("does not scope session key when thread id is absent", () => {
     const { route } = resolveMatrixInboundRoute({
-      cfg: baseCfg as never,
+      cfg: threadCfg as never,
       accountId: "ops",
       roomId: "!room:example.org",
       senderId: "@alice:example.org",

@@ -1,3 +1,9 @@
+// Shared provider helper tests cover deadlines, guarded fetch policy, HTTP
+// config, and multipart transcription.
+import {
+  MAX_DATE_TIMESTAMP_MS,
+  MAX_TIMER_TIMEOUT_MS,
+} from "@openclaw/normalization-core/number-coercion";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VERSION } from "../version.js";
 
@@ -28,15 +34,14 @@ vi.mock("../infra/net/proxy-env.js", async () => {
 
 import {
   createProviderOperationDeadline,
-  createProviderOperationTimeoutResolver,
   fetchProviderDownloadResponse,
   fetchWithTimeoutGuarded,
   pollProviderOperationJson,
   postJsonRequest,
   postTranscriptionRequest,
-  readErrorResponse,
-  resolveProviderOperationTimeoutMs,
   resolveProviderHttpRequestConfig,
+  resolveProviderHttpRequestConfigWithOriginTrust,
+  resolveProviderOperationTimeoutMs,
   waitProviderOperationPollInterval,
 } from "./shared.js";
 
@@ -50,6 +55,8 @@ afterEach(() => {
 });
 
 function getFirstGuardedFetchCall() {
+  // Guarded fetch options carry SSRF and proxy policy, so assertions inspect the
+  // structured request passed to the network guard.
   const [mockCall] = fetchWithSsrFGuardMock.mock.calls;
   if (!mockCall) {
     throw new Error("Expected fetchWithSsrFGuard to be called");
@@ -61,6 +68,21 @@ function getFirstGuardedFetchCall() {
   return request as Record<string, unknown>;
 }
 
+function createTricklingResponse(status = 200): Response {
+  const chunk = new TextEncoder().encode("{");
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        controller.enqueue(chunk);
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 20);
+        });
+      },
+    }),
+    { status, headers: { "content-type": "application/json" } },
+  );
+}
+
 describe("provider operation deadlines", () => {
   it("keeps default per-call timeouts when no operation timeout is configured", () => {
     const deadline = createProviderOperationDeadline({
@@ -68,6 +90,40 @@ describe("provider operation deadlines", () => {
     });
 
     expect(resolveProviderOperationTimeoutMs({ deadline, defaultTimeoutMs: 60_000 })).toBe(60_000);
+  });
+
+  it("caps oversized operation and per-call timeouts to timer-safe values", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+
+    const deadline = createProviderOperationDeadline({
+      label: "video generation",
+      timeoutMs: MAX_TIMER_TIMEOUT_MS + 1_000_000,
+    });
+
+    expect(deadline.timeoutMs).toBe(MAX_TIMER_TIMEOUT_MS);
+    expect(deadline.deadlineAtMs).toBe(1_000 + MAX_TIMER_TIMEOUT_MS);
+    expect(
+      resolveProviderOperationTimeoutMs({
+        deadline: createProviderOperationDeadline({ label: "no deadline" }),
+        defaultTimeoutMs: MAX_TIMER_TIMEOUT_MS + 1_000_000,
+      }),
+    ).toBe(MAX_TIMER_TIMEOUT_MS);
+  });
+
+  it("keeps operation deadlines inside the Date timestamp range", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(MAX_DATE_TIMESTAMP_MS));
+
+    const deadline = createProviderOperationDeadline({
+      label: "video generation",
+      timeoutMs: 1,
+    });
+
+    expect(deadline.deadlineAtMs).toBe(MAX_DATE_TIMESTAMP_MS);
+    expect(() => resolveProviderOperationTimeoutMs({ deadline, defaultTimeoutMs: 60_000 })).toThrow(
+      "video generation timed out after 1ms",
+    );
   });
 
   it("clamps per-call timeouts to the remaining operation deadline", () => {
@@ -82,6 +138,22 @@ describe("provider operation deadlines", () => {
     vi.setSystemTime(4_250);
 
     expect(resolveProviderOperationTimeoutMs({ deadline, defaultTimeoutMs: 60_000 })).toBe(1_750);
+  });
+
+  it("resolves a lazy total timeout once when the deadline starts", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const resolveTimeoutMs = vi.fn(() => 5_000);
+
+    const deadline = createProviderOperationDeadline({
+      label: "generated media download",
+      timeoutMs: resolveTimeoutMs,
+    });
+    vi.setSystemTime(4_250);
+
+    expect(resolveTimeoutMs).toHaveBeenCalledTimes(1);
+    expect(resolveProviderOperationTimeoutMs({ deadline, defaultTimeoutMs: 60_000 })).toBe(1_750);
+    expect(resolveTimeoutMs).toHaveBeenCalledTimes(1);
   });
 
   it("throws once the operation deadline has expired", () => {
@@ -125,6 +197,20 @@ describe("provider operation deadlines", () => {
     await expect(wait).resolves.toBeUndefined();
   });
 
+  it("caps oversized provider poll waits without an operation deadline", async () => {
+    vi.useFakeTimers();
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+    const wait = waitProviderOperationPollInterval({
+      deadline: createProviderOperationDeadline({ label: "video generation" }),
+      pollIntervalMs: MAX_TIMER_TIMEOUT_MS + 1_000_000,
+    });
+
+    expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), MAX_TIMER_TIMEOUT_MS);
+    await vi.advanceTimersByTimeAsync(MAX_TIMER_TIMEOUT_MS);
+    await expect(wait).resolves.toBeUndefined();
+  });
+
   it("polls provider status JSON until a payload is complete", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
@@ -153,6 +239,109 @@ describe("provider operation deadlines", () => {
 
     await expect(result).resolves.toEqual({ status: "completed" });
     expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds a trickling poll response body with the operation deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(createTricklingResponse());
+    const result = pollProviderOperationJson<{ status?: string }>({
+      url: "https://api.example.com/v1/videos/task-1",
+      headers: new Headers(),
+      deadline: createProviderOperationDeadline({
+        label: "video generation task task-1",
+        timeoutMs: 100,
+      }),
+      defaultTimeoutMs: 5_000,
+      fetchFn,
+      maxAttempts: 3,
+      pollIntervalMs: 1_000,
+      requestFailedMessage: "status failed",
+      timeoutMessage: "task timed out",
+      isComplete: (payload) => payload.status === "completed",
+    });
+    const assertion = expect(result).rejects.toThrow(
+      "video generation task task-1 timed out after 100ms",
+    );
+
+    await vi.advanceTimersByTimeAsync(110);
+    await assertion;
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes guarded request policy through provider status polling", async () => {
+    const release = vi.fn(async () => {});
+    fetchWithSsrFGuardMock.mockResolvedValueOnce({
+      response: new Response(JSON.stringify({ status: "completed" })),
+      finalUrl: "https://api.example.com/v1/videos/task-1",
+      release,
+    });
+
+    const result = await pollProviderOperationJson<{ status?: string }>({
+      url: "https://api.example.com/v1/videos/task-1",
+      headers: new Headers({ authorization: "Bearer test" }),
+      deadline: createProviderOperationDeadline({
+        label: "video generation task task-1",
+      }),
+      defaultTimeoutMs: 5_000,
+      fetchFn: fetch,
+      maxAttempts: 3,
+      pollIntervalMs: 1_000,
+      requestFailedMessage: "status failed",
+      timeoutMessage: "task timed out",
+      allowPrivateNetwork: true,
+      dispatcherPolicy: { mode: "direct" },
+      auditContext: "provider-video-status",
+      isComplete: (payload) => payload.status === "completed",
+    });
+
+    expect(result).toEqual({ status: "completed" });
+    expect(getFirstGuardedFetchCall().policy).toEqual({ allowPrivateNetwork: true });
+    expect(getFirstGuardedFetchCall().dispatcherPolicy).toEqual({ mode: "direct" });
+    expect(getFirstGuardedFetchCall().auditContext).toBe("provider-video-status");
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries guarded transient provider status failures while polling", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const firstRelease = vi.fn(async () => {});
+    const secondRelease = vi.fn(async () => {});
+    fetchWithSsrFGuardMock
+      .mockResolvedValueOnce({
+        response: new Response("busy", { status: 503, statusText: "Service Unavailable" }),
+        finalUrl: "https://api.example.com/v1/videos/task-1",
+        release: firstRelease,
+      })
+      .mockResolvedValueOnce({
+        response: new Response(JSON.stringify({ status: "completed" })),
+        finalUrl: "https://api.example.com/v1/videos/task-1",
+        release: secondRelease,
+      });
+
+    const result = pollProviderOperationJson<{ status?: string }>({
+      url: "https://api.example.com/v1/videos/task-1",
+      headers: new Headers({ authorization: "Bearer test" }),
+      deadline: createProviderOperationDeadline({
+        label: "video generation task task-1",
+        timeoutMs: 10_000,
+      }),
+      defaultTimeoutMs: 5_000,
+      fetchFn: fetch,
+      maxAttempts: 3,
+      pollIntervalMs: 1_000,
+      requestFailedMessage: "status failed",
+      timeoutMessage: "task timed out",
+      allowPrivateNetwork: true,
+      isComplete: (payload) => payload.status === "completed",
+    });
+
+    await vi.advanceTimersByTimeAsync(250);
+
+    await expect(result).resolves.toEqual({ status: "completed" });
+    expect(fetchWithSsrFGuardMock).toHaveBeenCalledTimes(2);
+    expect(firstRelease).toHaveBeenCalledTimes(1);
+    expect(secondRelease).toHaveBeenCalledTimes(1);
   });
 
   it("throws provider failure messages while polling status JSON", async () => {
@@ -301,6 +490,7 @@ describe("provider operation deadlines", () => {
     const response = await fetchProviderDownloadResponse({
       url: "https://cdn.example.com/video.mp4",
       init: { method: "GET" },
+      // Keep the shipped timeoutMs call shape working for external plugins.
       timeoutMs: 5_000,
       fetchFn,
       provider: "test-video",
@@ -311,6 +501,26 @@ describe("provider operation deadlines", () => {
     expect(await response.text()).toBe("video-bytes");
     expect(fetchFn).toHaveBeenCalledTimes(2);
     expect(sleep).toHaveBeenCalledWith(0, undefined);
+  });
+
+  it("bounds a trickling generated-asset error body", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(createTricklingResponse(503));
+    const result = fetchProviderDownloadResponse({
+      url: "https://cdn.example.com/video.mp4",
+      init: { method: "GET" },
+      deadline: createProviderOperationDeadline({ label: "download failed", timeoutMs: 100 }),
+      fetchFn,
+      provider: "test-video",
+      requestFailedMessage: "download failed",
+      retry: { attempts: 1 },
+    });
+    const assertion = expect(result).rejects.toThrow("download failed timed out after 100ms");
+
+    await vi.advanceTimersByTimeAsync(110);
+    await assertion;
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
   it("recomputes remaining download timeout before retry attempts", async () => {
@@ -330,7 +540,7 @@ describe("provider operation deadlines", () => {
       fetchProviderDownloadResponse({
         url: "https://cdn.example.com/video.mp4",
         init: { method: "GET" },
-        timeoutMs: createProviderOperationTimeoutResolver({ deadline, defaultTimeoutMs: 5_000 }),
+        deadline,
         fetchFn,
         provider: "test-video",
         requestFailedMessage: "download failed",
@@ -407,6 +617,30 @@ describe("resolveProviderHttpRequestConfig", () => {
     expect(resolved.headers.get("x-goog-api-key")).toBe("test-key");
   });
 
+  it("keeps configured-origin trust eligibility internal to core callers", () => {
+    const custom = resolveProviderHttpRequestConfigWithOriginTrust({
+      baseUrl: "https://models.internal/v1",
+      defaultBaseUrl: "https://api.example.com/v1",
+      provider: "example",
+    });
+    const deniedLocal = resolveProviderHttpRequestConfigWithOriginTrust({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      defaultBaseUrl: "https://api.example.com/v1",
+      provider: "example",
+      request: { allowPrivateNetwork: false },
+    });
+
+    expect(custom.trustConfiguredBaseUrlOrigin).toBe(true);
+    expect(deniedLocal.trustConfiguredBaseUrlOrigin).toBe(false);
+    expect(
+      resolveProviderHttpRequestConfig({
+        baseUrl: "https://models.internal/v1",
+        defaultBaseUrl: "https://api.example.com/v1",
+        provider: "example",
+      }),
+    ).not.toHaveProperty("trustConfiguredBaseUrlOrigin");
+  });
+
   it("surfaces dispatcher policy for explicit proxy and mTLS transport overrides", () => {
     const resolved = resolveProviderHttpRequestConfig({
       baseUrl: "https://api.deepgram.com/v1",
@@ -451,32 +685,6 @@ describe("resolveProviderHttpRequestConfig", () => {
   });
 });
 
-describe("readErrorResponse", () => {
-  it("caps streamed error bodies instead of buffering the whole response", async () => {
-    const encoder = new TextEncoder();
-    let reads = 0;
-    const response = new Response(
-      new ReadableStream<Uint8Array>({
-        pull(controller) {
-          reads += 1;
-          controller.enqueue(encoder.encode("a".repeat(2048)));
-          if (reads >= 10) {
-            controller.close();
-          }
-        },
-      }),
-      {
-        status: 500,
-      },
-    );
-
-    const detail = await readErrorResponse(response);
-
-    expect(detail).toBe(`${"a".repeat(300)}…`);
-    expect(reads).toBe(2);
-  });
-});
-
 describe("fetchWithTimeoutGuarded", () => {
   it("applies a default timeout when callers omit one", async () => {
     fetchWithSsrFGuardMock.mockResolvedValue({
@@ -506,6 +714,23 @@ describe("fetchWithTimeoutGuarded", () => {
     const call = getFirstGuardedFetchCall();
     expect(call.auditContext).toBe("provider-http fal image test");
     expect(call.timeoutMs).toBe(5000);
+  });
+
+  it("truncates auditContext without leaving a lone surrogate at the max boundary", async () => {
+    fetchWithSsrFGuardMock.mockResolvedValue({
+      response: new Response(null, { status: 200 }),
+      finalUrl: "https://example.com",
+      release: async () => {},
+    });
+
+    const prefix = "a".repeat(79);
+    await fetchWithTimeoutGuarded("https://example.com", {}, 5000, fetch, {
+      auditContext: `${prefix}${String.fromCodePoint(0x1f600)}tail`,
+    });
+
+    const call = getFirstGuardedFetchCall();
+    expect(call.auditContext).toBe(prefix);
+    expect(call.auditContext).not.toContain(String.fromCharCode(0xd83d));
   });
 
   it("passes configured explicit proxy policy through the SSRF guard", async () => {
@@ -628,6 +853,39 @@ describe("fetchWithTimeoutGuarded", () => {
     fetchWithSsrFGuardMock
       .mockResolvedValueOnce({
         response: new Response("busy", { status: 503, statusText: "Service Unavailable" }),
+        finalUrl: "https://api.example.com",
+        release: firstRelease,
+      })
+      .mockResolvedValueOnce({
+        response: new Response(null, { status: 200 }),
+        finalUrl: "https://api.example.com",
+        release: secondRelease,
+      });
+
+    const result = await postJsonRequest({
+      url: "https://api.example.com/v1/analyze",
+      headers: new Headers(),
+      body: { media: "base64" },
+      fetchFn: fetch,
+      retryStage: "read",
+      retry: { attempts: 2, baseDelayMs: 0, maxDelayMs: 0, sleep },
+    });
+
+    expect(result.response.status).toBe(200);
+    expect(fetchWithSsrFGuardMock).toHaveBeenCalledTimes(2);
+    expect(firstRelease).toHaveBeenCalledOnce();
+    expect(secondRelease).not.toHaveBeenCalled();
+    expect(sleep).toHaveBeenCalledWith(0, undefined);
+  });
+
+  it("retries read JSON POST 429 rate limit responses", async () => {
+    fetchWithSsrFGuardMock.mockReset();
+    const firstRelease = vi.fn(async () => undefined);
+    const secondRelease = vi.fn(async () => undefined);
+    const sleep = vi.fn(async () => undefined);
+    fetchWithSsrFGuardMock
+      .mockResolvedValueOnce({
+        response: new Response("rate limited", { status: 429, statusText: "Too Many Requests" }),
         finalUrl: "https://api.example.com",
         release: firstRelease,
       })

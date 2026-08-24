@@ -1,8 +1,11 @@
+// Deepseek plugin entrypoint registers its OpenClaw integration.
 import { readConfiguredProviderCatalogEntries } from "openclaw/plugin-sdk/provider-catalog-shared";
 import { defineSingleProviderPluginEntry } from "openclaw/plugin-sdk/provider-entry";
 import { buildProviderReplayFamilyHooks } from "openclaw/plugin-sdk/provider-model-shared";
 import { buildProviderToolCompatFamilyHooks } from "openclaw/plugin-sdk/provider-tools";
-import { applyDeepSeekConfig, DEEPSEEK_DEFAULT_MODEL_REF } from "./onboard.js";
+import { fetchDeepSeekUsage } from "openclaw/plugin-sdk/provider-usage";
+import { applyDeepSeekConfig } from "./onboard.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
 import { buildDeepSeekProvider } from "./provider-catalog.js";
 import { createDeepSeekV4ThinkingWrapper } from "./stream.js";
 import { resolveDeepSeekV4ThinkingProfile } from "./thinking.js";
@@ -13,31 +16,15 @@ export default defineSingleProviderPluginEntry({
   id: PROVIDER_ID,
   name: "DeepSeek Provider",
   description: "Bundled DeepSeek provider plugin",
+  manifest,
   provider: {
     label: "DeepSeek",
     docsPath: "/providers/deepseek",
-    auth: [
-      {
-        methodId: "api-key",
-        label: "DeepSeek API key",
-        hint: "API key",
-        optionKey: "deepseekApiKey",
-        flagName: "--deepseek-api-key",
-        envVar: "DEEPSEEK_API_KEY",
-        promptMessage: "Enter DeepSeek API key",
-        defaultModel: DEEPSEEK_DEFAULT_MODEL_REF,
-        applyConfig: (cfg) => applyDeepSeekConfig(cfg),
-        wizard: {
-          choiceId: "deepseek-api-key",
-          choiceLabel: "DeepSeek API key",
-          groupId: "deepseek",
-          groupLabel: "DeepSeek",
-          groupHint: "API key",
-        },
-      },
-    ],
+    manifestAuth: { applyConfig: applyDeepSeekConfig },
     catalog: {
       buildProvider: buildDeepSeekProvider,
+      buildStaticProvider: buildDeepSeekProvider,
+      liveModelDiscovery: true,
     },
     augmentModelCatalog: ({ config }) =>
       readConfiguredProviderCatalogEntries({
@@ -54,5 +41,13 @@ export default defineSingleProviderPluginEntry({
     wrapStreamFn: (ctx) => createDeepSeekV4ThinkingWrapper(ctx.streamFn, ctx.thinkingLevel),
     resolveThinkingProfile: ({ modelId }) => resolveDeepSeekV4ThinkingProfile(modelId),
     isModernModelRef: ({ modelId }) => Boolean(resolveDeepSeekV4ThinkingProfile(modelId)),
+    resolveUsageAuth: async (ctx) => {
+      const apiKey = ctx.resolveApiKeyFromConfigAndStore({
+        envDirect: [ctx.env.DEEPSEEK_API_KEY],
+      });
+      return apiKey ? { token: apiKey } : null;
+    },
+    fetchUsageSnapshot: async (ctx) =>
+      await fetchDeepSeekUsage(ctx.token, ctx.timeoutMs, ctx.fetchFn),
   },
 });

@@ -1,3 +1,7 @@
+// Mattermost tests cover monitor.authz plugin behavior.
+import "./monitor-helpers.test-support.js";
+import "./monitor-onchar.test-support.js";
+import "./monitor.channel-kind.test-support.js";
 import { describe, expect, it } from "vitest";
 import type { ResolvedMattermostAccount } from "./accounts.js";
 import {
@@ -25,11 +29,7 @@ function authorizeGroupCommand(senderId: string) {
         allowFrom: ["trusted-user"],
       },
     },
-    cfg: {
-      commands: {
-        useAccessGroups: true,
-      },
-    },
+    cfg: {},
     senderId,
     senderName: senderId,
     channelId: "chan-1",
@@ -122,11 +122,7 @@ describe("mattermost monitor authz", () => {
           dmPolicy: "open",
         },
       },
-      cfg: {
-        commands: {
-          useAccessGroups: true,
-        },
-      },
+      cfg: {},
       senderId: "alice",
       senderName: "Alice",
       channelId: "dm-1",
@@ -182,6 +178,47 @@ describe("mattermost monitor authz", () => {
     });
   });
 
+  it("denies command invocations when channel type is unavailable", async () => {
+    const decision = await authorizeMattermostCommandInvocation({
+      account: {
+        ...accountFixture,
+        config: {
+          dmPolicy: "allowlist",
+          groupPolicy: "open",
+          allowFrom: ["trusted-user"],
+        },
+      },
+      cfg: {},
+      senderId: "new-user",
+      senderName: "New User",
+      channelId: "dm-1",
+      channelInfo: {
+        id: "dm-1",
+        name: "",
+        display_name: "",
+      },
+      storeAllowFrom: [],
+      allowTextCommands: true,
+      hasControlCommand: true,
+    });
+
+    expect(decision).toEqual({
+      ok: false,
+      denyReason: "unknown-channel",
+      commandAuthorized: false,
+      channelInfo: {
+        id: "dm-1",
+        name: "",
+        display_name: "",
+      },
+      kind: "channel",
+      chatType: "channel",
+      channelName: "",
+      channelDisplay: "",
+      roomLabel: "#dm-1",
+    });
+  });
+
   it("authorizes group senders through static access groups", async () => {
     const decision = await authorizeMattermostCommandInvocation({
       account: {
@@ -192,9 +229,6 @@ describe("mattermost monitor authz", () => {
         },
       },
       cfg: {
-        commands: {
-          useAccessGroups: true,
-        },
         accessGroups: {
           oncall: {
             type: "message.senders",

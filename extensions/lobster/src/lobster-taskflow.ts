@@ -1,7 +1,8 @@
+// Lobster plugin module implements lobster taskflow behavior.
 import type { OpenClawPluginApi } from "../runtime-api.js";
 import type { LobsterEnvelope, LobsterRunner, LobsterRunnerParams } from "./lobster-runner.js";
 
-type JsonLike =
+export type JsonLike =
   | null
   | boolean
   | number
@@ -11,11 +12,11 @@ type JsonLike =
       [key: string]: JsonLike;
     };
 
-type BoundTaskFlow = ReturnType<
+export type BoundTaskFlow = ReturnType<
   NonNullable<OpenClawPluginApi["runtime"]>["tasks"]["managedFlows"]["bindSession"]
 >;
 
-type FlowRecord = ReturnType<BoundTaskFlow["createManaged"]>;
+type FlowRecord = NonNullable<ReturnType<BoundTaskFlow["tryCreateManaged"]>>;
 type MutationResult = ReturnType<BoundTaskFlow["setWaiting"]>;
 
 type LobsterApprovalWaitState = {
@@ -106,23 +107,13 @@ function toJsonLike(value: unknown, seen = new WeakSet<object>()): JsonLike {
 }
 
 function buildApprovalWaitState(envelope: Extract<LobsterEnvelope, { ok: true }>): JsonLike {
-  if (!envelope.requiresApproval) {
-    return {
-      kind: "lobster_approval",
-      prompt: "",
-      items: [],
-    } satisfies LobsterApprovalWaitState;
-  }
+  const approval = envelope.requiresApproval;
   return {
     kind: "lobster_approval",
-    prompt: envelope.requiresApproval.prompt,
-    items: envelope.requiresApproval.items.map((item) => toJsonLike(item)),
-    ...(envelope.requiresApproval.resumeToken
-      ? { resumeToken: envelope.requiresApproval.resumeToken }
-      : {}),
-    ...(envelope.requiresApproval.approvalId
-      ? { approvalId: envelope.requiresApproval.approvalId }
-      : {}),
+    prompt: approval ? approval.prompt : "",
+    items: approval ? approval.items.map((item) => toJsonLike(item)) : [],
+    ...(approval?.resumeToken ? { resumeToken: approval.resumeToken } : {}),
+    ...(approval?.approvalId ? { approvalId: approval.approvalId } : {}),
   } satisfies LobsterApprovalWaitState;
 }
 
@@ -133,43 +124,28 @@ function applyEnvelopeToFlow(params: {
   waitingStep: string;
 }): MutationResult {
   const { taskFlow, flow, envelope, waitingStep } = params;
+  const flowMutation = { flowId: flow.flowId, expectedRevision: flow.revision };
 
   if (!envelope.ok) {
-    return taskFlow.fail({
-      flowId: flow.flowId,
-      expectedRevision: flow.revision,
-    });
+    return taskFlow.fail(flowMutation);
   }
 
   if (envelope.status === "needs_approval") {
     return taskFlow.setWaiting({
-      flowId: flow.flowId,
-      expectedRevision: flow.revision,
+      ...flowMutation,
       currentStep: waitingStep,
       waitJson: buildApprovalWaitState(envelope),
     });
   }
 
-  return taskFlow.finish({
-    flowId: flow.flowId,
-    expectedRevision: flow.revision,
-  });
+  return taskFlow.finish(flowMutation);
 }
 
-function buildEnvelopeError(envelope: Extract<LobsterEnvelope, { ok: false }>) {
-  return new Error(envelope.error.message);
-}
-
-export async function runManagedLobsterFlow(
-  params: RunManagedLobsterFlowParams,
+async function executeManagedLobsterFlow(
+  params: Pick<RunManagedLobsterFlowParams, "taskFlow" | "runner" | "runnerParams" | "waitingStep">,
+  flow: FlowRecord,
+  failureFlowId = flow.flowId,
 ): Promise<ManagedLobsterFlowResult> {
-  const flow = params.taskFlow.createManaged({
-    controllerId: params.controllerId,
-    goal: params.goal,
-    currentStep: params.currentStep ?? "run_lobster",
-    ...(params.stateJson !== undefined ? { stateJson: params.stateJson } : {}),
-  });
-
   try {
     const envelope = await params.runner.run(params.runnerParams);
     const mutation = applyEnvelopeToFlow({
@@ -179,40 +155,39 @@ export async function runManagedLobsterFlow(
       waitingStep: params.waitingStep ?? "await_lobster_approval",
     });
     if (!envelope.ok) {
-      return {
-        ok: false,
-        flow,
-        mutation,
-        error: buildEnvelopeError(envelope),
-      };
+      return { ok: false, flow, mutation, error: new Error(envelope.error.message) };
     }
-    return {
-      ok: true,
-      envelope,
-      flow,
-      mutation,
-    };
+    return { ok: true, envelope, flow, mutation };
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error));
     try {
       const mutation = params.taskFlow.fail({
-        flowId: flow.flowId,
+        flowId: failureFlowId,
         expectedRevision: flow.revision,
       });
-      return {
-        ok: false,
-        flow,
-        mutation,
-        error: err,
-      };
+      return { ok: false, flow, mutation, error: err };
     } catch {
-      return {
-        ok: false,
-        flow,
-        error: err,
-      };
+      return { ok: false, flow, error: err };
     }
   }
+}
+
+export async function runManagedLobsterFlow(
+  params: RunManagedLobsterFlowParams,
+): Promise<ManagedLobsterFlowResult> {
+  const createFlowParams = {
+    controllerId: params.controllerId,
+    goal: params.goal,
+    currentStep: params.currentStep ?? "run_lobster",
+    ...(params.stateJson !== undefined ? { stateJson: params.stateJson } : {}),
+  };
+  const flow = params.taskFlow.tryCreateManaged
+    ? params.taskFlow.tryCreateManaged(createFlowParams)
+    : params.taskFlow.createManaged(createFlowParams);
+  if (!flow) {
+    return { ok: false, error: new Error("TaskFlow persistence failed.") };
+  }
+  return await executeManagedLobsterFlow(params, flow);
 }
 
 export async function resumeManagedLobsterFlow(
@@ -232,48 +207,5 @@ export async function resumeManagedLobsterFlow(
       error: new Error(`TaskFlow resume failed: ${resumed.code}`),
     };
   }
-
-  try {
-    const envelope = await params.runner.run(params.runnerParams);
-    const mutation = applyEnvelopeToFlow({
-      taskFlow: params.taskFlow,
-      flow: resumed.flow,
-      envelope,
-      waitingStep: params.waitingStep ?? "await_lobster_approval",
-    });
-    if (!envelope.ok) {
-      return {
-        ok: false,
-        flow: resumed.flow,
-        mutation,
-        error: buildEnvelopeError(envelope),
-      };
-    }
-    return {
-      ok: true,
-      envelope,
-      flow: resumed.flow,
-      mutation,
-    };
-  } catch (error) {
-    const err = error instanceof Error ? error : new Error(String(error));
-    try {
-      const mutation = params.taskFlow.fail({
-        flowId: params.flowId,
-        expectedRevision: resumed.flow.revision,
-      });
-      return {
-        ok: false,
-        flow: resumed.flow,
-        mutation,
-        error: err,
-      };
-    } catch {
-      return {
-        ok: false,
-        flow: resumed.flow,
-        error: err,
-      };
-    }
-  }
+  return await executeManagedLobsterFlow(params, resumed.flow, params.flowId);
 }

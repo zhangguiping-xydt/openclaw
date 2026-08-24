@@ -1,3 +1,4 @@
+// Tests runtime-loaded fast-path command behavior for get-reply.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
@@ -19,6 +20,28 @@ installReplyRuntimeMocks(agentMocks);
 describe("getReplyFromConfig fast-path runtime", () => {
   beforeAll(async () => {
     ({ getReplyFromConfig } = await loadGetReplyModuleForTest({ cacheKey: import.meta.url }));
+    vi.stubEnv("OPENCLAW_TEST_FAST", "1");
+    resetReplyRuntimeMocks(agentMocks);
+    agentMocks.runEmbeddedAgent.mockResolvedValue(makeEmbeddedTextResult("warm runtime"));
+    await withTempHome(async (home) => {
+      await getReplyFromConfig(
+        {
+          Body: "warm runtime",
+          BodyForAgent: "warm runtime",
+          RawBody: "warm runtime",
+          CommandBody: "warm runtime",
+          From: "+1001",
+          To: "+2000",
+          SessionKey: "agent:main:whatsapp:+2000",
+          Provider: "whatsapp",
+          Surface: "whatsapp",
+          ChatType: "direct",
+        },
+        {},
+        makeReplyConfig(home) as OpenClawConfig,
+      );
+    });
+    vi.unstubAllEnvs();
   });
 
   beforeEach(async () => {
@@ -34,7 +57,7 @@ describe("getReplyFromConfig fast-path runtime", () => {
   it("keeps old-style runtime tests fast with marked temp-home configs", async () => {
     await withTempHome(async (home) => {
       let seenPrompt: string | undefined;
-      agentMocks.runEmbeddedPiAgent.mockImplementation(async (params) => {
+      agentMocks.runEmbeddedAgent.mockImplementation(async (params) => {
         seenPrompt = params.prompt;
         return makeEmbeddedTextResult("ok");
       });
@@ -47,8 +70,10 @@ describe("getReplyFromConfig fast-path runtime", () => {
           CommandBody: "hello",
           From: "+1001",
           To: "+2000",
-          MediaPaths: ["/tmp/a.png", "/tmp/b.png"],
-          MediaUrls: ["/tmp/a.png", "/tmp/b.png"],
+          media: [
+            { path: "/tmp/a.png", url: "/tmp/a.png" },
+            { path: "/tmp/b.png", url: "/tmp/b.png" },
+          ],
           SessionKey: "agent:main:whatsapp:+2000",
           Provider: "whatsapp",
           Surface: "whatsapp",
@@ -67,7 +92,7 @@ describe("getReplyFromConfig fast-path runtime", () => {
 
   it("routes structured native command turns through the target session before legacy sync", async () => {
     await withTempHome(async (home) => {
-      agentMocks.runEmbeddedPiAgent.mockResolvedValue(makeEmbeddedTextResult("ok"));
+      agentMocks.runEmbeddedAgent.mockResolvedValue(makeEmbeddedTextResult("ok"));
 
       await getReplyFromConfig(
         {
@@ -90,7 +115,7 @@ describe("getReplyFromConfig fast-path runtime", () => {
         makeReplyConfig(home) as OpenClawConfig,
       );
 
-      expect(agentMocks.runEmbeddedPiAgent).toHaveBeenCalledWith(
+      expect(agentMocks.runEmbeddedAgent).toHaveBeenCalledWith(
         expect.objectContaining({
           sessionKey: "agent:main:telegram:direct:target",
         }),
@@ -100,7 +125,7 @@ describe("getReplyFromConfig fast-path runtime", () => {
 
   it("ignores stale native legacy source for structured normal turns before routing", async () => {
     await withTempHome(async (home) => {
-      agentMocks.runEmbeddedPiAgent.mockResolvedValue(makeEmbeddedTextResult("ok"));
+      agentMocks.runEmbeddedAgent.mockResolvedValue(makeEmbeddedTextResult("ok"));
 
       await getReplyFromConfig(
         {
@@ -124,7 +149,7 @@ describe("getReplyFromConfig fast-path runtime", () => {
         makeReplyConfig(home) as OpenClawConfig,
       );
 
-      expect(agentMocks.runEmbeddedPiAgent).toHaveBeenCalledWith(
+      expect(agentMocks.runEmbeddedAgent).toHaveBeenCalledWith(
         expect.objectContaining({
           sessionKey: "agent:main:telegram:direct:source",
         }),

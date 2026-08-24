@@ -1,43 +1,95 @@
+/**
+ * Tests persisted auth profile boundary normalization.
+ * Covers malformed credential coercion, state merging, legacy OAuth refs, and
+ * main/agent store drift repair.
+ */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { resolveOAuthDir } from "../../config/paths.js";
+import { afterEach, describe, expect, it } from "vitest";
 import { AUTH_STORE_VERSION } from "./constants.js";
-import { legacyOAuthSidecarTestUtils } from "./legacy-oauth-sidecar.js";
-import { resolveAuthStorePath } from "./paths.js";
-import { coercePersistedAuthProfileStore, loadPersistedAuthProfileStore } from "./persisted.js";
-
-function withEnvValue(key: string, value: string | undefined): () => void {
-  const previous = process.env[key];
-  if (value === undefined) {
-    delete process.env[key];
-  } else {
-    process.env[key] = value;
-  }
-  return () => {
-    if (previous === undefined) {
-      delete process.env[key];
-    } else {
-      process.env[key] = previous;
-    }
-  };
-}
+import { resolveAuthProfileOrder } from "./order.js";
+import {
+  applyLegacyAuthStore,
+  coerceLegacyAuthStore,
+  coercePersistedAuthProfileStore,
+  mergeAuthProfileStores,
+} from "./persisted.js";
+import { getRuntimeExternalCliProfileIds } from "./runtime-external-profile-references.js";
+import { buildPersistedAuthProfileState, coerceAuthProfileState } from "./state.js";
+import type { AuthProfileStore, RuntimeAuthProfileStore } from "./types.js";
 
 describe("persisted auth profile boundary", () => {
+  it.each([
+    {
+      name: "token-expired classification with auth reason",
+      cooldownReason: "auth",
+      cooldownClassification: "wham_token_expired",
+      expectedClassification: "wham_token_expired",
+    },
+    {
+      name: "dead-account classification with permanent-auth reason",
+      cooldownReason: "auth_permanent",
+      cooldownClassification: "wham_account_dead",
+      expectedClassification: "wham_account_dead",
+    },
+    {
+      name: "classification mismatched with its canonical reason",
+      cooldownReason: "rate_limit",
+      cooldownClassification: "wham_account_dead",
+      expectedClassification: undefined,
+    },
+    {
+      name: "classification missing its canonical reason",
+      cooldownReason: undefined,
+      cooldownClassification: "wham_token_expired",
+      expectedClassification: undefined,
+    },
+  ] as const)("normalizes $name", (testCase) => {
+    const state = {
+      usageStats: {
+        "openai:default": {
+          cooldownUntil: 1_900_000_000_000,
+          cooldownReason: testCase.cooldownReason,
+          cooldownClassification: testCase.cooldownClassification,
+        },
+      },
+    };
+    const normalizedStats = [
+      coerceAuthProfileState(state).usageStats?.["openai:default"],
+      buildPersistedAuthProfileState(state)?.usageStats?.["openai:default"],
+    ];
+
+    for (const stats of normalizedStats) {
+      expect(stats?.cooldownReason).toBe(testCase.cooldownReason);
+      expect(stats?.cooldownClassification).toBe(testCase.expectedClassification);
+    }
+  });
+
   it("normalizes malformed persisted credentials and state before runtime use", () => {
     const store = coercePersistedAuthProfileStore({
       version: "not-a-version",
       profiles: {
         "openai:default": {
-          type: "api_key",
+          type: "apiKey",
           provider: " OpenAI ",
-          key: 42,
+          apiKey: "demo-openai-key",
           keyRef: { source: "env", id: "OPENAI_API_KEY" },
           metadata: { account: "acct_123", bad: 123 },
           copyToAgents: "yes",
           email: ["wrong"],
           displayName: "Work",
+        },
+        "openai:legacy-api-key": {
+          type: "apiKey",
+          provider: "openai",
+          apiKey: "legacy-openai-key",
+        },
+        "openai:legacy-malformed-ref": {
+          type: "apiKey",
+          provider: "openai",
+          apiKey: "legacy-fallback-key",
+          keyRef: { source: "env", id: "" },
         },
         "minimax:default": {
           type: "token",
@@ -46,15 +98,15 @@ describe("persisted auth profile boundary", () => {
           tokenRef: { source: "env", provider: "default", id: "MINIMAX_TOKEN" },
           expires: "tomorrow",
         },
-        "codex:default": {
+        "openai:oauth": {
           type: "oauth",
-          provider: "openai-codex",
+          provider: "openai",
           access: ["wrong"],
           refresh: "refresh-token",
           expires: "later",
           oauthRef: {
             source: "openclaw-credentials",
-            provider: "openai-codex",
+            provider: "openai",
             id: "not-a-secret-id",
           },
         },
@@ -92,15 +144,25 @@ describe("persisted auth profile boundary", () => {
           metadata: { account: "acct_123" },
           displayName: "Work",
         },
+        "openai:legacy-api-key": {
+          type: "api_key",
+          provider: "openai",
+          key: "legacy-openai-key",
+        },
+        "openai:legacy-malformed-ref": {
+          type: "api_key",
+          provider: "openai",
+          key: "legacy-fallback-key",
+        },
         "minimax:default": {
           type: "token",
           provider: "minimax",
           tokenRef: { source: "env", provider: "default", id: "MINIMAX_TOKEN" },
           expires: 0,
         },
-        "codex:default": {
+        "openai:oauth": {
           type: "oauth",
-          provider: "openai-codex",
+          provider: "openai",
           refresh: "refresh-token",
           expires: 0,
         },
@@ -120,96 +182,421 @@ describe("persisted auth profile boundary", () => {
       },
     });
     expect(store?.profiles["broken:array"]).toBeUndefined();
-    expect(store?.profiles["openai:default"]).not.toHaveProperty("key");
     expect(store?.profiles["openai:default"]).not.toHaveProperty("copyToAgents");
-    expect(store?.profiles["codex:default"]).not.toHaveProperty("oauthRef");
+    expect(store?.profiles["openai:oauth"]).not.toHaveProperty("oauthRef");
   });
 
-  it("rehydrates legacy oauthRef sidecars read-only for upgraded Codex OAuth users", () => {
-    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-auth-oauthref-runtime-"));
-    const agentDir = path.join(stateDir, "agents", "main", "agent");
-    const restoreStateDir = withEnvValue("OPENCLAW_STATE_DIR", stateDir);
-    const restoreOAuthDir = withEnvValue("OPENCLAW_OAUTH_DIR", undefined);
-    const restoreSecretKey = withEnvValue("OPENCLAW_AUTH_PROFILE_SECRET_KEY", "legacy-seed");
-    try {
-      fs.mkdirSync(agentDir, { recursive: true });
-      const profileId = "openai-codex:default";
-      const ref = {
-        source: "openclaw-credentials" as const,
-        provider: "openai-codex" as const,
-        id: "0123456789abcdef0123456789abcdef",
-      };
-      fs.writeFileSync(
-        resolveAuthStorePath(agentDir),
-        `${JSON.stringify(
-          {
-            version: AUTH_STORE_VERSION,
-            profiles: {
-              [profileId]: {
-                type: "oauth",
-                provider: "openai-codex",
-                expires: 123456,
-                accountId: "acct-legacy",
-                chatgptPlanType: "plus",
-                oauthRef: ref,
-              },
-            },
+  it("lets authoritative runtime external metadata remove stale base profiles", () => {
+    const merged = mergeAuthProfileStores(
+      {
+        version: AUTH_STORE_VERSION,
+        runtimeExternalProfileIds: ["anthropic:claude-cli"],
+        runtimeExternalProfileIdsAuthoritative: true,
+        profiles: {
+          "anthropic:claude-cli": {
+            type: "oauth",
+            provider: "anthropic",
+            access: "stale-access",
+            refresh: "stale-refresh",
+            expires: 1,
           },
-          null,
-          2,
-        )}\n`,
-      );
+        },
+        order: {
+          anthropic: ["anthropic:claude-cli"],
+        },
+        lastGood: {
+          anthropic: "anthropic:claude-cli",
+        },
+      },
+      {
+        version: AUTH_STORE_VERSION,
+        runtimeExternalProfileIds: [],
+        runtimeExternalProfileIdsAuthoritative: true,
+        profiles: {},
+      },
+    );
 
-      const sidecarPath = path.join(resolveOAuthDir(), "auth-profiles", `${ref.id}.json`);
-      fs.mkdirSync(path.dirname(sidecarPath), { recursive: true });
-      fs.writeFileSync(
-        sidecarPath,
-        `${JSON.stringify(
-          {
-            version: 1,
-            profileId,
-            provider: "openai-codex",
-            encrypted: legacyOAuthSidecarTestUtils.encryptLegacyOAuthMaterial({
-              ref,
-              profileId,
-              provider: "openai-codex",
-              seed: "legacy-seed",
-              material: {
-                access: "legacy-access-token",
-                refresh: "legacy-refresh-token",
-                idToken: "legacy-id-token",
-              },
-            }),
+    expect(merged.runtimeExternalProfileIds).toEqual([]);
+    expect(merged.runtimeExternalProfileIdsAuthoritative).toBe(true);
+    expect(merged.profiles["anthropic:claude-cli"]).toBeUndefined();
+    expect(merged.order?.anthropic).toBeUndefined();
+    expect(merged.lastGood?.anthropic).toBeUndefined();
+  });
+
+  it("keeps override profiles when authoritative metadata removes base runtime external state", () => {
+    const profileId = "anthropic:claude-cli";
+    const merged = mergeAuthProfileStores(
+      {
+        version: AUTH_STORE_VERSION,
+        runtimeExternalProfileIds: [profileId],
+        runtimeExternalProfileIdsAuthoritative: true,
+        profiles: {
+          [profileId]: {
+            type: "oauth",
+            provider: "anthropic",
+            access: "stale-access",
+            refresh: "stale-refresh",
+            expires: 1,
           },
-          null,
-          2,
-        )}\n`,
-      );
+        },
+        order: {
+          anthropic: [profileId],
+        },
+        lastGood: {
+          anthropic: profileId,
+        },
+      },
+      {
+        version: AUTH_STORE_VERSION,
+        runtimeExternalProfileIds: [],
+        runtimeExternalProfileIdsAuthoritative: true,
+        profiles: {
+          [profileId]: {
+            type: "api_key",
+            provider: "anthropic",
+            key: "sk-local",
+          },
+        },
+        order: {
+          anthropic: [profileId],
+        },
+        lastGood: {
+          anthropic: profileId,
+        },
+      },
+    );
 
-      const unresolved = loadPersistedAuthProfileStore(agentDir)?.profiles[profileId];
-      expect(unresolved).not.toHaveProperty("access");
-      expect(unresolved).not.toHaveProperty("refresh");
-      expect(unresolved).not.toHaveProperty("idToken");
+    expect(merged.runtimeExternalProfileIds).toEqual([]);
+    expect(merged.runtimeExternalProfileIdsAuthoritative).toBe(true);
+    expect(merged.profiles[profileId]).toMatchObject({
+      type: "api_key",
+      provider: "anthropic",
+      key: "sk-local",
+    });
+    expect(merged.order?.anthropic).toEqual([profileId]);
+    expect(merged.lastGood?.anthropic).toBe(profileId);
+  });
 
-      const credential = loadPersistedAuthProfileStore(agentDir, {
-        resolveLegacyOAuthSidecars: true,
-      })?.profiles[profileId];
-      expect(credential).toMatchObject({
-        type: "oauth",
-        provider: "openai-codex",
-        access: "legacy-access-token",
-        refresh: "legacy-refresh-token",
-        idToken: "legacy-id-token",
-        expires: 123456,
-        accountId: "acct-legacy",
-        chatgptPlanType: "plus",
-      });
-      expect(credential).not.toHaveProperty("oauthRef");
-    } finally {
-      restoreSecretKey();
-      restoreOAuthDir();
-      restoreStateDir();
-      fs.rmSync(stateDir, { recursive: true, force: true });
+  it("tracks persisted profile provenance with override precedence", () => {
+    const merged = mergeAuthProfileStores(
+      {
+        version: AUTH_STORE_VERSION,
+        runtimePersistedProfileIds: ["openai:base", "openai:overridden"],
+        profiles: {
+          "openai:base": {
+            type: "api_key",
+            provider: "openai",
+            key: "base-key",
+          },
+          "openai:overridden": {
+            type: "api_key",
+            provider: "openai",
+            key: "old-key",
+          },
+        },
+      },
+      {
+        version: AUTH_STORE_VERSION,
+        runtimePersistedProfileIds: ["openai:added"],
+        runtimeLocalProfileIds: ["openai:added"],
+        profiles: {
+          "openai:overridden": {
+            type: "api_key",
+            provider: "openai",
+            key: "scoped-key",
+          },
+          "openai:added": {
+            type: "api_key",
+            provider: "openai",
+            key: "added-key",
+          },
+        },
+      },
+    );
+
+    expect(merged.runtimePersistedProfileIds).toEqual(["openai:added", "openai:base"]);
+    expect(merged.runtimeLocalProfileIds).toEqual(["openai:added"]);
+  });
+
+  it("preserves config-only order fallbacks during agent-store merges", () => {
+    const merged = mergeAuthProfileStores(
+      {
+        version: AUTH_STORE_VERSION,
+        profiles: {},
+        order: {
+          openai: ["openai:aws-sdk"],
+        },
+      },
+      {
+        version: AUTH_STORE_VERSION,
+        profiles: {
+          "openai:new-login": {
+            type: "oauth",
+            provider: "openai",
+            access: "new-access",
+            refresh: "new-refresh",
+            expires: 1,
+          },
+        },
+        order: {
+          openai: ["openai:new-login", "openai:aws-sdk"],
+        },
+      },
+      { preserveBaseRuntimeExternalProfiles: true },
+    );
+
+    expect(merged.order?.openai).toEqual(["openai:new-login", "openai:aws-sdk"]);
+  });
+
+  it("prefers agent-local provider profiles before inherited main profiles", () => {
+    const expires = Date.now() + 60_000;
+    const merged = mergeAuthProfileStores(
+      {
+        version: AUTH_STORE_VERSION,
+        profiles: {
+          "minimax-portal:cli": {
+            type: "oauth",
+            provider: "minimax-portal",
+            access: "main-minimax-access",
+            refresh: "main-minimax-refresh",
+            expires,
+          },
+        },
+        order: {
+          "minimax-portal": ["minimax-portal:cli"],
+        },
+      },
+      {
+        version: AUTH_STORE_VERSION,
+        profiles: {
+          "minimax-portal:default": {
+            type: "oauth",
+            provider: "minimax-portal",
+            access: "agent-minimax-access",
+            refresh: "agent-minimax-refresh",
+            expires,
+          },
+        },
+      },
+      { preserveBaseRuntimeExternalProfiles: true },
+    );
+
+    expect(Object.keys(merged.profiles)).toEqual(["minimax-portal:default", "minimax-portal:cli"]);
+    expect(merged.order?.["minimax-portal"]).toEqual([
+      "minimax-portal:default",
+      "minimax-portal:cli",
+    ]);
+    expect(resolveAuthProfileOrder({ store: merged, provider: "minimax-portal" })).toEqual([
+      "minimax-portal:default",
+      "minimax-portal:cli",
+    ]);
+  });
+
+  it("collapses normalized provider order keys without expanding explicit override order", () => {
+    const merged = mergeAuthProfileStores(
+      {
+        version: AUTH_STORE_VERSION,
+        profiles: {
+          "openai:main": {
+            type: "api_key",
+            provider: "OpenAI",
+            key: "main-key",
+          },
+        },
+        order: {
+          OpenAI: ["openai:main"],
+        },
+      },
+      {
+        version: AUTH_STORE_VERSION,
+        profiles: {
+          "openai:agent": {
+            type: "api_key",
+            provider: "openai",
+            key: "agent-key",
+          },
+          "openai:other-agent": {
+            type: "api_key",
+            provider: "openai",
+            key: "other-agent-key",
+          },
+        },
+        order: {
+          openai: ["openai:agent"],
+        },
+      },
+      { preserveBaseRuntimeExternalProfiles: true },
+    );
+
+    expect(merged.order).toEqual({
+      openai: ["openai:agent"],
+    });
+  });
+
+  it("preserves inherited base runtime external profiles during agent-store merges", () => {
+    const profileId = "anthropic:claude-cli";
+    const merged = mergeAuthProfileStores(
+      {
+        version: AUTH_STORE_VERSION,
+        runtimeExternalProfileIds: [profileId],
+        runtimeExternalProfileIdsAuthoritative: true,
+        profiles: {
+          [profileId]: {
+            type: "oauth",
+            provider: "anthropic",
+            access: "main-access",
+            refresh: "main-refresh",
+            expires: 1,
+          },
+        },
+        order: {
+          anthropic: [profileId],
+        },
+        lastGood: {
+          anthropic: profileId,
+        },
+      },
+      {
+        version: AUTH_STORE_VERSION,
+        runtimeExternalProfileIds: [],
+        runtimeExternalProfileIdsAuthoritative: true,
+        profiles: {},
+      },
+      { preserveBaseRuntimeExternalProfiles: true },
+    );
+
+    expect(merged.runtimeExternalProfileIds).toEqual([profileId]);
+    expect(merged.runtimeExternalProfileIdsAuthoritative).toBe(true);
+    expect(merged.profiles[profileId]).toMatchObject({
+      type: "oauth",
+      provider: "anthropic",
+      access: "main-access",
+      refresh: "main-refresh",
+    });
+    expect(merged.order?.anthropic).toEqual([profileId]);
+    expect(merged.lastGood?.anthropic).toBe(profileId);
+  });
+
+  it("carries built-in CLI provenance only with the winning external profile", () => {
+    const profileId = "openai:default";
+    const base: RuntimeAuthProfileStore = {
+      version: AUTH_STORE_VERSION,
+      runtimeExternalProfileIds: [profileId],
+      runtimeExternalCliProfileIds: [profileId],
+      profiles: {
+        [profileId]: {
+          type: "oauth",
+          provider: "openai",
+          access: "cli-access",
+          refresh: "cli-refresh",
+          expires: 1,
+        },
+      },
+    };
+    const inherited = mergeAuthProfileStores(
+      base,
+      { version: AUTH_STORE_VERSION, profiles: {} },
+      { preserveBaseRuntimeExternalProfiles: true },
+    );
+    expect(getRuntimeExternalCliProfileIds(inherited)).toEqual([profileId]);
+
+    const pluginOverride: RuntimeAuthProfileStore = {
+      version: AUTH_STORE_VERSION,
+      runtimeExternalProfileIds: [profileId],
+      profiles: {
+        [profileId]: {
+          type: "oauth",
+          provider: "openai",
+          access: "plugin-access",
+          refresh: "plugin-refresh",
+          expires: 2,
+        },
+      },
+    };
+    const collided = mergeAuthProfileStores(base, pluginOverride);
+    expect(collided.profiles[profileId]).toMatchObject({ access: "plugin-access" });
+    expect(getRuntimeExternalCliProfileIds(collided)).toEqual([]);
+  });
+});
+
+describe("applyLegacyAuthStore", () => {
+  const agentDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of agentDirs.splice(0)) {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  function writeLegacyAuthJson(value: unknown): string {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-legacy-auth-"));
+    agentDirs.push(agentDir);
+    fs.writeFileSync(path.join(agentDir, "auth.json"), JSON.stringify(value), "utf8");
+    return agentDir;
+  }
+
+  it("preserves OAuth refresh material when migrating legacy auth.json", () => {
+    const agentDir = writeLegacyAuthJson({
+      chutes: {
+        type: "oauth",
+        provider: "chutes",
+        access: "ACCESS_TOKEN",
+        refresh: "REFRESH_TOKEN",
+        expires: 1_900_000_000_000,
+        clientId: "chutes-client-id-123",
+        idToken: "ID_TOKEN_xyz",
+        chatgptPlanType: "pro",
+      },
+    });
+    const legacy = coerceLegacyAuthStore(
+      JSON.parse(fs.readFileSync(path.join(agentDir, "auth.json"), "utf8")),
+    );
+    expect(legacy).not.toBeNull();
+
+    const store: AuthProfileStore = { version: AUTH_STORE_VERSION, profiles: {} };
+    applyLegacyAuthStore(store, legacy ?? {});
+
+    expect(store.profiles["chutes:default"]).toMatchObject({
+      type: "oauth",
+      provider: "chutes",
+      access: "ACCESS_TOKEN",
+      refresh: "REFRESH_TOKEN",
+      clientId: "chutes-client-id-123",
+      idToken: "ID_TOKEN_xyz",
+      chatgptPlanType: "pro",
+    });
+  });
+
+  it("preserves secret-ref credentials when migrating legacy auth.json", () => {
+    const agentDir = writeLegacyAuthJson({
+      openai: {
+        type: "api_key",
+        provider: "openai",
+        keyRef: { source: "env", id: "OPENAI_API_KEY" },
+      },
+      anthropic: {
+        type: "token",
+        provider: "anthropic",
+        tokenRef: { source: "env", id: "ANTHROPIC_TOKEN" },
+      },
+    });
+    const legacy = coerceLegacyAuthStore(
+      JSON.parse(fs.readFileSync(path.join(agentDir, "auth.json"), "utf8")),
+    );
+    expect(legacy).not.toBeNull();
+
+    const store: AuthProfileStore = { version: AUTH_STORE_VERSION, profiles: {} };
+    applyLegacyAuthStore(store, legacy ?? {});
+
+    expect(store.profiles["openai:default"]).toMatchObject({
+      type: "api_key",
+      provider: "openai",
+      keyRef: { source: "env", id: "OPENAI_API_KEY" },
+    });
+    expect(store.profiles["anthropic:default"]).toMatchObject({
+      type: "token",
+      provider: "anthropic",
+      tokenRef: { source: "env", id: "ANTHROPIC_TOKEN" },
+    });
   });
 });

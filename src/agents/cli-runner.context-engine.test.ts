@@ -1,6 +1,8 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+/** Tests CLI runner integration with context-engine lifecycle hooks. */
+import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ContextEngine } from "../context-engine/types.js";
+import { createTestAdmittedRunContext } from "./admitted-run-context.test-support.js";
 import type { PreparedCliRunContext } from "./cli-runner/types.js";
 
 const {
@@ -8,15 +10,28 @@ const {
   loadCliSessionContextEngineMessagesMock,
   loadCliSessionHistoryMessagesMock,
   getGlobalHookRunnerMock,
+  runBeforeAgentReplyForTurnMock,
+  prepareCliRunContextMock,
 } = vi.hoisted(() => ({
   executePreparedCliRunMock: vi.fn(),
   loadCliSessionContextEngineMessagesMock: vi.fn(),
   loadCliSessionHistoryMessagesMock: vi.fn(),
   getGlobalHookRunnerMock: vi.fn(() => null),
+  runBeforeAgentReplyForTurnMock: vi.fn(async () => undefined),
+  prepareCliRunContextMock: vi.fn(),
 }));
+
+let runCliAgent: typeof import("./cli-runner.js").runCliAgent;
+let runPreparedCliAgent: typeof import("./cli-runner.js").runPreparedCliAgent;
+let restoreCliRunnerTestDeps: typeof import("./cli-runner.js").restoreCliRunnerTestDeps;
+let setCliRunnerTestDeps: typeof import("./cli-runner.js").setCliRunnerTestDeps;
 
 vi.mock("./cli-runner/execute.runtime.js", () => ({
   executePreparedCliRun: executePreparedCliRunMock,
+}));
+
+vi.mock("./cli-runner/prepare.runtime.js", () => ({
+  prepareCliRunContext: prepareCliRunContextMock,
 }));
 
 vi.mock("./cli-runner/session-history.js", () => ({
@@ -28,6 +43,11 @@ vi.mock("../plugins/hook-runner-global.js", () => ({
   getGlobalHookRunner: getGlobalHookRunnerMock,
 }));
 
+vi.mock("../plugins/before-agent-reply.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/before-agent-reply.js")>()),
+  runBeforeAgentReplyForTurn: runBeforeAgentReplyForTurnMock,
+}));
+
 function textMessage(role: "user" | "assistant", text: string, timestamp: number): AgentMessage {
   return {
     role,
@@ -37,6 +57,7 @@ function textMessage(role: "user" | "assistant", text: string, timestamp: number
 }
 
 function createContextEngine(overrides: Partial<ContextEngine> = {}): ContextEngine {
+  // Minimal context engine keeps tests focused on runner lifecycle calls.
   return {
     info: { id: "test-context-engine", name: "Test context engine" },
     ingest: vi.fn(async () => ({ ingested: true })),
@@ -58,6 +79,8 @@ function createMaintenanceResult() {
 }
 
 function buildPreparedContext(contextEngine: ContextEngine): PreparedCliRunContext {
+  // Prepared contexts mirror the shape produced by prepare.runtime without
+  // loading full backend setup in every lifecycle assertion.
   const backend = {
     command: "claude",
     args: ["--print"],
@@ -69,6 +92,7 @@ function buildPreparedContext(contextEngine: ContextEngine): PreparedCliRunConte
 
   return {
     params: {
+      admittedRunContext: createTestAdmittedRunContext("run-1"),
       sessionId: "openclaw-session-1",
       sessionKey: "agent:main:main",
       agentId: "main",
@@ -95,6 +119,7 @@ function buildPreparedContext(contextEngine: ContextEngine): PreparedCliRunConte
       env: {},
     },
     reusableCliSession: {
+      mode: "reuse",
       sessionId: "existing-external-cli-session",
     },
     hadSessionFile: true,
@@ -111,6 +136,7 @@ function buildPreparedContext(contextEngine: ContextEngine): PreparedCliRunConte
 }
 
 function expectMessageText(message: AgentMessage | undefined, expected: string): void {
+  // Context engines may use legacy string content or structured text blocks.
   expect(message).toBeDefined();
   const content = (message as { content?: unknown } | undefined)?.content;
   if (typeof content === "string") {
@@ -122,6 +148,11 @@ function expectMessageText(message: AgentMessage | undefined, expected: string):
 }
 
 describe("runPreparedCliAgent context engine lifecycle", () => {
+  beforeAll(async () => {
+    ({ restoreCliRunnerTestDeps, runCliAgent, runPreparedCliAgent, setCliRunnerTestDeps } =
+      await import("./cli-runner.js"));
+  });
+
   beforeEach(() => {
     executePreparedCliRunMock.mockReset();
     executePreparedCliRunMock.mockResolvedValue({
@@ -129,6 +160,7 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
       rawText: " final answer ",
       sessionId: "external-cli-session-1",
       usage: { input: 11, output: 7, total: 18 },
+      diagnosticUsage: { input: 21, output: 9, total: 30 },
       finalPromptText: "prompt sent to cli",
     });
     loadCliSessionContextEngineMessagesMock.mockReset();
@@ -140,6 +172,96 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
     loadCliSessionHistoryMessagesMock.mockResolvedValue([]);
     getGlobalHookRunnerMock.mockReset();
     getGlobalHookRunnerMock.mockReturnValue(null);
+    runBeforeAgentReplyForTurnMock.mockClear();
+    prepareCliRunContextMock.mockReset();
+    restoreCliRunnerTestDeps();
+    setCliRunnerTestDeps({
+      claudeCliSessionTranscriptHasContent: vi.fn(async () => true),
+    });
+  });
+
+  afterEach(() => {
+    restoreCliRunnerTestDeps();
+  });
+
+  it("keeps isolated completion outside hooks, history, and context-engine lifecycle", async () => {
+    const bootstrap = vi.fn<NonNullable<ContextEngine["bootstrap"]>>(async () => ({
+      bootstrapped: true,
+    }));
+    const afterTurn = vi.fn<NonNullable<ContextEngine["afterTurn"]>>(async () => {});
+    const maintain = vi.fn<NonNullable<ContextEngine["maintain"]>>(async () =>
+      createMaintenanceResult(),
+    );
+    const dispose = vi.fn(async () => {});
+    const context = buildPreparedContext(
+      createContextEngine({ bootstrap, afterTurn, maintain, dispose }),
+    );
+    context.params.isolatedCompletion = true;
+
+    const result = await runPreparedCliAgent(context);
+
+    expect(result.payloads).toEqual([{ text: "final answer" }]);
+    expect(executePreparedCliRunMock).toHaveBeenCalledWith(context, undefined, undefined);
+    expect(getGlobalHookRunnerMock).not.toHaveBeenCalled();
+    expect(loadCliSessionHistoryMessagesMock).not.toHaveBeenCalled();
+    expect(loadCliSessionContextEngineMessagesMock).not.toHaveBeenCalled();
+    expect(bootstrap).not.toHaveBeenCalled();
+    expect(afterTurn).not.toHaveBeenCalled();
+    expect(maintain).not.toHaveBeenCalled();
+    expect(dispose).not.toHaveBeenCalled();
+  });
+
+  it("skips the top-level before-reply hook for isolated completion", async () => {
+    const context = buildPreparedContext(createContextEngine());
+    context.params.isolatedCompletion = true;
+    prepareCliRunContextMock.mockResolvedValue(context);
+
+    await expect(runCliAgent(context.params)).resolves.toMatchObject({
+      payloads: [{ text: "final answer" }],
+    });
+
+    expect(prepareCliRunContextMock).toHaveBeenCalledOnce();
+    expect(runBeforeAgentReplyForTurnMock).not.toHaveBeenCalled();
+  });
+
+  it("runs a native control command on the existing session without turn side effects", async () => {
+    const bootstrap = vi.fn<NonNullable<ContextEngine["bootstrap"]>>(async () => ({
+      bootstrapped: true,
+    }));
+    const afterTurn = vi.fn<NonNullable<ContextEngine["afterTurn"]>>(async () => {});
+    const context = buildPreparedContext(createContextEngine({ bootstrap, afterTurn }));
+    context.params.controlOperation = "compact";
+    context.params.allowEmptyAssistantReplyAsSilent = true;
+    executePreparedCliRunMock.mockResolvedValueOnce({
+      text: "",
+      rawText: "",
+      sessionId: "existing-external-cli-session",
+    });
+
+    const result = await runPreparedCliAgent(context);
+
+    expect(result.meta.agentMeta?.sessionId).toBe("existing-external-cli-session");
+    expect(executePreparedCliRunMock).toHaveBeenCalledWith(
+      context,
+      "existing-external-cli-session",
+      undefined,
+    );
+    expect(getGlobalHookRunnerMock).not.toHaveBeenCalled();
+    expect(loadCliSessionHistoryMessagesMock).not.toHaveBeenCalled();
+    expect(loadCliSessionContextEngineMessagesMock).not.toHaveBeenCalled();
+    expect(bootstrap).not.toHaveBeenCalled();
+    expect(afterTurn).not.toHaveBeenCalled();
+  });
+
+  it("skips the top-level before-reply hook for native control commands", async () => {
+    const context = buildPreparedContext(createContextEngine());
+    context.params.controlOperation = "compact";
+    prepareCliRunContextMock.mockResolvedValue(context);
+
+    await runCliAgent(context.params);
+
+    expect(prepareCliRunContextMock).toHaveBeenCalledOnce();
+    expect(runBeforeAgentReplyForTurnMock).not.toHaveBeenCalled();
   });
 
   it("finalizes successful CLI turns with the active context engine", async () => {
@@ -153,11 +275,14 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
     const dispose = vi.fn(async () => {});
     const contextEngine = createContextEngine({ bootstrap, afterTurn, maintain, dispose });
     const context = buildPreparedContext(contextEngine);
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     const result = await runPreparedCliAgent(context);
 
     expect(result.meta.agentMeta?.sessionId).toBe("external-cli-session-1");
+    expect(result.meta.agentMeta).toMatchObject({
+      usage: { input: 11, output: 7, total: 18 },
+      lastCallUsage: { input: 11, output: 7, total: 18 },
+      diagnosticUsage: { input: 21, output: 9, total: 30 },
+    });
     expect(loadCliSessionContextEngineMessagesMock).toHaveBeenCalledWith({
       sessionId: "openclaw-session-1",
       sessionFile: "session.jsonl",
@@ -166,10 +291,29 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
       config: undefined,
     });
     expect(loadCliSessionHistoryMessagesMock).not.toHaveBeenCalled();
-    expect(bootstrap).toHaveBeenCalledWith({
+    expect(bootstrap).toHaveBeenCalledTimes(1);
+    const bootstrapParams = bootstrap.mock.calls[0]?.[0];
+    expect(bootstrapParams).toMatchObject({
       sessionId: "openclaw-session-1",
       sessionKey: "agent:main:main",
       sessionFile: "session.jsonl",
+      runtimeSettings: {
+        schemaVersion: 1,
+        runtime: { host: "openclaw", mode: "normal" },
+        model: {
+          provider: "claude-cli",
+          requested: null,
+          resolved: "sonnet-4.6",
+        },
+        contextEngineSelection: {
+          selectedId: expect.any(String),
+          source: "configured",
+        },
+        executionHost: {
+          id: "cli:claude-cli",
+          label: 'CLI backend "claude-cli"',
+        },
+      },
     });
     expect(afterTurn).toHaveBeenCalledTimes(1);
     const afterTurnParams = afterTurn.mock.calls[0]?.[0];
@@ -178,6 +322,7 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
       sessionKey: "agent:main:main",
       sessionFile: "session.jsonl",
       prePromptMessageCount: 2,
+      isHeartbeat: false,
       tokenBudget: undefined,
       runtimeContext: undefined,
     });
@@ -207,6 +352,122 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
     expect(dispose).not.toHaveBeenCalled();
   });
 
+  it("does not emit CLI turn facts without transcript admission", async () => {
+    const afterTurn = vi.fn<NonNullable<ContextEngine["afterTurn"]>>(async () => {});
+    const maintain = vi.fn<NonNullable<ContextEngine["maintain"]>>(async () =>
+      createMaintenanceResult(),
+    );
+    const dispose = vi.fn(async () => {});
+    const context = buildPreparedContext(createContextEngine({ afterTurn, maintain, dispose }));
+    const onContextEngineTurnCandidate = vi.fn();
+    context.params.onContextEngineTurnCandidate = onContextEngineTurnCandidate;
+    prepareCliRunContextMock.mockResolvedValue(context);
+
+    await runCliAgent(context.params);
+
+    expect(onContextEngineTurnCandidate).not.toHaveBeenCalled();
+    expect(afterTurn).not.toHaveBeenCalled();
+    expect(maintain).toHaveBeenCalledTimes(1);
+    expect(dispose).not.toHaveBeenCalled();
+  });
+
+  it("uses the admitted user anchor for an accepted transcriptless CLI turn", async () => {
+    const context = buildPreparedContext(createContextEngine());
+    executePreparedCliRunMock.mockResolvedValue({
+      text: "",
+      rawText: "",
+      didSendViaMessagingTool: true,
+      sessionId: "external-cli-session-1",
+      usage: { input: 11, output: 0, total: 11 },
+      diagnosticUsage: { input: 21, output: 0, total: 21 },
+      finalPromptText: "prompt sent to cli",
+    });
+    const admission = {
+      agentId: "main",
+      sessionId: "openclaw-session-1",
+      sessionKey: "agent:main:main",
+      storePath: "/tmp/openclaw-cli-context-engine-test/sessions.json",
+      generation: "generation-1",
+      entryId: "cli-user",
+      rawSeq: 1,
+      effectiveParentId: null,
+      activeMessagePosition: 0,
+      logicalTurnId: "cli-turn",
+      role: "user" as const,
+    };
+    const onContextEngineTurnCandidate = vi.fn();
+    context.params.onContextEngineTurnCandidate = onContextEngineTurnCandidate;
+    context.params.userTurnTranscriptRecorder = {
+      message: undefined,
+      resolveMessage: vi.fn(async () => undefined),
+      getAdmissionReceipt: () => admission,
+      markRuntimePersistencePending: vi.fn(),
+      markRuntimePersisted: vi.fn(),
+      markBlocked: vi.fn(),
+      hasPersisted: () => true,
+      isBlocked: () => false,
+      hasRuntimePersistencePending: () => false,
+      waitForRuntimePersistence: vi.fn(async () => {}),
+      persistApproved: vi.fn(async () => undefined),
+      persistBlocked: vi.fn(async () => undefined),
+      persistFallback: vi.fn(async () => undefined),
+    };
+
+    await runPreparedCliAgent(context);
+
+    expect(onContextEngineTurnCandidate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        boundary: { admission, terminal: admission },
+      }),
+    );
+  });
+
+  it("uses the admitted user anchor as the terminal for transcriptless room events", async () => {
+    const context = buildPreparedContext(createContextEngine());
+    const admission = {
+      agentId: "main",
+      sessionId: "openclaw-session-1",
+      sessionKey: "agent:main:main",
+      storePath: "/tmp/openclaw-cli-context-engine-test/sessions.json",
+      generation: "generation-1",
+      entryId: "room-event-user",
+      rawSeq: 1,
+      effectiveParentId: null,
+      activeMessagePosition: 0,
+      logicalTurnId: "room-event-turn",
+      role: "user" as const,
+    };
+    const onContextEngineTurnCandidate = vi.fn();
+    context.params.currentInboundEventKind = "room_event";
+    context.params.persistAssistantTranscript = false;
+    context.params.onContextEngineTurnCandidate = onContextEngineTurnCandidate;
+    context.params.userTurnTranscriptRecorder = {
+      message: undefined,
+      resolveMessage: vi.fn(async () => undefined),
+      getAdmissionReceipt: () => admission,
+      markRuntimePersistencePending: vi.fn(),
+      markRuntimePersisted: vi.fn(),
+      markBlocked: vi.fn(),
+      hasPersisted: () => true,
+      isBlocked: () => false,
+      hasRuntimePersistencePending: () => false,
+      waitForRuntimePersistence: vi.fn(async () => {}),
+      persistApproved: vi.fn(async () => undefined),
+      persistBlocked: vi.fn(async () => undefined),
+      persistFallback: vi.fn(async () => undefined),
+    };
+
+    await runPreparedCliAgent(context);
+
+    expect(onContextEngineTurnCandidate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        boundary: { admission, terminal: admission },
+        sessionIdUsed: "openclaw-session-1",
+        sessionKey: "agent:main:main",
+      }),
+    );
+  });
+
   it("does not synthesize a context-engine user turn for empty transcript prompts", async () => {
     const afterTurn = vi.fn<NonNullable<ContextEngine["afterTurn"]>>(async () => {});
     const dispose = vi.fn(async () => {});
@@ -214,8 +475,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
     const context = buildPreparedContext(contextEngine);
     context.params.transcriptPrompt = "";
     context.contextEngineTurnPrompt = "";
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     await runPreparedCliAgent(context);
 
     const afterTurnParams = afterTurn.mock.calls[0]?.[0];
@@ -239,8 +498,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
     context.params.prompt = "runtime context\n\noriginal user ask";
     delete context.params.transcriptPrompt;
     context.contextEngineTurnPrompt = "original user ask";
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     await runPreparedCliAgent(context);
 
     const afterTurnParams = afterTurn.mock.calls[0]?.[0];
@@ -262,8 +519,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
       textMessage("user", `old ask ${index}`, index),
     );
     loadCliSessionContextEngineMessagesMock.mockResolvedValueOnce(fullHistory);
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     await runPreparedCliAgent(context);
 
     const afterTurnParams = afterTurn.mock.calls[0]?.[0];
@@ -283,8 +538,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
     const dispose = vi.fn(async () => {});
     const contextEngine = createContextEngine({ bootstrap, afterTurn, dispose });
     const context = buildPreparedContext(contextEngine);
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     await runPreparedCliAgent(context);
 
     expect(bootstrap).toHaveBeenCalledTimes(1);
@@ -309,8 +562,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
     );
     const dispose = vi.fn(async () => {});
     const contextEngine = createContextEngine({ ingestBatch, maintain, dispose });
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     await runPreparedCliAgent(buildPreparedContext(contextEngine));
 
     expect(ingestBatch).toHaveBeenCalledTimes(1);
@@ -340,7 +591,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
       maintain,
       dispose,
     });
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
     const context = buildPreparedContext(contextEngine);
 
     await runPreparedCliAgent(context);
@@ -361,8 +611,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
       },
       dispose,
     });
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     await runPreparedCliAgent(buildPreparedContext(contextEngine));
 
     expect(dispose).not.toHaveBeenCalled();
@@ -383,8 +631,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
       maintain,
       dispose,
     });
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     await expect(runPreparedCliAgent(buildPreparedContext(contextEngine))).rejects.toThrow(
       "cli boom",
     );
@@ -413,8 +659,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
       maintain,
       dispose,
     });
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     await expect(runPreparedCliAgent(buildPreparedContext(contextEngine))).rejects.toThrow(
       "cli boom",
     );
@@ -451,8 +695,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
       maintain,
       dispose,
     });
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     await expect(runPreparedCliAgent(buildPreparedContext(contextEngine))).rejects.toMatchObject({
       name: "FailoverError",
       reason: "empty_response",
@@ -474,8 +716,6 @@ describe("runPreparedCliAgent context engine lifecycle", () => {
       throw new Error("dispose boom");
     });
     const contextEngine = createContextEngine({ dispose });
-    const { runPreparedCliAgent } = await import("./cli-runner.js");
-
     await expect(runPreparedCliAgent(buildPreparedContext(contextEngine))).rejects.toThrow(
       "cli boom",
     );

@@ -1,8 +1,16 @@
-import { readChannelAllowFromStore } from "../../pairing/pairing-store.js";
+/**
+ * Channel ingress runtime resolver.
+ *
+ * Merges route, sender, command, access-group, and pairing-store facts before decision evaluation.
+ */
+import {
+  normalizeStringEntries,
+  uniqueStrings,
+} from "@openclaw/normalization-core/string-normalization";
 import type { PairingChannel } from "../../pairing/pairing-store.types.js";
-import { normalizeStringEntries } from "../../shared/string-normalization.js";
-import { mergeDmAllowFromSources, resolveGroupAllowFromSources } from "../allow-from.js";
+import { recordChannelIngressResolution } from "./admission-evidence.js";
 import { decideChannelIngress } from "./decision.js";
+import { resolveChannelIngressEffectiveAllowFromLists } from "./effective-allow-from.js";
 import {
   allReferencedAccessGroupNames,
   normalizeEffectiveEntries,
@@ -30,6 +38,7 @@ import type {
   ResolvedChannelMessageIngress,
 } from "./runtime-types.js";
 import { resolveChannelIngressState } from "./state.js";
+import { readChannelIngressStoreAllowFromForDmPolicy } from "./store-allow-from.js";
 import type {
   AccessGraphGate,
   ChannelIngressChannelId,
@@ -61,65 +70,6 @@ function shouldReadStore(params: {
     params.dmPolicy !== "allowlist" &&
     params.dmPolicy !== "open"
   );
-}
-
-/**
- * Merge configured direct, group, and pairing-store allowlists into the
- * effective lists consumed by sender and context-visibility checks.
- */
-export function resolveChannelIngressEffectiveAllowFromLists(params: {
-  allowFrom?: Array<string | number> | null;
-  groupAllowFrom?: Array<string | number> | null;
-  storeAllowFrom?: Array<string | number> | null;
-  dmPolicy?: string | null;
-  groupAllowFromFallbackToAllowFrom?: boolean | null;
-}): {
-  effectiveAllowFrom: string[];
-  effectiveGroupAllowFrom: string[];
-} {
-  const allowFrom = Array.isArray(params.allowFrom) ? params.allowFrom : undefined;
-  const groupAllowFrom = Array.isArray(params.groupAllowFrom) ? params.groupAllowFrom : undefined;
-  const storeAllowFrom = Array.isArray(params.storeAllowFrom) ? params.storeAllowFrom : undefined;
-  const effectiveAllowFrom = normalizeStringEntries(
-    mergeDmAllowFromSources({
-      allowFrom,
-      storeAllowFrom,
-      dmPolicy: params.dmPolicy ?? undefined,
-    }),
-  );
-  const effectiveGroupAllowFrom = normalizeStringEntries(
-    resolveGroupAllowFromSources({
-      allowFrom,
-      groupAllowFrom,
-      fallbackToAllowFrom: params.groupAllowFromFallbackToAllowFrom ?? undefined,
-    }),
-  );
-  return { effectiveAllowFrom, effectiveGroupAllowFrom };
-}
-
-/**
- * Read pairing-store allowlist entries when a direct-message policy permits
- * store fallback.
- */
-export async function readChannelIngressStoreAllowFromForDmPolicy(params: {
-  provider: PairingChannel;
-  accountId: string;
-  dmPolicy?: string | null;
-  shouldRead?: boolean | null;
-  readStore?: (provider: PairingChannel, accountId: string) => Promise<string[]>;
-}): Promise<string[]> {
-  if (
-    params.shouldRead === false ||
-    params.dmPolicy === "allowlist" ||
-    params.dmPolicy === "open"
-  ) {
-    return [];
-  }
-  const readStore =
-    params.readStore ??
-    ((provider: PairingChannel, accountId: string) =>
-      readChannelAllowFromStore(provider, process.env, accountId));
-  return await readStore(params.provider, params.accountId).catch(() => []);
 }
 
 async function readStoreAllowFrom(
@@ -188,7 +138,7 @@ function useAccessGroupsFromConfig(params: {
   useAccessGroups?: boolean | null;
   cfg?: ChannelIngressCommandPresetInput["cfg"];
 }): boolean {
-  return params.useAccessGroups ?? params.cfg?.commands?.useAccessGroups !== false;
+  return params.useAccessGroups ?? true;
 }
 
 function channelIngressCommand(
@@ -272,6 +222,7 @@ export function createChannelIngressResolver(
       identity: base.identity,
       subject: input.subject,
       conversation: input.conversation,
+      contextBinding: input.contextBinding,
       event: channelIngressEvent({
         isGroup,
         ...eventDefaults,
@@ -591,7 +542,7 @@ function appendAccessGroupMatchedEntry(params: {
   matchedEntry: string | null;
 }): string[] {
   return params.matchedEntry && params.allowlist.accessGroups.matched.length > 0
-    ? Array.from(new Set([...params.entries, params.matchedEntry]))
+    ? uniqueStrings([...params.entries, params.matchedEntry])
     : params.entries;
 }
 
@@ -711,7 +662,7 @@ export async function resolveChannelMessageIngress(
   const routeAccess = projectRouteAccess({ ingress, route: params.route });
   const commandAccess = projectCommandAccess({ ingress, policy });
   const activationAccess = projectActivationAccess({ ingress });
-  return {
+  const result: ResolvedChannelMessageIngress = {
     state,
     ingress,
     senderAccess,
@@ -719,4 +670,26 @@ export async function resolveChannelMessageIngress(
     commandAccess,
     activationAccess,
   };
+  return recordChannelIngressResolution({
+    result,
+    channelId,
+    accountId: params.accountId,
+    rawPrincipalRef: params.subject.stableId,
+    scope: {
+      conversation: {
+        kind: params.conversation.kind,
+        id: params.conversation.id,
+        parentId: params.conversation.parentId,
+        threadId: params.conversation.threadId,
+      },
+      contextBinding: params.contextBinding,
+    },
+    participantOutcomeAffecting:
+      senderAccess.gate?.match?.matched === true &&
+      (senderAccess.reasonCode === "dm_policy_allowlisted" ||
+        senderAccess.reasonCode === "group_policy_allowed") &&
+      !(isGroup
+        ? state.allowlists.group.hasWildcard
+        : state.allowlists.dm.hasWildcard || state.allowlists.pairingStore.hasWildcard),
+  });
 }

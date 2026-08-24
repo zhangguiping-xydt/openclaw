@@ -1,3 +1,4 @@
+// Twitch tests cover access control plugin behavior.
 import { describe, expect, it } from "vitest";
 import { checkTwitchAccessControl } from "./access-control.js";
 import type { TwitchAccountConfig, TwitchChatMessage } from "./types.js";
@@ -11,6 +12,7 @@ describe("checkTwitchAccessControl", () => {
   };
 
   const mockMessage: TwitchChatMessage = {
+    id: "message-1",
     username: "testuser",
     userId: "123456",
     message: "hello bot",
@@ -83,17 +85,6 @@ describe("checkTwitchAccessControl", () => {
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain(params.reason);
   }
-
-  describe("when no restrictions are configured", () => {
-    it("allows messages that mention the bot (default requireMention)", async () => {
-      const result = await runAccessCheck({
-        message: {
-          message: "@testbot hello",
-        },
-      });
-      expect(result.allowed).toBe(true);
-    });
-  });
 
   describe("requireMention default", () => {
     it("defaults to true when undefined", async () => {

@@ -1,4 +1,11 @@
+/** Handles /bash and ! shell command chat shortcuts. */
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
+import { cancelBackgroundExecSession } from "../../agents/bash-process-control.js";
 import { getFinishedSession, getSession } from "../../agents/bash-process-registry.js";
 import { createExecTool } from "../../agents/bash-tools.js";
 import { resolveSandboxRuntimeStatus } from "../../agents/sandbox.js";
@@ -6,10 +13,6 @@ import { isCommandFlagEnabled } from "../../config/commands.flags.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
 import { formatErrorMessage } from "../../infra/errors.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalString,
-} from "../../shared/string-coerce.js";
 import { clampInt } from "../../utils.js";
 import type { MsgContext } from "../templating.js";
 import type { ReplyPayload } from "../types.js";
@@ -35,7 +38,6 @@ type ActiveBashJob =
       sessionId: string;
       startedAt: number;
       command: string;
-      watcherAttached: boolean;
     };
 
 let activeJob: ActiveBashJob | null = null;
@@ -53,7 +55,7 @@ function formatSessionSnippet(sessionId: string) {
   if (trimmed.length <= 12) {
     return trimmed;
   }
-  return `${trimmed.slice(0, 8)}…`;
+  return `${truncateUtf16Safe(trimmed, 8)}…`;
 }
 
 function formatOutputBlock(text: string) {
@@ -66,7 +68,7 @@ function formatOutputBlock(text: string) {
 
 function parseBashRequest(raw: string): BashRequest | null {
   const trimmed = raw.trimStart();
-  let restSource = "";
+  let restSource;
   if (normalizeLowercaseStringOrEmpty(trimmed).startsWith("/bash")) {
     const match = trimmed.match(/^\/bash(?:\s*:\s*|\s+|$)([\s\S]*)$/i);
     if (!match) {
@@ -108,7 +110,7 @@ function resolveRawCommandBody(params: {
   agentId?: string;
   isGroup: boolean;
 }) {
-  const source = params.ctx.CommandBody ?? params.ctx.RawBody ?? params.ctx.Body ?? "";
+  const source = params.ctx.commandText ?? "";
   const stripped = stripStructuralPrefixes(source);
   return params.isGroup
     ? stripMentions(stripped, params.ctx, params.cfg, params.agentId)
@@ -146,29 +148,6 @@ function ensureActiveJobState() {
   return null;
 }
 
-function attachActiveWatcher(sessionId: string) {
-  if (!activeJob || activeJob.state !== "running") {
-    return;
-  }
-  if (activeJob.sessionId !== sessionId) {
-    return;
-  }
-  if (activeJob.watcherAttached) {
-    return;
-  }
-  const { running } = getScopedSession(sessionId);
-  const child = running?.child;
-  if (!child) {
-    return;
-  }
-  activeJob.watcherAttached = true;
-  child.once("close", () => {
-    if (activeJob?.state === "running" && activeJob.sessionId === sessionId) {
-      activeJob = null;
-    }
-  });
-}
-
 function buildUsageReply(): ReplyPayload {
   return {
     text: [
@@ -181,6 +160,7 @@ function buildUsageReply(): ReplyPayload {
   };
 }
 
+/** Parses, authorizes, starts, polls, or stops chat-driven bash commands. */
 export async function handleBashChatCommand(params: {
   ctx: MsgContext;
   cfg: OpenClawConfig;
@@ -212,6 +192,7 @@ export async function handleBashChatCommand(params: {
     const runtimeSandboxed = resolveSandboxRuntimeStatus({
       cfg: params.cfg,
       sessionKey: resolveRuntimePolicySessionKey({
+        agentId,
         cfg: params.cfg,
         ctx: params.ctx,
         sessionKey: params.sessionKey,
@@ -252,7 +233,6 @@ export async function handleBashChatCommand(params: {
     }
     const { running, finished } = getScopedSession(sessionId);
     if (running) {
-      attachActiveWatcher(sessionId);
       const runtimeSec = Math.max(0, Math.floor((Date.now() - running.startedAt) / 1000));
       const tail = running.tail || "(no output yet)";
       return {
@@ -308,14 +288,11 @@ export async function handleBashChatCommand(params: {
         text: `⚠️ Session ${formatSessionSnippet(sessionId)} is not backgrounded.`,
       };
     }
-    const pid = running.pid ?? running.child?.pid;
-    if (!pid) {
+    if (!cancelBackgroundExecSession(sessionId)) {
       return {
-        text: `⚠️ Unable to stop bash session ${formatSessionSnippet(sessionId)} because no process ID is available. Use !poll ${sessionId} to check whether it exits on its own.`,
+        text: `⚠️ Unable to stop bash session ${formatSessionSnippet(sessionId)} because no active cancellation handle is available. Use !poll ${sessionId} to check whether it is already exiting.`,
       };
     }
-    const { killProcessTree } = await import("../../process/kill-tree.js");
-    killProcessTree(pid);
     return {
       text: `⚙️ bash stopping (session ${formatSessionSnippet(sessionId)}). Use !poll ${sessionId} to confirm exit.`,
     };
@@ -344,7 +321,7 @@ export async function handleBashChatCommand(params: {
   try {
     const foregroundMs = resolveForegroundMs(params.cfg);
     const shouldBackgroundImmediately = foregroundMs <= 0;
-    const timeoutSec = params.cfg.tools?.exec?.timeoutSec;
+    const timeoutSec = params.cfg.tools?.exec?.timeoutSeconds;
     const notifyOnExit = params.cfg.tools?.exec?.notifyOnExit;
     const notifyOnExitEmptySuccess = params.cfg.tools?.exec?.notifyOnExitEmptySuccess;
     const execTool = createExecTool({
@@ -366,7 +343,7 @@ export async function handleBashChatCommand(params: {
       command: commandText,
       background: shouldBackgroundImmediately,
       yieldMs: shouldBackgroundImmediately ? undefined : foregroundMs,
-      timeout: timeoutSec,
+      timeoutSeconds: timeoutSec,
       elevated: true,
     });
 
@@ -377,9 +354,7 @@ export async function handleBashChatCommand(params: {
         sessionId,
         startedAt: result.details.startedAt,
         command: commandText,
-        watcherAttached: false,
       };
-      attachActiveWatcher(sessionId);
       const snippet = formatSessionSnippet(sessionId);
       logVerbose(`Started bash session ${snippet}: ${commandText}`);
       return {

@@ -1,3 +1,4 @@
+// Mattermost plugin module implements monitor auth behavior.
 import { parseAccessGroupAllowFromEntry } from "openclaw/plugin-sdk/access-groups";
 import {
   type ChannelIngressDecision,
@@ -6,10 +7,13 @@ import {
   resolveStableChannelMessageIngress,
   type StableChannelIngressIdentityParams,
 } from "openclaw/plugin-sdk/channel-ingress-runtime";
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  normalizeLowercaseStringOrEmpty,
+  uniqueStrings,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { ResolvedMattermostAccount } from "./accounts.js";
 import type { MattermostChannel } from "./client.js";
-import type { OpenClawConfig } from "./runtime-api.js";
+import type { ChatType, OpenClawConfig } from "./runtime-api.js";
 import { isDangerousNameMatchingEnabled, resolveAllowlistMatchSimple } from "./runtime-api.js";
 
 const MATTERMOST_USER_NAME_KIND =
@@ -54,7 +58,20 @@ export function normalizeMattermostAllowList(entries: Array<string | number>): s
   const normalized = entries
     .map((entry) => normalizeMattermostAllowEntry(String(entry)))
     .filter(Boolean);
-  return Array.from(new Set(normalized));
+  return uniqueStrings(normalized);
+}
+
+export function formatMattermostDirectMessageDropLog(params: {
+  senderId: string;
+  dmPolicy: string;
+  reasonCode?: string;
+}): string {
+  const reason = params.reasonCode ? ` reason=${params.reasonCode}` : "";
+  const hint =
+    params.dmPolicy === "open" && params.reasonCode === "dm_policy_not_allowlisted"
+      ? " hint=add-allowFrom-wildcard"
+      : "";
+  return `mattermost: drop dm sender=${params.senderId} (dmPolicy=${params.dmPolicy}${reason}${hint})`;
 }
 
 export function isMattermostSenderAllowed(params: {
@@ -64,9 +81,6 @@ export function isMattermostSenderAllowed(params: {
   allowNameMatching?: boolean;
 }): boolean {
   const allowFrom = normalizeMattermostAllowList(params.allowFrom);
-  if (allowFrom.length === 0) {
-    return false;
-  }
   const match = resolveAllowlistMatchSimple({
     allowFrom,
     senderId: normalizeMattermostAllowEntry(params.senderId),
@@ -76,8 +90,11 @@ export function isMattermostSenderAllowed(params: {
   return match.allowed;
 }
 
-function mapMattermostChannelKind(channelType?: string | null): "direct" | "group" | "channel" {
+function mapMattermostChannelTypeToChatType(channelType?: string | null): ChatType {
   const normalized = channelType?.trim().toUpperCase();
+  if (!normalized) {
+    return "direct";
+  }
   if (normalized === "D") {
     return "direct";
   }
@@ -87,7 +104,17 @@ function mapMattermostChannelKind(channelType?: string | null): "direct" | "grou
   return "channel";
 }
 
-export type MattermostCommandAuthDecision =
+export function resolveMattermostTrustedChatKind(params: {
+  channelType?: string | null;
+  fallback?: ChatType;
+}): ChatType {
+  const channelType = params.channelType?.trim();
+  return channelType
+    ? mapMattermostChannelTypeToChatType(channelType)
+    : (params.fallback ?? "direct");
+}
+
+type MattermostCommandAuthDecision =
   | {
       ok: true;
       commandAuthorized: boolean;
@@ -247,12 +274,12 @@ export async function authorizeMattermostCommandInvocation(params: {
     hasControlCommand,
   } = params;
 
-  if (!channelInfo) {
+  if (!channelInfo?.type) {
     return {
       ok: false,
       denyReason: "unknown-channel",
       commandAuthorized: false,
-      channelInfo: null,
+      channelInfo,
       kind: "channel",
       chatType: "channel",
       channelName: "",
@@ -261,7 +288,7 @@ export async function authorizeMattermostCommandInvocation(params: {
     };
   }
 
-  const kind = mapMattermostChannelKind(channelInfo.type);
+  const kind = mapMattermostChannelTypeToChatType(channelInfo.type);
   const chatType = kind;
   const channelName = channelInfo.name ?? "";
   const channelDisplay = channelInfo.display_name ?? channelName;

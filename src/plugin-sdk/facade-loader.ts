@@ -1,10 +1,13 @@
+// Facade loader helpers resolve plugin public API modules from source, dist, or installed roots.
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { openRootFileSync } from "../infra/boundary-file-read.js";
 import { resolveBundledPluginsDir } from "../plugins/bundled-dir.js";
+import { shouldRejectHardlinkedPluginFiles } from "../plugins/hardlink-policy.js";
+import { registerPluginMetadataProcessMemoLifecycleClear } from "../plugins/plugin-metadata-lifecycle.js";
 import {
+  clearPluginModuleLoaderLifecycleCache,
   getCachedPluginModuleLoader,
   type PluginModuleLoaderCache,
   type PluginModuleLoaderFactory,
@@ -12,23 +15,28 @@ import {
 import { resolveLoaderPackageRoot } from "../plugins/sdk-alias.js";
 import { resolveBundledFacadeModuleLocation } from "./facade-resolution-shared.js";
 
+/** Error thrown when a bundled plugin public surface artifact cannot be resolved. */
+export class MissingPublicSurfaceError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "MissingPublicSurfaceError";
+  }
+}
+
 const CURRENT_MODULE_PATH = fileURLToPath(import.meta.url);
 
-const nodeRequire = createRequire(import.meta.url);
 const moduleLoaders: PluginModuleLoaderCache = new Map();
 const loadedFacadeModules = new Map<string, unknown>();
+const loadedFacadeModuleRoots = new Map<string, string>();
 const loadedFacadePluginIds = new Set<string>();
 let facadeLoaderSourceTransformFactory: PluginModuleLoaderFactory | undefined;
 let cachedOpenClawPackageRoot: string | undefined;
 
-function getSourceTransformFactory() {
-  if (facadeLoaderSourceTransformFactory) {
-    return facadeLoaderSourceTransformFactory;
-  }
-  const { createJiti } = nodeRequire("jiti") as typeof import("jiti");
-  facadeLoaderSourceTransformFactory = createJiti;
-  return facadeLoaderSourceTransformFactory;
-}
+// Facade exports and native loader closures must retire with their plugin; imported ids are history.
+registerPluginMetadataProcessMemoLifecycleClear(() => {
+  loadedFacadeModules.clear();
+  clearPluginModuleLoaderLifecycleCache({ moduleLoaders, moduleRoots: loadedFacadeModuleRoots });
+});
 
 function getOpenClawPackageRoot() {
   if (cachedOpenClawPackageRoot) {
@@ -63,7 +71,9 @@ function getModuleLoader(modulePath: string) {
     importerUrl: import.meta.url,
     preferBuiltDist: true,
     loaderFilename: import.meta.url,
-    createLoader: getSourceTransformFactory(),
+    ...(facadeLoaderSourceTransformFactory
+      ? { createLoader: facadeLoaderSourceTransformFactory }
+      : {}),
   });
 }
 
@@ -121,19 +131,49 @@ function createLazyFacadeProxyValue<T extends object>(params: {
   }) as T;
 }
 
+/** Create an object proxy that loads the underlying facade only on first property access. */
 export function createLazyFacadeObjectValue<T extends object>(load: () => T): T {
   return createLazyFacadeProxyValue({ load, target: {} });
 }
 
+/** Create an array proxy that loads the underlying facade only on first array access. */
 export function createLazyFacadeArrayValue<T extends readonly unknown[]>(load: () => T): T {
   return createLazyFacadeProxyValue({ load, target: [] });
 }
 
+/** Resolved public-surface module path plus the filesystem root it must stay within. */
 export type FacadeModuleLocation = {
   modulePath: string;
   boundaryRoot: string;
 };
 
+function isPathAtOrInside(target: string, root: string): boolean {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  return resolvedTarget === resolvedRoot || resolvedTarget.startsWith(resolvedRoot + path.sep);
+}
+
+// Registry-resolved locations can point at installed plugin roots, which must
+// reject hardlinked artifacts (see hardlink-policy.ts); core-shipped roots keep
+// hardlinks allowed for bundled dist/Nix layouts.
+function resolveFacadeBoundaryOpenParams(boundaryRoot: string): {
+  boundaryLabel: string;
+  rejectHardlinks: boolean;
+} {
+  if (isPathAtOrInside(boundaryRoot, getOpenClawPackageRoot())) {
+    return { boundaryLabel: "OpenClaw package root", rejectHardlinks: false };
+  }
+  const bundledDir = resolveBundledPluginsDir();
+  if (bundledDir && isPathAtOrInside(boundaryRoot, bundledDir)) {
+    return { boundaryLabel: "bundled plugin directory", rejectHardlinks: false };
+  }
+  return {
+    boundaryLabel: "plugin root",
+    rejectHardlinks: shouldRejectHardlinkedPluginFiles({ origin: "global", rootDir: boundaryRoot }),
+  };
+}
+
+/** Load and cache a facade module after verifying it is inside its declared boundary root. */
 export function loadFacadeModuleAtLocationSync<T extends object>(params: {
   location: FacadeModuleLocation;
   trackedPluginId: string | (() => string);
@@ -148,16 +188,7 @@ export function loadFacadeModuleAtLocationSync<T extends object>(params: {
   const opened = openRootFileSync({
     absolutePath: location.modulePath,
     rootPath: location.boundaryRoot,
-    boundaryLabel:
-      location.boundaryRoot === getOpenClawPackageRoot()
-        ? "OpenClaw package root"
-        : (() => {
-            const bundledDir = resolveBundledPluginsDir();
-            return bundledDir && path.resolve(location.boundaryRoot) === path.resolve(bundledDir)
-              ? "bundled plugin directory"
-              : "plugin root";
-          })(),
-    rejectHardlinks: false,
+    ...resolveFacadeBoundaryOpenParams(location.boundaryRoot),
   });
   if (!opened.ok) {
     throw new Error(`Unable to open bundled plugin public surface ${location.modulePath}`, {
@@ -174,6 +205,7 @@ export function loadFacadeModuleAtLocationSync<T extends object>(params: {
     loaded =
       params.loadModule?.(location.modulePath) ??
       (getModuleLoader(location.modulePath)(location.modulePath) as T);
+    loadedFacadeModuleRoots.set(location.modulePath, location.boundaryRoot);
     Object.assign(sentinel, loaded);
     loadedFacadePluginIds.add(
       typeof params.trackedPluginId === "function"
@@ -188,8 +220,9 @@ export function loadFacadeModuleAtLocationSync<T extends object>(params: {
   return sentinel;
 }
 
+/** Resolve and synchronously load a bundled plugin public surface by plugin dir and artifact name. */
 // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Dynamic facade loaders use caller-supplied module surface types.
-export function loadBundledPluginPublicSurfaceModuleSync<T extends object>(params: {
+export function loadBundledPluginPublicSurfaceModuleSyncCore<T extends object>(params: {
   dirName: string;
   artifactBasename: string;
   trackedPluginId?: string | (() => string);
@@ -197,7 +230,7 @@ export function loadBundledPluginPublicSurfaceModuleSync<T extends object>(param
 }): T {
   const location = resolveFacadeModuleLocation(params);
   if (!location) {
-    throw new Error(
+    throw new MissingPublicSurfaceError(
       `Unable to resolve bundled plugin public surface ${params.dirName}/${params.artifactBasename}`,
     );
   }
@@ -207,6 +240,7 @@ export function loadBundledPluginPublicSurfaceModuleSync<T extends object>(param
   });
 }
 
+/** Resolve and asynchronously import a bundled plugin public surface with sync-loader fallback. */
 export async function loadBundledPluginPublicSurfaceModule<T extends object>(params: {
   dirName: string;
   artifactBasename: string;
@@ -214,7 +248,7 @@ export async function loadBundledPluginPublicSurfaceModule<T extends object>(par
 }): Promise<T> {
   const location = resolveFacadeModuleLocation(params);
   if (!location) {
-    throw new Error(
+    throw new MissingPublicSurfaceError(
       `Unable to resolve bundled plugin public surface ${params.dirName}/${params.artifactBasename}`,
     );
   }
@@ -227,11 +261,7 @@ export async function loadBundledPluginPublicSurfaceModule<T extends object>(par
   const opened = openRootFileSync({
     absolutePath: preparedLocation.modulePath,
     rootPath: preparedLocation.boundaryRoot,
-    boundaryLabel:
-      preparedLocation.boundaryRoot === getOpenClawPackageRoot()
-        ? "OpenClaw package root"
-        : "plugin root",
-    rejectHardlinks: false,
+    ...resolveFacadeBoundaryOpenParams(preparedLocation.boundaryRoot),
   });
   if (!opened.ok) {
     throw new Error(`Unable to open bundled plugin public surface ${preparedLocation.modulePath}`, {
@@ -241,6 +271,7 @@ export async function loadBundledPluginPublicSurfaceModule<T extends object>(par
   fs.closeSync(opened.fd);
 
   try {
+    // Native ESM imports cannot be evicted; bundled core-dist artifacts change only on restart.
     const loaded = (await import(pathToFileURL(preparedLocation.modulePath).href)) as T;
     loadedFacadeModules.set(preparedLocation.modulePath, loaded);
     loadedFacadePluginIds.add(
@@ -257,18 +288,21 @@ export async function loadBundledPluginPublicSurfaceModule<T extends object>(par
   }
 }
 
+/** List plugin ids whose public facades have been loaded in this process. */
 export function listImportedBundledPluginFacadeIds(): string[] {
   return [...loadedFacadePluginIds].toSorted((left, right) => left.localeCompare(right));
 }
 
+/** Reset facade module caches and test loader overrides. */
 export function resetFacadeLoaderStateForTest(): void {
   loadedFacadeModules.clear();
   loadedFacadePluginIds.clear();
-  moduleLoaders.clear();
+  clearPluginModuleLoaderLifecycleCache({ moduleLoaders, moduleRoots: loadedFacadeModuleRoots });
   facadeLoaderSourceTransformFactory = undefined;
   cachedOpenClawPackageRoot = undefined;
 }
 
+/** Override source transform loader creation for facade-loader tests. */
 export function setFacadeLoaderSourceTransformFactoryForTest(
   factory: PluginModuleLoaderFactory | undefined,
 ): void {

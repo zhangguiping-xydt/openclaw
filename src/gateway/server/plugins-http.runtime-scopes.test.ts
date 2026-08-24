@@ -1,12 +1,11 @@
+/**
+ * Plugin HTTP runtime-scope integration tests.
+ */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SubsystemLogger } from "../../logging/subsystem.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry.js";
-import {
-  pinActivePluginHttpRouteRegistry,
-  releasePinnedPluginHttpRouteRegistry,
-  setActivePluginRegistry,
-} from "../../plugins/runtime.js";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { getPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
 import { ExecApprovalManager } from "../exec-approval-manager.js";
 import type { AuthorizedGatewayHttpRequest } from "../http-utils.js";
@@ -14,8 +13,15 @@ import { authorizeOperatorScopesForMethod, CLI_DEFAULT_OPERATOR_SCOPES } from ".
 import { isApprovalRecordVisibleToClient } from "../server-methods/approval-shared.js";
 import type { GatewayRequestContext } from "../server-methods/types.js";
 import { makeMockHttpResponse } from "../test-http-response.js";
-import { createTestRegistry } from "./__tests__/test-utils.js";
+import { createGatewayTestRegistry } from "./__tests__/test-utils.js";
 import { createGatewayPluginRequestHandler } from "./plugins-http.js";
+
+const SECURE_HOOK_PATH = "/secure-hook";
+const SECURE_ADMIN_HOOK_PATH = "/secure-admin-hook";
+
+type PluginHttpRoute = ReturnType<typeof createRoute>;
+type PluginRequestHandler = ReturnType<typeof createGatewayPluginRequestHandler>;
+type PluginRequestAuthContext = NonNullable<Parameters<PluginRequestHandler>[3]>;
 
 function createRoute(params: {
   path: string;
@@ -71,9 +77,66 @@ function assertAdminHelperAllowed() {
   }
 }
 
+function createPluginRequestHandler(params: {
+  routes: PluginHttpRoute[];
+  log?: SubsystemLogger;
+  getRouteRegistry?: () => ReturnType<typeof createGatewayTestRegistry>;
+  getGatewayRequestContext?: () => GatewayRequestContext;
+}) {
+  return createGatewayPluginRequestHandler({
+    registry: createGatewayTestRegistry({ httpRoutes: params.routes }),
+    ...(params.getRouteRegistry ? { getRouteRegistry: params.getRouteRegistry } : {}),
+    log: params.log ?? createMockLogger(),
+    ...(params.getGatewayRequestContext
+      ? { getGatewayRequestContext: params.getGatewayRequestContext }
+      : {}),
+  });
+}
+
+async function dispatchPluginRequest(
+  handler: PluginRequestHandler,
+  params: {
+    path: string;
+    authContext: PluginRequestAuthContext;
+  },
+) {
+  const response = makeMockHttpResponse();
+  const handled = await handler(
+    { url: params.path } as IncomingMessage,
+    response.res,
+    undefined,
+    params.authContext,
+  );
+  return { handled, ...response };
+}
+
+async function dispatchTrustedGatewayRequest(handler: PluginRequestHandler, path: string) {
+  return await dispatchPluginRequest(handler, {
+    path,
+    authContext: {
+      gatewayAuthSatisfied: true,
+      gatewayRequestAuth: { authMethod: "token", trustDeclaredOperatorScopes: false },
+      gatewayRequestOperatorScopes: ["operator.write"],
+    },
+  });
+}
+
+function expectMissingWriteScopeFailure(params: {
+  res: ServerResponse;
+  setHeader: ReturnType<typeof vi.fn>;
+  end: ReturnType<typeof vi.fn>;
+  log: SubsystemLogger;
+}) {
+  expect(params.res.statusCode).toBe(500);
+  expect(params.setHeader).toHaveBeenCalledWith("Content-Type", "text/plain; charset=utf-8");
+  expect(params.end).toHaveBeenCalledWith("Internal Server Error");
+  expect(params.log.warn).toHaveBeenCalledWith(
+    "plugin http route failed (route): Error: missing scope: operator.write",
+  );
+}
+
 describe("plugin HTTP route runtime scopes", () => {
   afterEach(() => {
-    releasePinnedPluginHttpRouteRegistry();
     setActivePluginRegistry(createEmptyPluginRegistry());
   });
 
@@ -86,35 +149,30 @@ describe("plugin HTTP route runtime scopes", () => {
     gatewayRequestOperatorScopes?: readonly string[];
   }) {
     const log = createMockLogger();
-    const handler = createGatewayPluginRequestHandler({
-      registry: createTestRegistry({
-        httpRoutes: [
-          createRoute({
-            path: params.path,
-            auth: params.auth,
-            gatewayRuntimeScopeSurface: params.gatewayRuntimeScopeSurface,
-            handler: async () => {
-              assertWriteHelperAllowed();
-              return true;
-            },
-          }),
-        ],
-      }),
+    const handler = createPluginRequestHandler({
+      routes: [
+        createRoute({
+          path: params.path,
+          auth: params.auth,
+          gatewayRuntimeScopeSurface: params.gatewayRuntimeScopeSurface,
+          handler: async () => {
+            assertWriteHelperAllowed();
+            return true;
+          },
+        }),
+      ],
       log,
     });
 
-    const response = makeMockHttpResponse();
-    const handled = await handler(
-      { url: params.path } as IncomingMessage,
-      response.res,
-      undefined,
-      {
+    const response = await dispatchPluginRequest(handler, {
+      path: params.path,
+      authContext: {
         gatewayAuthSatisfied: params.gatewayAuthSatisfied,
         gatewayRequestAuth: params.gatewayRequestAuth,
         gatewayRequestOperatorScopes: params.gatewayRequestOperatorScopes,
       },
-    );
-    return { handled, log, ...response };
+    });
+    return { log, ...response };
   }
 
   it("keeps plugin-auth routes off write-capable runtime helpers", async () => {
@@ -125,12 +183,7 @@ describe("plugin HTTP route runtime scopes", () => {
     });
 
     expect(handled).toBe(true);
-    expect(res.statusCode).toBe(500);
-    expect(setHeader).toHaveBeenCalledWith("Content-Type", "text/plain; charset=utf-8");
-    expect(end).toHaveBeenCalledWith("Internal Server Error");
-    expect(log.warn).toHaveBeenCalledWith(
-      "plugin http route failed (route): Error: missing scope: operator.write",
-    );
+    expectMissingWriteScopeFailure({ res, setHeader, end, log });
   });
 
   it("preserves write-capable runtime helpers on gateway-auth routes", async () => {
@@ -154,32 +207,31 @@ describe("plugin HTTP route runtime scopes", () => {
           gatewayMethodDispatchAllowed: boolean | undefined;
         }
       | undefined;
-    const handler = createGatewayPluginRequestHandler({
-      registry: createTestRegistry({
-        httpRoutes: [
-          createRoute({
-            path: "/secure-hook",
-            auth: "gateway",
-            gatewayMethodDispatchAllowed: true,
-            handler: async () => {
-              const scope = getPluginRuntimeGatewayRequestScope();
-              observed = {
-                pluginId: scope?.pluginId,
-                pluginSource: scope?.pluginSource,
-                gatewayMethodDispatchAllowed: scope?.gatewayMethodDispatchAllowed,
-              };
-              return true;
-            },
-          }),
-        ],
-      }),
-      log: createMockLogger(),
+    const handler = createPluginRequestHandler({
+      routes: [
+        createRoute({
+          path: SECURE_HOOK_PATH,
+          auth: "gateway",
+          gatewayMethodDispatchAllowed: true,
+          handler: async () => {
+            const scope = getPluginRuntimeGatewayRequestScope();
+            observed = {
+              pluginId: scope?.pluginId,
+              pluginSource: scope?.pluginSource,
+              gatewayMethodDispatchAllowed: scope?.gatewayMethodDispatchAllowed,
+            };
+            return true;
+          },
+        }),
+      ],
     });
 
-    const { res } = makeMockHttpResponse();
-    const handled = await handler({ url: "/secure-hook" } as IncomingMessage, res, undefined, {
-      gatewayAuthSatisfied: true,
-      gatewayRequestOperatorScopes: ["operator.write"],
+    const { handled, res } = await dispatchPluginRequest(handler, {
+      path: SECURE_HOOK_PATH,
+      authContext: {
+        gatewayAuthSatisfied: true,
+        gatewayRequestOperatorScopes: ["operator.write"],
+      },
     });
 
     expect(handled).toBe(true);
@@ -195,10 +247,10 @@ describe("plugin HTTP route runtime scopes", () => {
     const serverAContext = { label: "server-a" } as unknown as GatewayRequestContext;
     const serverBContext = { label: "server-b" } as unknown as GatewayRequestContext;
     const observed: Array<{ route: string; context?: GatewayRequestContext }> = [];
-    const serverARegistry = createTestRegistry({
+    const serverARegistry = createGatewayTestRegistry({
       httpRoutes: [
         createRoute({
-          path: "/secure-hook",
+          path: SECURE_HOOK_PATH,
           auth: "gateway",
           handler: async () => {
             const context = getPluginRuntimeGatewayRequestScope()?.context;
@@ -208,10 +260,10 @@ describe("plugin HTTP route runtime scopes", () => {
         }),
       ],
     });
-    const serverBRegistry = createTestRegistry({
+    const serverBRegistry = createGatewayTestRegistry({
       httpRoutes: [
         createRoute({
-          path: "/secure-hook",
+          path: SECURE_HOOK_PATH,
           auth: "gateway",
           handler: async () => {
             const context = getPluginRuntimeGatewayRequestScope()?.context;
@@ -223,7 +275,6 @@ describe("plugin HTTP route runtime scopes", () => {
     });
 
     setActivePluginRegistry(serverBRegistry);
-    pinActivePluginHttpRouteRegistry(serverBRegistry);
 
     const handlerA = createGatewayPluginRequestHandler({
       registry: serverARegistry,
@@ -240,7 +291,7 @@ describe("plugin HTTP route runtime scopes", () => {
 
     const responseA = makeMockHttpResponse();
     const handledA = await handlerA(
-      { url: "/secure-hook" } as IncomingMessage,
+      { url: SECURE_HOOK_PATH } as IncomingMessage,
       responseA.res,
       undefined,
       {
@@ -250,7 +301,7 @@ describe("plugin HTTP route runtime scopes", () => {
     );
     const responseB = makeMockHttpResponse();
     const handledB = await handlerB(
-      { url: "/secure-hook" } as IncomingMessage,
+      { url: SECURE_HOOK_PATH } as IncomingMessage,
       responseB.res,
       undefined,
       {
@@ -277,31 +328,30 @@ describe("plugin HTTP route runtime scopes", () => {
     record.requestedByClientId = "client-owner";
     let observedApprovalRuntime: boolean | undefined;
     let observedVisibility: boolean | undefined;
-    const handler = createGatewayPluginRequestHandler({
-      registry: createTestRegistry({
-        httpRoutes: [
-          createRoute({
-            path: "/secure-hook",
-            auth: "gateway",
-            handler: async () => {
-              const runtimeClient = getPluginRuntimeGatewayRequestScope()?.client;
-              observedApprovalRuntime = runtimeClient?.internal?.approvalRuntime;
-              observedVisibility = isApprovalRecordVisibleToClient({
-                record,
-                client: runtimeClient ?? null,
-              });
-              return true;
-            },
-          }),
-        ],
-      }),
-      log: createMockLogger(),
+    const handler = createPluginRequestHandler({
+      routes: [
+        createRoute({
+          path: SECURE_HOOK_PATH,
+          auth: "gateway",
+          handler: async () => {
+            const runtimeClient = getPluginRuntimeGatewayRequestScope()?.client;
+            observedApprovalRuntime = runtimeClient?.internal?.approvalRuntime;
+            observedVisibility = isApprovalRecordVisibleToClient({
+              record,
+              client: runtimeClient ?? null,
+            });
+            return true;
+          },
+        }),
+      ],
     });
 
-    const { res } = makeMockHttpResponse();
-    const handled = await handler({ url: "/secure-hook" } as IncomingMessage, res, undefined, {
-      gatewayAuthSatisfied: true,
-      gatewayRequestOperatorScopes: ["operator.approvals"],
+    const { handled, res } = await dispatchPluginRequest(handler, {
+      path: SECURE_HOOK_PATH,
+      authContext: {
+        gatewayAuthSatisfied: true,
+        gatewayRequestOperatorScopes: ["operator.approvals"],
+      },
     });
 
     expect(handled).toBe(true);
@@ -333,49 +383,32 @@ describe("plugin HTTP route runtime scopes", () => {
     });
 
     expect(handled).toBe(true);
-    expect(res.statusCode).toBe(500);
-    expect(setHeader).toHaveBeenCalledWith("Content-Type", "text/plain; charset=utf-8");
-    expect(end).toHaveBeenCalledWith("Internal Server Error");
-    expect(log.warn).toHaveBeenCalledWith(
-      "plugin http route failed (route): Error: missing scope: operator.write",
-    );
+    expectMissingWriteScopeFailure({ res, setHeader, end, log });
   });
 
   it("restores trusted-operator defaults for routes opting into trusted surface", async () => {
     let observedScopes: string[] | undefined;
     const log = createMockLogger();
-    const handler = createGatewayPluginRequestHandler({
-      registry: createTestRegistry({
-        httpRoutes: [
-          createRoute({
-            path: "/secure-admin-hook",
-            auth: "gateway",
-            gatewayRuntimeScopeSurface: "trusted-operator",
-            handler: async () => {
-              observedScopes =
-                getPluginRuntimeGatewayRequestScope()?.client?.connect?.scopes?.slice() ?? [];
-              assertAdminHelperAllowed();
-              return true;
-            },
-          }),
-        ],
-      }),
+    const handler = createPluginRequestHandler({
+      routes: [
+        createRoute({
+          path: SECURE_ADMIN_HOOK_PATH,
+          auth: "gateway",
+          gatewayRuntimeScopeSurface: "trusted-operator",
+          handler: async () => {
+            observedScopes =
+              getPluginRuntimeGatewayRequestScope()?.client?.connect?.scopes?.slice() ?? [];
+            assertAdminHelperAllowed();
+            return true;
+          },
+        }),
+      ],
       log,
     });
 
-    const response = makeMockHttpResponse();
-    const handled = await handler(
-      { url: "/secure-admin-hook" } as IncomingMessage,
-      response.res,
-      undefined,
-      {
-        gatewayAuthSatisfied: true,
-        gatewayRequestAuth: { authMethod: "token", trustDeclaredOperatorScopes: false },
-        gatewayRequestOperatorScopes: ["operator.write"],
-      },
-    );
+    const response = await dispatchTrustedGatewayRequest(handler, SECURE_ADMIN_HOOK_PATH);
 
-    expect(handled).toBe(true);
+    expect(response.handled).toBe(true);
     expect(response.res.statusCode).toBe(200);
     expect(log.warn).not.toHaveBeenCalled();
     expect(observedScopes).toEqual(CLI_DEFAULT_OPERATOR_SCOPES);
@@ -385,7 +418,7 @@ describe("plugin HTTP route runtime scopes", () => {
     const observed: Array<{ route: "exact" | "prefix"; scopes: string[] }> = [];
     const log = createMockLogger();
     const handler = createGatewayPluginRequestHandler({
-      registry: createTestRegistry({
+      registry: createGatewayTestRegistry({
         httpRoutes: [
           createRoute({
             path: "/secure/admin-hook",
@@ -420,19 +453,9 @@ describe("plugin HTTP route runtime scopes", () => {
       log,
     });
 
-    const response = makeMockHttpResponse();
-    const handled = await handler(
-      { url: "/secure/admin-hook" } as IncomingMessage,
-      response.res,
-      undefined,
-      {
-        gatewayAuthSatisfied: true,
-        gatewayRequestAuth: { authMethod: "token", trustDeclaredOperatorScopes: false },
-        gatewayRequestOperatorScopes: ["operator.write"],
-      },
-    );
+    const response = await dispatchTrustedGatewayRequest(handler, "/secure/admin-hook");
 
-    expect(handled).toBe(true);
+    expect(response.handled).toBe(true);
     expect(response.res.statusCode).toBe(200);
     expect(log.warn).not.toHaveBeenCalled();
     expect(observed).toHaveLength(2);
@@ -464,7 +487,7 @@ describe("plugin HTTP route runtime scopes", () => {
     async ({ auth, gatewayAuthSatisfied, gatewayRequestOperatorScopes, path, expectedScopes }) => {
       let observedScopes: string[] | undefined;
       const handler = createGatewayPluginRequestHandler({
-        registry: createTestRegistry({
+        registry: createGatewayTestRegistry({
           httpRoutes: [
             createRoute({
               path,

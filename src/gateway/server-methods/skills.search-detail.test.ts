@@ -1,3 +1,7 @@
+// Skill search/detail tests cover ClawHub search and detail gateway responses,
+// including validation and external error mapping.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const searchSkillsFromClawHubMock = vi.fn();
@@ -14,20 +18,27 @@ vi.mock("../../agents/agent-scope.js", () => ({
   resolveAgentWorkspaceDir: vi.fn(() => "/tmp/workspace"),
 }));
 
-vi.mock("../../agents/skills-clawhub.js", () => ({
+vi.mock("../../skills/lifecycle/clawhub.js", () => ({
   installSkillFromClawHub: vi.fn(),
   updateSkillsFromClawHub: vi.fn(),
   searchSkillsFromClawHub: (...args: unknown[]) => searchSkillsFromClawHubMock(...args),
 }));
 
-vi.mock("../../infra/clawhub.js", () => ({
+vi.mock("../../infra/clawhub-skills.js", () => ({
+  CLAWHUB_SKILLS_SH_REF_PREFIX: "skills-sh:",
   fetchClawHubSkillDetail: (...args: unknown[]) => fetchClawHubSkillDetailMock(...args),
-  resolveClawHubBaseUrl: vi.fn(() => "https://clawhub.ai"),
   searchClawHubSkills: vi.fn(),
+}));
+
+vi.mock("../../infra/clawhub-artifacts.js", () => ({
   downloadClawHubSkillArchive: vi.fn(),
 }));
 
-vi.mock("../../agents/skills-install.js", () => ({
+vi.mock("../../infra/clawhub-client.js", () => ({
+  resolveClawHubBaseUrl: vi.fn(() => "https://clawhub.ai"),
+}));
+
+vi.mock("../../skills/lifecycle/install.js", () => ({
   installSkill: vi.fn(),
 }));
 
@@ -37,7 +48,10 @@ function callHandler(method: string, params: Record<string, unknown>) {
   let ok: boolean | null = null;
   let response: unknown;
   let error: unknown;
-  const result = skillsHandlers[method]({
+  const result = expectDefined(
+    skillsHandlers[method],
+    "skillsHandlers[method] test invariant",
+  )({
     params,
     req: {} as never,
     client: null as never,

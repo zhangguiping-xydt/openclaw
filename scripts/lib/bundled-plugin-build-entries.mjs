@@ -1,3 +1,4 @@
+// Discovers bundled plugin source entries, package artifacts, and root excludes for builds.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -9,9 +10,51 @@ import {
 import { shouldBuildBundledCluster } from "./optional-bundled-clusters.mjs";
 
 const TOP_LEVEL_PUBLIC_SURFACE_EXTENSIONS = new Set([".ts", ".js", ".mts", ".cts", ".mjs", ".cjs"]);
-export const NON_PACKAGED_BUNDLED_PLUGIN_DIRS = new Set(["qa-channel", "qa-lab", "qa-matrix"]);
+/** Bundled plugin directories built with core but not packaged as standalone npm plugins. */
+export const NON_PACKAGED_BUNDLED_PLUGIN_DIRS = new Set(["qa-channel", "qa-lab"]);
 const EXCLUDED_CORE_BUNDLED_PLUGIN_DIRS = new Set(["qqbot", "whatsapp"]);
+const BUNDLED_PLUGIN_BUILD_IDS_ENV = "OPENCLAW_BUNDLED_PLUGIN_BUILD_IDS";
+/** @internal Shared repository-script contract. */
+export const DOCKER_SELECTED_PLUGIN_BUILD_IDS_ENV = "OPENCLAW_INTERNAL_DOCKER_BUILD_PLUGIN_IDS";
+const PLUGIN_ID_RE = /^[a-z0-9][a-z0-9-]*$/u;
+const TOP_LEVEL_PRIVATE_TEST_SURFACE_RE =
+  /(?:^|[._-])(?:test|spec|test-support|test-helpers|test-fixtures|test-harness|mock-setup)(?:[._-]|$)/u;
 const toPosixPath = (value) => value.replaceAll("\\", "/");
+
+function parseBundledPluginBuildIdFilter(env = process.env) {
+  const raw = env[BUNDLED_PLUGIN_BUILD_IDS_ENV];
+  if (typeof raw !== "string" || raw.trim() === "") {
+    return null;
+  }
+  return new Set(
+    raw
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+  );
+}
+
+function parseDockerSelectedPluginBuildIdFilter(env = process.env) {
+  const raw = env[DOCKER_SELECTED_PLUGIN_BUILD_IDS_ENV];
+  if (typeof raw !== "string" || raw.trim() === "") {
+    return null;
+  }
+  const ids = new Set(
+    raw
+      .split(/[\s,]+/u)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+  );
+  const invalidIds = [...ids].filter((id) => !PLUGIN_ID_RE.test(id));
+  if (invalidIds.length > 0) {
+    throw new Error(
+      `${DOCKER_SELECTED_PLUGIN_BUILD_IDS_ENV} contains invalid plugin id(s): ${invalidIds
+        .toSorted((left, right) => left.localeCompare(right))
+        .join(", ")}`,
+    );
+  }
+  return ids;
+}
 
 function readBundledPluginPackageJson(packageJsonPath, options = {}) {
   if (!(options.hasPackageJson ?? fs.existsSync(packageJsonPath))) {
@@ -25,6 +68,9 @@ function readBundledPluginPackageJson(packageJsonPath, options = {}) {
 }
 
 function isManifestlessBundledRuntimeSupportPackage(params) {
+  if (params.packageJson?.openclaw?.release?.publishToNpm === true) {
+    return false;
+  }
   const packageName = typeof params.packageJson?.name === "string" ? params.packageJson.name : "";
   if (packageName !== `@openclaw/${params.dirName}`) {
     return false;
@@ -36,6 +82,18 @@ function shouldBuildBundledDistEntry(packageJson) {
   return packageJson?.openclaw?.build?.bundledDist !== false;
 }
 
+function isExcludedTopLevelPublicSurfaceFile(fileName) {
+  const normalizedName = fileName.toLowerCase();
+  return (
+    normalizedName.endsWith(".d.ts") ||
+    /^config-api\.(?:[cm]?[jt]s)$/u.test(normalizedName) ||
+    TOP_LEVEL_PRIVATE_TEST_SURFACE_RE.test(normalizedName) ||
+    normalizedName.includes(".fixture.") ||
+    normalizedName.includes(".snap")
+  );
+}
+
+/** Collect plugin source entry files declared by package export metadata. */
 export function collectPluginSourceEntries(packageJson) {
   let packageEntries = Array.isArray(packageJson?.openclaw?.extensions)
     ? packageJson.openclaw.extensions.filter(
@@ -53,6 +111,7 @@ export function collectPluginSourceEntries(packageJson) {
   return packageEntries.length > 0 ? packageEntries : ["./index.ts"];
 }
 
+/** Collect top-level public plugin surface files that should be built. */
 export function collectTopLevelPublicSurfaceEntries(pluginDir) {
   if (!fs.existsSync(pluginDir)) {
     return [];
@@ -70,15 +129,7 @@ export function collectTopLevelPublicSurfaceEntries(pluginDir) {
         return [];
       }
 
-      const normalizedName = dirent.name.toLowerCase();
-      if (
-        normalizedName.endsWith(".d.ts") ||
-        /^config-api\.(?:[cm]?[jt]s)$/u.test(normalizedName) ||
-        normalizedName.includes(".test.") ||
-        normalizedName.includes(".spec.") ||
-        normalizedName.includes(".fixture.") ||
-        normalizedName.includes(".snap")
-      ) {
+      if (isExcludedTopLevelPublicSurfaceFile(dirent.name)) {
         return [];
       }
 
@@ -99,15 +150,7 @@ function collectTopLevelPublicSurfaceEntriesFromFiles(relativeFiles) {
         return [];
       }
 
-      const normalizedName = relativeFile.toLowerCase();
-      if (
-        normalizedName.endsWith(".d.ts") ||
-        /^config-api\.(?:[cm]?[jt]s)$/u.test(normalizedName) ||
-        normalizedName.includes(".test.") ||
-        normalizedName.includes(".spec.") ||
-        normalizedName.includes(".fixture.") ||
-        normalizedName.includes(".snap")
-      ) {
+      if (isExcludedTopLevelPublicSurfaceFile(relativeFile)) {
         return [];
       }
 
@@ -125,10 +168,12 @@ function collectTrackedBundledPluginFiles(cwd) {
   if (result.status !== 0) {
     return null;
   }
-
   const filesByPlugin = new Map();
   for (const rawLine of result.stdout.split("\n")) {
     const line = toPosixPath(rawLine.trim());
+    if (!fs.existsSync(path.join(cwd, line))) {
+      continue;
+    }
     const match = new RegExp(`^${BUNDLED_PLUGIN_ROOT_DIR}/([^/]+)/(.+)$`).exec(line);
     if (!match) {
       continue;
@@ -166,19 +211,24 @@ function collectBundledPluginCandidates(cwd, extensionsRoot) {
         relativeFiles: null,
         topLevelPublicSurfaceEntries: collectTopLevelPublicSurfaceEntries(pluginDir),
       };
-    });
+    })
+    .toSorted((left, right) => left.dirName.localeCompare(right.dirName));
 }
 
+/** Collect all bundled plugin build entries for the current checkout. */
 export function collectBundledPluginBuildEntries(params = {}) {
   const cwd = params.cwd ?? process.cwd();
   const env = params.env ?? process.env;
   const extensionsRoot = path.join(cwd, BUNDLED_PLUGIN_ROOT_DIR);
+  const dockerSelectedBuildIds = parseDockerSelectedPluginBuildIdFilter(env);
+  const candidates = collectBundledPluginCandidates(cwd, extensionsRoot);
   const entries = [];
 
-  for (const candidate of collectBundledPluginCandidates(cwd, extensionsRoot)) {
+  for (const candidate of candidates) {
     const { dirName, pluginDir, relativeFiles, topLevelPublicSurfaceEntries } = candidate;
     const manifestPath = path.join(pluginDir, "openclaw.plugin.json");
-    const hasManifest = relativeFiles?.includes("openclaw.plugin.json") ?? fs.existsSync(manifestPath);
+    const hasManifest =
+      relativeFiles?.includes("openclaw.plugin.json") ?? fs.existsSync(manifestPath);
     const packageJsonPath = path.join(pluginDir, "package.json");
     const packageJson = readBundledPluginPackageJson(packageJsonPath, {
       hasPackageJson: relativeFiles?.includes("package.json"),
@@ -196,7 +246,7 @@ export function collectBundledPluginBuildEntries(params = {}) {
     if (!shouldBuildBundledCluster(dirName, env, { packageJson })) {
       continue;
     }
-    if (!shouldBuildBundledDistEntry(packageJson)) {
+    if (!shouldBuildBundledDistEntry(packageJson) && !dockerSelectedBuildIds?.has(dirName)) {
       continue;
     }
     if (EXCLUDED_CORE_BUNDLED_PLUGIN_DIRS.has(dirName)) {
@@ -217,9 +267,38 @@ export function collectBundledPluginBuildEntries(params = {}) {
     });
   }
 
-  return entries;
+  if (dockerSelectedBuildIds) {
+    const knownIds = new Set(candidates.map((candidate) => candidate.dirName));
+    const unknownIds = [...dockerSelectedBuildIds].filter((id) => !knownIds.has(id));
+    if (unknownIds.length > 0) {
+      throw new Error(
+        `${DOCKER_SELECTED_PLUGIN_BUILD_IDS_ENV} references unknown plugin id(s): ${unknownIds
+          .toSorted((left, right) => left.localeCompare(right))
+          .join(", ")}`,
+      );
+    }
+  }
+
+  const filteredBuildIds = parseBundledPluginBuildIdFilter(env);
+  if (!filteredBuildIds) {
+    return entries;
+  }
+  const buildableIds = new Set(entries.map((entry) => entry.id));
+  const missingIds = [...filteredBuildIds].filter((id) => !buildableIds.has(id));
+  if (missingIds.length > 0) {
+    throw new Error(
+      `${BUNDLED_PLUGIN_BUILD_IDS_ENV} references unknown bundled plugin id(s): ${missingIds
+        .toSorted((left, right) => left.localeCompare(right))
+        .join(", ")}`,
+    );
+  }
+  return entries.filter((entry) => filteredBuildIds.has(entry.id));
 }
 
+/**
+ * Return buildable bundled plugin entries with optional CLI filtering applied.
+ * @internal Directly tested script implementation detail.
+ */
 export function listBundledPluginBuildEntries(params = {}) {
   return Object.fromEntries(
     collectBundledPluginBuildEntries(params).flatMap(({ id, sourceEntries }) =>
@@ -232,6 +311,10 @@ export function listBundledPluginBuildEntries(params = {}) {
   );
 }
 
+/**
+ * Collect bundled extension dirs that root package builds should exclude.
+ * @internal Shared repository-script contract.
+ */
 export function collectRootPackageExcludedExtensionDirs(params = {}) {
   const cwd = params.cwd ?? process.cwd();
   const packageJsonPath = path.join(cwd, "package.json");
@@ -253,6 +336,10 @@ export function collectRootPackageExcludedExtensionDirs(params = {}) {
   return excluded;
 }
 
+/**
+ * List package artifact files generated for bundled plugins.
+ * @internal Shared repository-script contract.
+ */
 export function listBundledPluginPackArtifacts(params = {}) {
   const excludedPackageDirs =
     params.includeRootPackageExcludedDirs === true

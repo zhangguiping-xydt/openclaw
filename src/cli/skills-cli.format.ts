@@ -1,21 +1,33 @@
-import type { SkillStatusEntry, SkillStatusReport } from "../agents/skills-status.js";
-import { sanitizeForLog, stripAnsi } from "../terminal/ansi.js";
-import { decorativeEmoji, decorativePrefix } from "../terminal/decorative-emoji.js";
-import { getTerminalTableWidth, renderTable } from "../terminal/table.js";
-import { theme } from "../terminal/theme.js";
+// Formatting layer for `openclaw skills` commands; keeps discovery data separate from terminal UI.
+import { sanitizeForLog, stripAnsi } from "../../packages/terminal-core/src/ansi.js";
+import {
+  decorativeEmoji,
+  decorativePrefix,
+} from "../../packages/terminal-core/src/decorative-emoji.js";
+import { getTerminalTableWidth, renderTable } from "../../packages/terminal-core/src/table.js";
+import { theme } from "../../packages/terminal-core/src/theme.js";
+import {
+  resolveSkillStatusEntry,
+  type SkillStatusEntry,
+  type SkillStatusReport,
+} from "../skills/discovery/status.js";
 import { shortenHomePath } from "../utils.js";
 import { formatCliCommand } from "./command-format.js";
+import { formatCliJsonFailure } from "./failure-output.js";
 
+/** Options for rendering the skill list command. */
 export type SkillsListOptions = {
   json?: boolean;
   eligible?: boolean;
   verbose?: boolean;
 };
 
+/** Options for rendering one skill detail view. */
 export type SkillInfoOptions = {
   json?: boolean;
 };
 
+/** Options for rendering skill readiness checks. */
 export type SkillsCheckOptions = {
   json?: boolean;
   agent?: string;
@@ -25,7 +37,8 @@ function appendClawHubHint(output: string, json?: boolean): string {
   if (json) {
     return output;
   }
-  return `${output}\n\nTip: use \`openclaw skills search\`, \`openclaw skills install\`, and \`openclaw skills update\` for ClawHub-backed skills.`;
+  const command = formatCliCommand("openclaw skills");
+  return `${output}\n\nTip: use \`${command} search\`, \`${command} install\`, and \`${command} update\` for ClawHub-backed skills.`;
 }
 
 function formatSkillStatus(skill: SkillStatusEntry): string {
@@ -103,59 +116,7 @@ function formatSkillMissingSummary(skill: SkillStatusEntry): string {
   return missing.join("; ");
 }
 
-function normalizeSkillLookupToken(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[\s_/]+/g, "-")
-    .replace(/[^a-z0-9-]+/g, "")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-function resolveSkillByName(
-  report: SkillStatusReport,
-  requestedName: string,
-): SkillStatusEntry | null {
-  const raw = requestedName.trim();
-  if (!raw) {
-    return null;
-  }
-
-  const direct = report.skills.find((s) => s.name === raw || s.skillKey === raw);
-  if (direct) {
-    return direct;
-  }
-
-  const lower = raw.toLowerCase();
-  const caseInsensitiveMatches = report.skills.filter(
-    (s) => s.name.toLowerCase() === lower || s.skillKey.toLowerCase() === lower,
-  );
-  if (caseInsensitiveMatches.length === 1) {
-    return caseInsensitiveMatches[0] ?? null;
-  }
-  if (caseInsensitiveMatches.length > 1) {
-    return null;
-  }
-
-  const normalized = normalizeSkillLookupToken(raw);
-  if (!normalized) {
-    return null;
-  }
-
-  const normalizedMatches = report.skills.filter(
-    (s) =>
-      normalizeSkillLookupToken(s.name) === normalized ||
-      normalizeSkillLookupToken(s.skillKey) === normalized,
-  );
-
-  if (normalizedMatches.length !== 1) {
-    return null;
-  }
-
-  return normalizedMatches[0] ?? null;
-}
-
+/** Render skill discovery status as sanitized JSON or a terminal table. */
 export function formatSkillsList(report: SkillStatusReport, opts: SkillsListOptions): string {
   const isReadyForAgent = (skill: SkillStatusEntry) =>
     skill.eligible && !skill.blockedByAgentFilter;
@@ -231,6 +192,7 @@ export function formatSkillsList(report: SkillStatusReport, opts: SkillsListOpti
   return appendClawHubHint(lines.join("\n"), opts.json);
 }
 
+/** Render one skill's status, requirements, install hints, and API-key setup details. */
 export function formatSkillInfo(
   report: SkillStatusReport,
   skillName: string,
@@ -238,12 +200,15 @@ export function formatSkillInfo(
 ): string {
   const requestedName = skillName.trim();
   const safeRequestedName = sanitizeJsonString(sanitizeForLog(requestedName));
-  const skill = resolveSkillByName(report, requestedName);
+  const skill = resolveSkillStatusEntry(report.skills, requestedName);
 
   if (!skill) {
     if (opts.json) {
       return JSON.stringify(
-        sanitizeJsonValue({ error: "not found", skill: requestedName }),
+        sanitizeJsonValue({
+          ...formatCliJsonFailure(`Skill "${requestedName}" not found.`),
+          skill: requestedName,
+        }),
         null,
         2,
       );
@@ -374,6 +339,7 @@ export function formatSkillInfo(
   return appendClawHubHint(lines.join("\n"), opts.json);
 }
 
+/** Render aggregate setup health for all discovered skills. */
 export function formatSkillsCheck(report: SkillStatusReport, opts: SkillsCheckOptions): string {
   const eligible = report.skills.filter((s) => s.eligible);
   const modelVisible = report.skills.filter((s) => s.modelVisible);
@@ -471,7 +437,7 @@ export function formatSkillsCheck(report: SkillStatusReport, opts: SkillsCheckOp
     }
     if (commandVisible.length > 0) {
       lines.push(
-        `  ${theme.muted("Available as command:")} people, scripts, or cron jobs can call the skill explicitly.`,
+        `  ${theme.muted("Available as command:")} people, scripts, or automations can call the skill explicitly.`,
       );
     }
     if (promptHidden.length > 0) {

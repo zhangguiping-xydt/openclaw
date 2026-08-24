@@ -1,8 +1,9 @@
+// Test Built Status Message Runtime tests cover test built status message runtime script behavior.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { findBuiltStatusMessageRuntimePath } from "../../scripts/test-built-status-message-runtime.mjs";
+import { findBuiltStatusMessageRuntimePath } from "../../scripts/test-built-status-message-runtime.mts";
 import { expectNoReaddirSyncDuring } from "../../src/test-utils/fs-scan-assertions.js";
 
 const tempDirs: string[] = [];

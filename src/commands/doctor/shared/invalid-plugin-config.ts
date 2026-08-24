@@ -1,7 +1,8 @@
+// Doctor quarantine for plugin entries whose config fails plugin-aware validation.
+import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
+import { sanitizeForLog } from "../../../../packages/terminal-core/src/ansi.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { validateConfigObjectWithPlugins } from "../../../config/validation.js";
-import { sanitizeForLog } from "../../../terminal/ansi.js";
-import { asObjectRecord } from "./object.js";
 
 type InvalidPluginConfigHit = {
   pluginId: string;
@@ -35,6 +36,7 @@ function scanInvalidPluginConfig(cfg: OpenClawConfig): InvalidPluginConfigHit[] 
   return hits;
 }
 
+/** Disable plugin entries and clear config when plugin validation marks their config invalid. */
 export function maybeRepairInvalidPluginConfig(cfg: OpenClawConfig): {
   config: OpenClawConfig;
   changes: string[];
@@ -45,14 +47,14 @@ export function maybeRepairInvalidPluginConfig(cfg: OpenClawConfig): {
   }
 
   const next = structuredClone(cfg);
-  const entries = asObjectRecord(next.plugins?.entries);
+  const entries = asNullableRecord(next.plugins?.entries);
   if (!entries) {
     return { config: cfg, changes: [] };
   }
 
   const quarantined: string[] = [];
   for (const hit of hits) {
-    const entry = asObjectRecord(entries[hit.pluginId]);
+    const entry = asNullableRecord(entries[hit.pluginId]);
     if (!entry) {
       continue;
     }

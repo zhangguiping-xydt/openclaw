@@ -1,3 +1,5 @@
+// Builds approval prompt view models from request and resolution events.
+import { normalizeApprovalRequest } from "./approval-types.js";
 import type {
   ApprovalMetadataView,
   ApprovalRequest,
@@ -9,15 +11,13 @@ import type {
   ResolvedApprovalView,
 } from "./approval-view-model.types.js";
 import { resolveExecApprovalCommandDisplay } from "./exec-approval-command-display.js";
-import { buildExecApprovalActionDescriptors } from "./exec-approval-reply.js";
+import { buildTypedApprovalActionDescriptors } from "./exec-approval-reply.js";
 import {
   resolveExecApprovalRequestAllowedDecisions,
   type ExecApprovalRequest,
 } from "./exec-approvals.js";
-import {
-  resolvePluginApprovalRequestAllowedDecisions,
-  type PluginApprovalRequest,
-} from "./plugin-approvals.js";
+import { resolveCanonicalPluginApprovalRequestAllowedDecisions } from "./plugin-approval-canonical-decisions.js";
+import type { PluginApprovalRequest } from "./plugin-approvals.js";
 
 type ApprovalPhase = "pending" | "resolved" | "expired";
 
@@ -101,53 +101,59 @@ function buildPluginViewBase<TPhase extends ApprovalPhase>(
   };
 }
 
+/** Builds the presentation model for an unresolved exec or plugin approval. */
 export function buildPendingApprovalView(request: ApprovalRequest): PendingApprovalView {
-  if (request.id.startsWith("plugin:")) {
-    const pluginRequest = request as PluginApprovalRequest;
+  const normalizedRequest = normalizeApprovalRequest(request);
+  if (normalizedRequest.approvalKind === "plugin") {
     return {
-      ...buildPluginViewBase(pluginRequest, "pending"),
-      actions: buildExecApprovalActionDescriptors({
-        approvalCommandId: pluginRequest.id,
-        allowedDecisions: resolvePluginApprovalRequestAllowedDecisions(pluginRequest.request),
+      ...buildPluginViewBase(normalizedRequest, "pending"),
+      actions: buildTypedApprovalActionDescriptors({
+        approvalCommandId: normalizedRequest.id,
+        approvalKind: normalizedRequest.approvalKind,
+        allowedDecisions: resolveCanonicalPluginApprovalRequestAllowedDecisions(
+          normalizedRequest.request,
+        ),
       }),
-      expiresAtMs: pluginRequest.expiresAtMs,
+      expiresAtMs: normalizedRequest.expiresAtMs,
     };
   }
-  const execRequest = request as ExecApprovalRequest;
   return {
-    ...buildExecViewBase(execRequest, "pending"),
-    actions: buildExecApprovalActionDescriptors({
-      approvalCommandId: execRequest.id,
-      ask: execRequest.request.ask,
-      allowedDecisions: resolveExecApprovalRequestAllowedDecisions(execRequest.request),
+    ...buildExecViewBase(normalizedRequest, "pending"),
+    actions: buildTypedApprovalActionDescriptors({
+      approvalCommandId: normalizedRequest.id,
+      approvalKind: normalizedRequest.approvalKind,
+      ask: normalizedRequest.request.ask,
+      allowedDecisions: resolveExecApprovalRequestAllowedDecisions(normalizedRequest.request),
     }),
-    expiresAtMs: execRequest.expiresAtMs,
+    expiresAtMs: normalizedRequest.expiresAtMs,
   };
 }
 
+/** Builds the presentation model for an approval after a decision was recorded. */
 export function buildResolvedApprovalView(
   request: ApprovalRequest,
   resolved: ApprovalResolved,
 ): ResolvedApprovalView {
-  if (request.id.startsWith("plugin:")) {
-    const pluginRequest = request as PluginApprovalRequest;
+  const normalizedRequest = normalizeApprovalRequest(request);
+  if (normalizedRequest.approvalKind === "plugin") {
     return {
-      ...buildPluginViewBase(pluginRequest, "resolved"),
+      ...buildPluginViewBase(normalizedRequest, "resolved"),
       decision: resolved.decision,
       resolvedBy: resolved.resolvedBy,
     };
   }
-  const execRequest = request as ExecApprovalRequest;
   return {
-    ...buildExecViewBase(execRequest, "resolved"),
+    ...buildExecViewBase(normalizedRequest, "resolved"),
     decision: resolved.decision,
     resolvedBy: resolved.resolvedBy,
   };
 }
 
+/** Builds the presentation model shown when an approval can no longer be acted on. */
 export function buildExpiredApprovalView(request: ApprovalRequest): ExpiredApprovalView {
-  if (request.id.startsWith("plugin:")) {
-    return buildPluginViewBase(request as PluginApprovalRequest, "expired");
+  const normalizedRequest = normalizeApprovalRequest(request);
+  if (normalizedRequest.approvalKind === "plugin") {
+    return buildPluginViewBase(normalizedRequest, "expired");
   }
-  return buildExecViewBase(request as ExecApprovalRequest, "expired");
+  return buildExecViewBase(normalizedRequest, "expired");
 }

@@ -1,3 +1,4 @@
+// Status JSON tests cover command output and runtime JSON writes.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { RuntimeEnv } from "../runtime.js";
 import { statusJsonCommand } from "./status-json.js";
@@ -30,6 +31,20 @@ vi.mock("../infra/provider-usage.js", () => ({
 
 vi.mock("../gateway/call.js", () => ({
   callGateway: mocks.callGateway,
+}));
+
+vi.mock("../channels/plugins/read-only.js", () => ({
+  resolveReadOnlyChannelPluginsForConfig: vi.fn(() => ({
+    plugins: [
+      { id: "discord" },
+      { id: "imessage" },
+      { id: "signal" },
+      { id: "slack" },
+      { id: "telegram" },
+      { id: "whatsapp" },
+    ],
+    missingConfiguredChannelIds: [],
+  })),
 }));
 
 vi.mock("./status.daemon.js", () => ({
@@ -129,8 +144,18 @@ describe("statusJsonCommand", () => {
     expect(payload).not.toHaveProperty("securityAudit");
   });
 
-  it("includes security audit details only when --all is requested", async () => {
+  it("includes security audit and plugin compatibility details when --all is requested", async () => {
     const { runtime, logs } = createRuntimeCapture();
+    const compatibilityNotice = {
+      pluginId: "legacy-plugin",
+      code: "hook-only",
+      severity: "warn",
+      message: "plugin registers only legacy hooks",
+    };
+    mocks.scanStatusJsonFast.mockResolvedValueOnce({
+      ...createScanResult(),
+      pluginCompatibility: [compatibilityNotice],
+    });
 
     await statusJsonCommand({ all: true }, runtime);
 
@@ -168,6 +193,34 @@ describe("statusJsonCommand", () => {
         summary: { critical: 1, warn: 0, info: 0 },
         findings: [],
       },
+      pluginCompatibility: {
+        count: 1,
+        warnings: [compatibilityNotice],
+      },
     });
+  });
+
+  it("reports deep gateway probe failures and runs the documented security audit", async () => {
+    const { runtime, logs } = createRuntimeCapture();
+    mocks.scanStatusJsonFast.mockResolvedValueOnce({
+      ...createScanResult(),
+      gatewayReachable: true,
+    });
+    mocks.callGateway.mockImplementation(async (params: { method?: string }) => {
+      if (params.method === "health") {
+        throw new Error("gateway health probe timed out");
+      }
+      return null;
+    });
+
+    await statusJsonCommand({ deep: true }, runtime);
+
+    expect(mocks.runSecurityAudit).toHaveBeenCalledOnce();
+    const payload = JSON.parse(logs[0] ?? "{}") as {
+      health?: { error?: string };
+      securityAudit?: { summary?: { critical?: number } };
+    };
+    expect(payload.health).toEqual({ error: "Error: gateway health probe timed out" });
+    expect(payload.securityAudit?.summary?.critical).toBe(1);
   });
 });

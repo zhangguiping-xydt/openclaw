@@ -1,3 +1,4 @@
+// Xai plugin module implements x search behavior.
 import {
   jsonResult,
   readCache,
@@ -26,6 +27,7 @@ import {
 import {
   buildMissingXSearchApiKeyPayload,
   createXSearchToolDefinition,
+  X_SEARCH_HANDLE_LIMIT,
 } from "./x-search-tool-shared.js";
 
 class PluginToolInputError extends Error {
@@ -93,7 +95,13 @@ function normalizeOptionalIsoDate(value: string | undefined, label: string): str
   if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
     throw new PluginToolInputError(`${label} must use YYYY-MM-DD`);
   }
-  const [year, month, day] = trimmed.split("-").map((entry) => Number.parseInt(entry, 10));
+  const [yearText, monthText, dayText] = trimmed.split("-");
+  if (yearText === undefined || monthText === undefined || dayText === undefined) {
+    throw new PluginToolInputError(`${label} must use YYYY-MM-DD`);
+  }
+  const year = Number.parseInt(yearText, 10);
+  const month = Number.parseInt(monthText, 10);
+  const day = Number.parseInt(dayText, 10);
   const date = new Date(Date.UTC(year, month - 1, day));
   if (
     date.getUTCFullYear() !== year ||
@@ -103,6 +111,27 @@ function normalizeOptionalIsoDate(value: string | undefined, label: string): str
     throw new PluginToolInputError(`${label} must be a valid calendar date`);
   }
   return trimmed;
+}
+
+function validateXSearchHandleFilters(params: {
+  allowedXHandles?: string[];
+  excludedXHandles?: string[];
+}): void {
+  if (params.allowedXHandles && params.excludedXHandles) {
+    throw new PluginToolInputError(
+      "allowed_x_handles and excluded_x_handles cannot be used together",
+    );
+  }
+  for (const [label, handles] of [
+    ["allowed_x_handles", params.allowedXHandles],
+    ["excluded_x_handles", params.excludedXHandles],
+  ] as const) {
+    if (handles && handles.length > X_SEARCH_HANDLE_LIMIT) {
+      throw new PluginToolInputError(
+        `${label} cannot contain more than ${X_SEARCH_HANDLE_LIMIT} handles`,
+      );
+    }
+  }
 }
 
 function buildXSearchCacheKey(params: {
@@ -147,7 +176,8 @@ export function createXSearchTool(options?: {
     return null;
   }
 
-  return createXSearchToolDefinition(async (_toolCallId: string, args: Record<string, unknown>) => {
+  return createXSearchToolDefinition(async (_toolCallId, args, signal) => {
+    signal?.throwIfAborted();
     const apiKey = await resolveXSearchApiKey({
       sourceConfig: options?.config,
       runtimeConfig: runtimeConfig ?? undefined,
@@ -160,6 +190,7 @@ export function createXSearchTool(options?: {
     const query = readStringParam(args, "query", { required: true });
     const allowedXHandles = readStringArrayParam(args, "allowed_x_handles");
     const excludedXHandles = readStringArrayParam(args, "excluded_x_handles");
+    validateXSearchHandleFilters({ allowedXHandles, excludedXHandles });
     const fromDate = normalizeOptionalIsoDate(readStringParam(args, "from_date"), "from_date");
     const toDate = normalizeOptionalIsoDate(readStringParam(args, "to_date"), "to_date");
     if (fromDate && toDate && fromDate > toDate) {
@@ -209,7 +240,9 @@ export function createXSearchTool(options?: {
       inlineCitations,
       maxTurns,
       options: xSearchOptions,
+      ...(signal ? { signal } : {}),
     });
+    signal?.throwIfAborted();
     const payload = buildXaiXSearchPayload({
       query,
       model,
@@ -217,6 +250,7 @@ export function createXSearchTool(options?: {
       content: result.content,
       citations: result.citations,
       inlineCitations: result.inlineCitations,
+      truncated: result.truncated,
       options: xSearchOptions,
     });
     writeCache(

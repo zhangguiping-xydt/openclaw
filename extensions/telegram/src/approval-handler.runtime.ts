@@ -1,11 +1,13 @@
+// Telegram plugin module implements approval handler behavior.
 import type {
   ChannelApprovalCapabilityHandlerContext,
+  ChannelApprovalKind,
   PendingApprovalView,
 } from "openclaw/plugin-sdk/approval-handler-runtime";
 import { createChannelApprovalNativeRuntimeAdapter } from "openclaw/plugin-sdk/approval-handler-runtime";
 import { buildChannelApprovalNativeTargetKey } from "openclaw/plugin-sdk/approval-native-runtime";
-import { buildPluginApprovalPendingReplyPayload } from "openclaw/plugin-sdk/approval-reply-runtime";
 import {
+  buildPluginApprovalPendingReplyPayload,
   buildApprovalPresentationFromActionDescriptors,
   buildExecApprovalPendingReplyPayload,
 } from "openclaw/plugin-sdk/approval-reply-runtime";
@@ -16,12 +18,22 @@ import type {
 } from "openclaw/plugin-sdk/approval-runtime";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  buildTelegramNativeExpiredApprovalText,
+  buildTelegramNativeResolvedApprovalText,
+} from "./approval-terminal.js";
 import { resolveTelegramInlineButtons } from "./button-types.js";
 import {
   isTelegramExecApprovalHandlerConfigured,
   shouldHandleTelegramExecApprovalRequest,
 } from "./exec-approvals.js";
-import { editMessageReplyMarkupTelegram, sendMessageTelegram, sendTypingTelegram } from "./send.js";
+import { escapeTelegramHtml } from "./format.js";
+import {
+  editMessageReplyMarkupTelegram,
+  editMessageTelegram,
+  sendMessageTelegram,
+  sendTypingTelegram,
+} from "./send.js";
 
 const log = createSubsystemLogger("telegram/approvals");
 
@@ -34,15 +46,19 @@ type TelegramPendingDelivery = {
   text: string;
   buttons: ReturnType<typeof resolveTelegramInlineButtons>;
 };
+type TelegramFinalDelivery = {
+  text: string;
+};
 
-export type TelegramExecApprovalHandlerDeps = {
+type TelegramExecApprovalHandlerDeps = {
   nowMs?: () => number;
   sendTyping?: typeof sendTypingTelegram;
   sendMessage?: typeof sendMessageTelegram;
+  editMessage?: typeof editMessageTelegram;
   editReplyMarkup?: typeof editMessageReplyMarkupTelegram;
 };
 
-export type TelegramApprovalHandlerContext = {
+type TelegramApprovalHandlerContext = {
   token: string;
   deps?: TelegramExecApprovalHandlerDeps;
 };
@@ -61,7 +77,7 @@ function resolveHandlerContext(params: ChannelApprovalCapabilityHandlerContext):
 
 function buildPendingPayload(params: {
   request: ApprovalRequest;
-  approvalKind: "exec" | "plugin";
+  approvalKind: ChannelApprovalKind;
   nowMs: number;
   view: PendingApprovalView;
 }): TelegramPendingDelivery {
@@ -101,7 +117,8 @@ export const telegramApprovalNativeRuntime = createChannelApprovalNativeRuntimeA
   TelegramPendingDelivery,
   { chatId: string; messageThreadId?: number },
   PendingMessage,
-  never
+  never,
+  TelegramFinalDelivery
 >({
   eventKinds: ["exec", "plugin"],
   availability: {
@@ -128,8 +145,14 @@ export const telegramApprovalNativeRuntime = createChannelApprovalNativeRuntimeA
   presentation: {
     buildPendingPayload: ({ request, approvalKind, nowMs, view }) =>
       buildPendingPayload({ request, approvalKind, nowMs, view }),
-    buildResolvedResult: () => ({ kind: "clear-actions" }),
-    buildExpiredResult: () => ({ kind: "clear-actions" }),
+    buildResolvedResult: ({ view }) => ({
+      kind: "update",
+      payload: { text: buildTelegramNativeResolvedApprovalText(view) },
+    }),
+    buildExpiredResult: ({ view }) => ({
+      kind: "update",
+      payload: { text: buildTelegramNativeExpiredApprovalText(view) },
+    }),
   },
   transport: {
     prepareTarget: ({ plannedTarget }) => ({
@@ -170,6 +193,20 @@ export const telegramApprovalNativeRuntime = createChannelApprovalNativeRuntimeA
         chatId: result.chatId,
         messageId: result.messageId,
       };
+    },
+    updateEntry: async ({ cfg, accountId, context, entry, payload }) => {
+      const resolved = resolveHandlerContext({ cfg, accountId, context });
+      if (!resolved) {
+        return;
+      }
+      const editMessage = resolved.context.deps?.editMessage ?? editMessageTelegram;
+      await editMessage(entry.chatId, entry.messageId, escapeTelegramHtml(payload.text), {
+        cfg,
+        token: resolved.context.token,
+        accountId: resolved.accountId,
+        textMode: "html",
+        buttons: [],
+      });
     },
   },
   interactions: {

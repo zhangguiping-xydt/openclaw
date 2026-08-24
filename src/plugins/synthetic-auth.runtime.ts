@@ -1,7 +1,7 @@
-import { normalizeProviderId } from "../agents/provider-id.js";
-import { loadPluginManifestRegistryForInstalledIndex } from "./manifest-registry-installed.js";
+/** Resolves synthetic and external auth provider refs from active runtime state or persisted manifests. */
+import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { loadPluginRegistrySnapshotWithMetadata } from "./plugin-registry.js";
-import type { PluginRegistrySnapshot } from "./plugin-registry.js";
+import type { LoadPluginRegistryParams, PluginRegistrySnapshot } from "./plugin-registry.js";
 import { getPluginRegistryState } from "./runtime-state.js";
 
 function uniqueProviderRefs(values: readonly string[]): string[] {
@@ -19,108 +19,62 @@ function uniqueProviderRefs(values: readonly string[]): string[] {
   return next;
 }
 
-function resolveManifestSyntheticAuthProviderRefs(
-  params: {
-    index?: PluginRegistrySnapshot;
-    registryDiagnostics?: readonly unknown[];
-  } = {},
-): string[] {
+function resolveManifestSyntheticAuthProviderRefState(
+  params: SyntheticAuthProviderRefParams = {},
+): { refs: string[]; complete: boolean } {
   if (params.index && (params.registryDiagnostics?.length ?? 0) > 0) {
-    return [];
+    return { refs: [], complete: false };
   }
-  const result = loadPluginRegistrySnapshotWithMetadata({ index: params.index });
+  const result = loadPluginRegistrySnapshotWithMetadata(params);
   if (result.source !== "persisted" && result.source !== "provided") {
-    return [];
+    return { refs: [], complete: false };
   }
-  return uniqueProviderRefs(
-    result.snapshot.plugins.flatMap((plugin) => plugin.syntheticAuthRefs ?? []),
-  );
+  return {
+    refs: uniqueProviderRefs(
+      result.snapshot.plugins.flatMap((plugin) => plugin.syntheticAuthRefs ?? []),
+    ),
+    complete: true,
+  };
 }
 
-function resolveManifestExternalAuthProviderRefs(
-  params: {
-    index?: PluginRegistrySnapshot;
-    registryDiagnostics?: readonly unknown[];
-  } = {},
-): string[] {
-  if (params.index && (params.registryDiagnostics?.length ?? 0) > 0) {
-    return [];
-  }
-  const result = loadPluginRegistrySnapshotWithMetadata({ index: params.index });
-  if (result.source !== "persisted" && result.source !== "provided") {
-    return [];
-  }
-  const manifestRegistry = loadPluginManifestRegistryForInstalledIndex({
-    index: result.snapshot,
-  });
-  return uniqueProviderRefs(
-    manifestRegistry.plugins.flatMap((plugin) => plugin.contracts?.externalAuthProviders ?? []),
-  );
-}
+type SyntheticAuthProviderRefParams = LoadPluginRegistryParams & {
+  index?: PluginRegistrySnapshot;
+  registryDiagnostics?: readonly unknown[];
+};
 
+/** Lists provider refs that can satisfy synthetic auth profile lookups. */
 export function resolveRuntimeSyntheticAuthProviderRefs(
-  params: {
-    index?: PluginRegistrySnapshot;
-    registryDiagnostics?: readonly unknown[];
-  } = {},
+  params: SyntheticAuthProviderRefParams = {},
 ): string[] {
-  const registry = getPluginRegistryState()?.activeRegistry;
-  if (registry) {
-    return uniqueProviderRefs([
-      ...(registry.providers ?? [])
-        .filter(
-          (entry) =>
-            "resolveSyntheticAuth" in entry.provider &&
-            typeof entry.provider.resolveSyntheticAuth === "function",
-        )
-        .map((entry) => entry.provider.id),
-      ...(registry.cliBackends ?? [])
-        .filter(
-          (entry) =>
-            "resolveSyntheticAuth" in entry.backend &&
-            typeof entry.backend.resolveSyntheticAuth === "function",
-        )
-        .map((entry) => entry.backend.id),
-    ]);
-  }
-  return resolveManifestSyntheticAuthProviderRefs({
-    index: params.index,
-    registryDiagnostics: params.registryDiagnostics,
-  });
+  return resolveRuntimeSyntheticAuthProviderRefState(params).refs;
 }
 
-export function resolveRuntimeExternalAuthProviderRefs(
-  params: {
-    index?: PluginRegistrySnapshot;
-    registryDiagnostics?: readonly unknown[];
-  } = {},
-): string[] {
+/** Returns synthetic-auth refs plus whether the control-plane data source was complete. */
+export function resolveRuntimeSyntheticAuthProviderRefState(
+  params: SyntheticAuthProviderRefParams = {},
+): { refs: string[]; complete: boolean } {
   const registry = getPluginRegistryState()?.activeRegistry;
   if (registry) {
-    return uniqueProviderRefs([
-      ...registry.plugins.flatMap((plugin) => plugin.contracts?.externalAuthProviders ?? []),
-      ...(registry.providers ?? [])
-        .filter(
-          (entry) =>
-            ("resolveExternalAuthProfiles" in entry.provider &&
-              typeof entry.provider.resolveExternalAuthProfiles === "function") ||
-            ("resolveExternalOAuthProfiles" in entry.provider &&
-              typeof entry.provider.resolveExternalOAuthProfiles === "function"),
-        )
-        .map((entry) => entry.provider.id),
-      ...(registry.cliBackends ?? [])
-        .filter(
-          (entry) =>
-            ("resolveExternalAuthProfiles" in entry.backend &&
-              typeof entry.backend.resolveExternalAuthProfiles === "function") ||
-            ("resolveExternalOAuthProfiles" in entry.backend &&
-              typeof entry.backend.resolveExternalOAuthProfiles === "function"),
-        )
-        .map((entry) => entry.backend.id),
-    ]);
+    return {
+      refs: uniqueProviderRefs([
+        ...registry.plugins.flatMap((plugin) => plugin.syntheticAuthRefs ?? []),
+        ...(registry.providers ?? [])
+          .filter(
+            (entry) =>
+              "resolveSyntheticAuth" in entry.provider &&
+              typeof entry.provider.resolveSyntheticAuth === "function",
+          )
+          .map((entry) => entry.provider.id),
+        ...registry.cliBackends
+          .filter(
+            (entry) =>
+              "resolveSyntheticAuth" in entry.backend &&
+              typeof entry.backend.resolveSyntheticAuth === "function",
+          )
+          .map((entry) => entry.backend.id),
+      ]),
+      complete: true,
+    };
   }
-  return resolveManifestExternalAuthProviderRefs({
-    index: params.index,
-    registryDiagnostics: params.registryDiagnostics,
-  });
+  return resolveManifestSyntheticAuthProviderRefState(params);
 }

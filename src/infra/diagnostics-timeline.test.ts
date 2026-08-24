@@ -1,11 +1,11 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+// Covers diagnostics timeline event writing and spans.
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { dirname, join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   emitDiagnosticsTimelineEvent,
-  flushDiagnosticsTimelineForTest,
   isDiagnosticsTimelineEnabled,
   measureDiagnosticsTimelineSpan,
   measureDiagnosticsTimelineSpanSync,
@@ -28,7 +28,7 @@ async function createTimelineEnv() {
 }
 
 async function readTimeline(path: string) {
-  await flushDiagnosticsTimelineForTest();
+  await Promise.resolve();
   return (await readFile(path, "utf8"))
     .trim()
     .split("\n")
@@ -55,6 +55,7 @@ function attributesRecord(event: Record<string, unknown>): Record<string, unknow
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -155,6 +156,49 @@ describe("diagnostics timeline", () => {
     expect(attributes.ignored).toBeUndefined();
   });
 
+  it("writes provider response status as a top-level field", async () => {
+    const { env, path } = await createTimelineEnv();
+
+    emitDiagnosticsTimelineEvent(
+      {
+        type: "provider.request",
+        name: "provider.request",
+        provider: "openai",
+        operation: "openai-responses",
+        ok: true,
+        status: 200,
+      },
+      { env },
+    );
+
+    const [event] = await readTimeline(path);
+    expect(event).toMatchObject({
+      type: "provider.request",
+      provider: "openai",
+      operation: "openai-responses",
+      ok: true,
+      status: 200,
+    });
+  });
+
+  it("routes timeline write failures through the captured console boundary once", async () => {
+    const { env, path } = await createTimelineEnv();
+    await mkdir(dirname(path), { recursive: true });
+    const blockingFile = join(dirname(path), "blocked");
+    await writeFile(blockingFile, "not a directory");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const failingEnv = {
+      ...env,
+      OPENCLAW_DIAGNOSTICS_TIMELINE_PATH: join(blockingFile, "timeline.jsonl"),
+    };
+
+    emitDiagnosticsTimelineEvent({ type: "mark", name: "first" }, { env: failingEnv });
+    emitDiagnosticsTimelineEvent({ type: "mark", name: "second" }, { env: failingEnv });
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("failed to write timeline event"));
+  });
+
   it("records span start and end events around successful work", async () => {
     const { env, path } = await createTimelineEnv();
     const configOnlyEnv = { ...env };
@@ -206,6 +250,30 @@ describe("diagnostics timeline", () => {
     expect(errorEvent.phase).toBe("startup");
     expect(errorEvent.errorName).toBe("TypeError");
     expect(errorEvent.errorMessage).toBe("bad plugin");
+  });
+
+  it("can omit sensitive span error messages", async () => {
+    const { env, path } = await createTimelineEnv();
+
+    await expect(
+      measureDiagnosticsTimelineSpan(
+        "secrets.prepare",
+        () => {
+          throw new Error('Secret provider "prod" failed for ref "TOKEN_ID"');
+        },
+        { env, omitErrorMessage: true, phase: "startup" },
+      ),
+    ).rejects.toThrow("TOKEN_ID");
+
+    const events = await readTimeline(path);
+    expect(events).toHaveLength(2);
+    const errorEvent = eventRecord(events, 1);
+    expect(errorEvent.type).toBe("span.error");
+    expect(errorEvent.name).toBe("secrets.prepare");
+    expect(errorEvent.errorName).toBe("Error");
+    expect(errorEvent.errorMessage).toBeUndefined();
+    expect(JSON.stringify(events)).not.toContain("TOKEN_ID");
+    expect(JSON.stringify(events)).not.toContain("prod");
   });
 
   it("records synchronous spans", async () => {

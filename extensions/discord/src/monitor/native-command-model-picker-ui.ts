@@ -1,5 +1,7 @@
+// Discord plugin module implements native command model picker ui behavior.
 import { resolveDefaultModelForAgent } from "openclaw/plugin-sdk/agent-runtime";
 import {
+  resolveEffectiveAgentRuntime,
   resolveStoredModelOverride,
   serializeCommandArgs,
   type ChatCommandDefinition,
@@ -7,7 +9,7 @@ import {
 } from "openclaw/plugin-sdk/command-auth-native";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { ResolvedAgentRoute } from "openclaw/plugin-sdk/routing";
-import { loadSessionStore, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
+import { getSessionEntry, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -25,11 +27,15 @@ import {
   type DiscordModelPickerPreferenceScope,
 } from "./model-picker-preferences.js";
 import {
+  findProviderBucketLocation,
   loadDiscordModelPickerData,
+  resolveDiscordModelPickerPageForModel,
+  type DiscordModelPickerCommandContext,
+} from "./model-picker.state.js";
+import {
   renderDiscordModelPickerModelsView,
   toDiscordModelPickerMessagePayload,
-  type DiscordModelPickerCommandContext,
-} from "./model-picker.js";
+} from "./model-picker.view.js";
 import { resolveDiscordNativeInteractionRouteState } from "./native-command-route.js";
 import type { SafeDiscordInteractionCall } from "./native-command-ui.types.js";
 import { resolveDiscordNativeInteractionChannelContext } from "./native-interaction-channel-context.js";
@@ -76,13 +82,6 @@ export function shouldOpenDiscordModelPickerFromCommand(params: {
   }
 
   return serializedArgs ? null : context;
-}
-
-function buildDiscordModelPickerCurrentModel(
-  defaultProvider: string,
-  defaultModel: string,
-): string {
-  return `${defaultProvider}/${defaultModel}`;
 }
 
 export function buildDiscordModelPickerAllowedModelRefs(
@@ -179,7 +178,12 @@ export async function resolveDiscordNativeChoiceContext(params: {
   cfg: OpenClawConfig;
   accountId: string;
   threadBindings: ThreadBindingManager;
-}): Promise<{ provider?: string; model?: string } | null> {
+}): Promise<{
+  provider?: string;
+  model?: string;
+  agentRuntime?: string;
+  agentId: string;
+} | null> {
   try {
     const resolved = await resolveDiscordModelPickerRouteState({
       interaction: params.interaction,
@@ -199,23 +203,27 @@ export async function resolveDiscordNativeChoiceContext(params: {
     const storePath = resolveStorePath(params.cfg.session?.store, {
       agentId: route.agentId,
     });
-    const sessionStore = loadSessionStore(storePath);
-    const sessionEntry = sessionStore[route.sessionKey];
+    const sessionEntry = getSessionEntry({ storePath, sessionKey: route.sessionKey });
     const override = resolveStoredModelOverride({
       sessionEntry,
-      sessionStore,
+      loadSessionEntry: (sessionKey) => getSessionEntry({ storePath, sessionKey }),
       sessionKey: route.sessionKey,
       defaultProvider: fallback.provider,
     });
-    if (!override?.model) {
-      return {
-        provider: fallback.provider,
-        model: fallback.model,
-      };
-    }
+    const provider = override?.provider || fallback.provider;
+    const model = override?.model || fallback.model;
     return {
-      provider: override.provider || fallback.provider,
-      model: override.model,
+      provider,
+      model,
+      agentId: route.agentId,
+      agentRuntime: resolveEffectiveAgentRuntime({
+        cfg: params.cfg,
+        provider,
+        modelId: model,
+        agentId: route.agentId,
+        sessionKey: route.sessionKey,
+        sessionEntry,
+      }),
     };
   } catch {
     return null;
@@ -227,19 +235,20 @@ export function resolveDiscordModelPickerCurrentModel(params: {
   route: ResolvedAgentRoute;
   data: Awaited<ReturnType<typeof loadDiscordModelPickerData>>;
 }): string {
-  const fallback = buildDiscordModelPickerCurrentModel(
-    params.data.resolvedDefault.provider,
-    params.data.resolvedDefault.model,
-  );
+  const fallback = `${params.data.resolvedDefault.provider}/${params.data.resolvedDefault.model}`;
   try {
     const storePath = resolveStorePath(params.cfg.session?.store, {
       agentId: params.route.agentId,
     });
-    const sessionStore = loadSessionStore(storePath, { skipCache: true });
-    const sessionEntry = sessionStore[params.route.sessionKey];
+    const sessionEntry = getSessionEntry({
+      storePath,
+      sessionKey: params.route.sessionKey,
+      readConsistency: "latest",
+    });
     const override = resolveStoredModelOverride({
       sessionEntry,
-      sessionStore,
+      loadSessionEntry: (sessionKey) =>
+        getSessionEntry({ storePath, sessionKey, readConsistency: "latest" }),
       sessionKey: params.route.sessionKey,
       defaultProvider: params.data.resolvedDefault.provider,
     });
@@ -264,9 +273,12 @@ export function resolveDiscordModelPickerCurrentRuntime(params: {
     const storePath = resolveStorePath(params.cfg.session?.store, {
       agentId: params.route.agentId,
     });
-    const sessionStore = loadSessionStore(storePath, { skipCache: true });
     const sessionRuntime = normalizeOptionalString(
-      sessionStore[params.route.sessionKey]?.agentRuntimeOverride,
+      getSessionEntry({
+        storePath,
+        sessionKey: params.route.sessionKey,
+        readConsistency: "latest",
+      })?.agentRuntimeOverride,
     );
     if (sessionRuntime) {
       return sessionRuntime;
@@ -311,19 +323,32 @@ export async function replyWithDiscordModelPickerProviders(params: {
     allowedModelRefs: buildDiscordModelPickerAllowedModelRefs(data),
     limit: 5,
   });
-  const currentProvider = splitDiscordModelRef(currentModel ?? "")?.provider;
+  const parsedCurrentRef = splitDiscordModelRef(currentModel ?? "");
   const initialProvider =
-    currentProvider && data.byProvider.has(currentProvider)
-      ? currentProvider
+    parsedCurrentRef && data.byProvider.has(parsedCurrentRef.provider)
+      ? parsedCurrentRef.provider
       : (data.providers[0] ?? data.resolvedDefault.provider);
+  const initialResolved =
+    parsedCurrentRef && parsedCurrentRef.provider === initialProvider
+      ? resolveDiscordModelPickerPageForModel({
+          data,
+          provider: initialProvider,
+          model: parsedCurrentRef.model,
+        })
+      : { page: 1 };
+  const initialPage = initialResolved.page;
+  const initialModelBucket = initialResolved.bucket;
+  const initialProviderLocation = findProviderBucketLocation(data, initialProvider);
 
   const rendered = renderDiscordModelPickerModelsView({
     command: params.command,
     userId: params.userId,
     data,
     provider: initialProvider,
-    page: 1,
-    providerPage: 1,
+    page: initialPage,
+    providerPage: initialProviderLocation?.page ?? 1,
+    providerBucket: initialProviderLocation?.bucket,
+    modelBucket: initialModelBucket,
     currentModel,
     currentRuntime,
     quickModels,

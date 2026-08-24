@@ -1,3 +1,4 @@
+// Resolves whether a sender may reset or restart a reply session.
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { isInternalMessageChannel } from "../../utils/message-channel.js";
 import { resolveCommandAuthorization } from "../command-auth.js";
@@ -9,7 +10,7 @@ export function isResetAuthorizedForContext(params: {
   commandAuthorized: boolean;
 }): boolean {
   const auth = resolveCommandAuthorization(params);
-  if (!params.commandAuthorized && !auth.isAuthorizedSender) {
+  if (!auth.isAuthorizedSender) {
     return false;
   }
   const provider = params.ctx.Provider;

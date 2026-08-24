@@ -1,3 +1,9 @@
+/**
+ * Browser client observation helpers.
+ *
+ * Wraps browser-control endpoints that read console/debug data or save page
+ * output without directly mutating page state.
+ */
 import type { BrowserActionPathResult } from "./client-actions-types.js";
 import { buildProfileQuery, withBaseUrl } from "./client-actions-url.js";
 import { fetchBrowserJson } from "./client-fetch.js";
@@ -18,9 +24,10 @@ function buildQuerySuffix(params: Array<[string, string | boolean | undefined]>)
   return encoded.length > 0 ? `?${encoded}` : "";
 }
 
+/** Read browser console messages for a tab. */
 export async function browserConsoleMessages(
   baseUrl: string | undefined,
-  opts: { level?: string; targetId?: string; profile?: string } = {},
+  opts: { level?: string; targetId?: string; profile?: string; signal?: AbortSignal } = {},
 ): Promise<{ ok: true; messages: BrowserConsoleMessage[]; targetId: string; url?: string }> {
   const suffix = buildQuerySuffix([
     ["level", opts.level],
@@ -32,12 +39,13 @@ export async function browserConsoleMessages(
     messages: BrowserConsoleMessage[];
     targetId: string;
     url?: string;
-  }>(withBaseUrl(baseUrl, `/console${suffix}`), { timeoutMs: 20000 });
+  }>(withBaseUrl(baseUrl, `/console${suffix}`), { timeoutMs: 20000, signal: opts.signal });
 }
 
+/** Save the current page as PDF through browser control. */
 export async function browserPdfSave(
   baseUrl: string | undefined,
-  opts: { targetId?: string; profile?: string } = {},
+  opts: { targetId?: string; profile?: string; signal?: AbortSignal } = {},
 ): Promise<BrowserActionPathResult> {
   const q = buildProfileQuery(opts.profile);
   return await fetchBrowserJson<BrowserActionPathResult>(withBaseUrl(baseUrl, `/pdf${q}`), {
@@ -45,5 +53,6 @@ export async function browserPdfSave(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ targetId: opts.targetId }),
     timeoutMs: 20000,
+    signal: opts.signal,
   });
 }

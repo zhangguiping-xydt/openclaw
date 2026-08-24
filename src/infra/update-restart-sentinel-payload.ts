@@ -1,3 +1,4 @@
+// Builds restart sentinel payloads for update handoff reporting.
 import {
   buildRestartSuccessContinuation,
   formatDoctorNonInteractiveHint,
@@ -5,7 +6,11 @@ import {
 } from "./restart-sentinel.js";
 import type { UpdateRunResult } from "./update-runner.js";
 
+// Update restart sentinel payloads carry update result details across a process
+// restart so the next gateway can report completion or failure.
+/** Metadata needed to route update restart continuation messages. */
 export type UpdateRestartSentinelMeta = {
+  root?: string;
   sessionKey?: string;
   deliveryContext?: {
     channel?: string;
@@ -18,12 +23,27 @@ export type UpdateRestartSentinelMeta = {
   continuationMessage?: string | null;
 };
 
+export function normalizeControlPlaneUpdateResult(result: UpdateRunResult): UpdateRunResult {
+  const beforeSha = result.before?.sha?.trim();
+  const afterSha = result.after?.sha?.trim();
+  return result.status === "ok" &&
+    result.mode === "git" &&
+    result.postUpdate?.plugins?.changed !== true &&
+    beforeSha &&
+    afterSha &&
+    beforeSha === afterSha
+    ? { ...result, status: "skipped", reason: "already-current" }
+    : result;
+}
+
+/** Build the restart sentinel payload written after update runs. */
 export function buildUpdateRestartSentinelPayload(params: {
   result: UpdateRunResult;
   meta: UpdateRestartSentinelMeta;
   nowMs?: number;
 }): RestartSentinelPayload {
-  const { result, meta } = params;
+  const result = normalizeControlPlaneUpdateResult(params.result);
+  const { meta } = params;
   const continuation =
     result.status === "ok"
       ? buildRestartSuccessContinuation({
@@ -43,7 +63,7 @@ export function buildUpdateRestartSentinelPayload(params: {
     doctorHint: formatDoctorNonInteractiveHint(),
     stats: {
       mode: result.mode,
-      ...(result.root ? { root: result.root } : {}),
+      ...(meta.root || result.root ? { root: meta.root ?? result.root } : {}),
       ...(meta.handoffId ? { handoffId: meta.handoffId } : {}),
       before: result.before ?? null,
       after: result.after ?? null,

@@ -1,8 +1,9 @@
+// Msteams tests cover message handler.authz plugin behavior.
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig, PluginRuntime } from "../../runtime-api.js";
 import type { GraphThreadMessage } from "../graph-thread.js";
-import { resetThreadParentContextCachesForTest } from "../thread-parent-context.js";
-import "./message-handler-mock-support.test-support.js";
+// Preserve module setup before modules that consume it.
+// oxfmt-ignore
 import { getRuntimeApiMockState } from "./message-handler-mock-support.test-support.js";
 import { createMSTeamsMessageHandler } from "./message-handler.js";
 import { createMessageHandlerDeps } from "./message-handler.test-support.js";
@@ -19,7 +20,9 @@ type TestAttachment = {
 
 const runtimeApiMockState = getRuntimeApiMockState();
 const graphThreadMockState = vi.hoisted(() => ({
-  resolveTeamGroupId: vi.fn(async () => "group-1"),
+  resolveTeamGroupId: vi.fn(
+    async (params: { aadGroupId?: string }) => params.aadGroupId?.trim() || "group-1",
+  ),
   fetchChannelMessage: vi.fn<
     (
       token: string,
@@ -37,7 +40,12 @@ const graphThreadMockState = vi.hoisted(() => ({
       limit?: number,
     ) => Promise<GraphThreadMessage[]>
   >(async () => []),
+  fetchChatMessageText: vi.fn<
+    (token: string, chatId: string, messageId: string) => Promise<string | undefined>
+  >(async () => undefined),
 }));
+let parentMessageSequence = 0;
+let currentParentMessageId = "";
 
 vi.mock("../graph-thread.js", () => {
   const stripHtmlFromTeamsMessage = (html: string) =>
@@ -73,17 +81,26 @@ vi.mock("../graph-thread.js", () => {
   return {
     stripHtmlFromTeamsMessage,
     formatThreadContext,
-    resolveTeamGroupId: graphThreadMockState.resolveTeamGroupId,
     fetchChannelMessage: graphThreadMockState.fetchChannelMessage,
     fetchThreadReplies: graphThreadMockState.fetchThreadReplies,
+    fetchChatMessageText: graphThreadMockState.fetchChatMessageText,
   };
 });
+
+vi.mock("../team-identity.js", () => ({
+  resolveTeamGroupId: graphThreadMockState.resolveTeamGroupId,
+}));
 
 describe("msteams monitor handler authz", () => {
   function createDeps(
     cfg: OpenClawConfig,
     options: {
       hasControlCommand?: PluginRuntime["channel"]["text"]["hasControlCommand"];
+      isControlCommandMessage?: PluginRuntime["channel"]["commands"]["isControlCommandMessage"];
+      shouldComputeCommandAuthorized?: PluginRuntime["channel"]["commands"]["shouldComputeCommandAuthorized"];
+      shouldHandleTextCommands?: PluginRuntime["channel"]["commands"]["shouldHandleTextCommands"];
+      createInboundDebouncer?: PluginRuntime["channel"]["debounce"]["createInboundDebouncer"];
+      resolveInboundDebounceMs?: PluginRuntime["channel"]["debounce"]["resolveInboundDebounceMs"];
     } = {},
   ) {
     const readAllowFromStore = vi.fn(async () => ["attacker-aad"]);
@@ -100,17 +117,21 @@ describe("msteams monitor handler authz", () => {
         accountId: "default",
       })),
       hasControlCommand: options.hasControlCommand,
+      isControlCommandMessage: options.isControlCommandMessage,
+      shouldComputeCommandAuthorized: options.shouldComputeCommandAuthorized,
+      shouldHandleTextCommands: options.shouldHandleTextCommands,
+      createInboundDebouncer: options.createInboundDebouncer,
+      resolveInboundDebounceMs: options.resolveInboundDebounceMs,
     });
   }
 
   function resetThreadMocks() {
-    runtimeApiMockState.dispatchReplyFromConfigWithSettledDispatcher.mockClear();
+    currentParentMessageId = `parent-msg-${++parentMessageSequence}`;
+    runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher.mockClear();
     graphThreadMockState.resolveTeamGroupId.mockClear();
     graphThreadMockState.fetchChannelMessage.mockReset();
     graphThreadMockState.fetchThreadReplies.mockReset();
-    // Parent-context LRU + per-session dedupe are module-level; clear between
-    // cases so stale parent fetches from earlier tests don't bleed in.
-    resetThreadParentContextCachesForTest();
+    graphThreadMockState.fetchChatMessageText.mockClear();
   }
 
   function createThreadMessage(params: {
@@ -247,10 +268,10 @@ describe("msteams monitor handler authz", () => {
         conversationType: "channel",
       },
       channelData: {
-        team: { id: "team123", name: "Team 123" },
-        channel: { name: "General" },
+        team: { id: "team123", name: "Team 123", aadGroupId: "graph-team-123" },
+        channel: { id: "19:graph-channel@thread.tacv2", name: "General" },
       },
-      extraActivity: { replyToId: "parent-msg" },
+      extraActivity: { replyToId: currentParentMessageId },
       attachments: params?.attachments ?? [],
     });
   }
@@ -289,11 +310,11 @@ describe("msteams monitor handler authz", () => {
 
   function firstSettledDispatch(): { ctxPayload?: unknown } {
     const dispatched = mockCallArg(
-      runtimeApiMockState.dispatchReplyFromConfigWithSettledDispatcher,
+      runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher,
       0,
       0,
     );
-    return recordFromMockCall(dispatched) as { ctxPayload?: unknown };
+    return { ctxPayload: recordFromMockCall(dispatched).ctx };
   }
 
   function logMeta(logFn: unknown, message: string): Record<string, unknown> {
@@ -418,10 +439,6 @@ describe("msteams monitor handler authz", () => {
         id: "bot-id",
         name: "Bot",
       },
-      bot: {
-        id: "bot-id",
-        name: "Bot",
-      },
       conversation: {
         id: "a:personal-chat",
         conversationType: "personal",
@@ -430,12 +447,12 @@ describe("msteams monitor handler authz", () => {
       tenantId: "tenant-1",
       aadObjectId: "new-user-aad",
       channelId: "msteams",
-      serviceUrl: "https://smba.trafficmanager.net/amer/",
+      serviceUrl: "https://smba.trafficmanager.net/amer",
       locale: "en-US",
       timezone: "America/New_York",
     });
     expect(recordInboundSession).not.toHaveBeenCalled();
-    expect(runtimeApiMockState.dispatchReplyFromConfigWithSettledDispatcher).not.toHaveBeenCalled();
+    expect(runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
   });
 
   // Regression coverage for #58774: proactive sends fail with HTTP 403 when
@@ -494,6 +511,48 @@ describe("msteams monitor handler authz", () => {
     const storedConversation = recordFromMockCall(storedRef.conversation);
     expect(storedConversation.id).toBe("19:team-channel@thread.tacv2");
     expect(storedConversation.tenantId).toBe("tenant-from-channel-data");
+  });
+
+  it("does not persist blocked serviceUrl hosts in conversation references", async () => {
+    const { conversationStore, deps } = createDeps({
+      channels: {
+        msteams: {
+          dmPolicy: "allowlist",
+          allowFrom: ["sender-aad"],
+        },
+      },
+    } as OpenClawConfig);
+
+    const handler = createMSTeamsMessageHandler(deps);
+    await handler({
+      activity: {
+        id: "msg-blocked-service-url",
+        type: "message",
+        text: "hello",
+        from: {
+          id: "sender-id",
+          aadObjectId: "sender-aad",
+          name: "Sender",
+        },
+        recipient: {
+          id: "bot-id",
+          name: "Bot",
+        },
+        conversation: {
+          id: "a:personal-chat",
+          conversationType: "personal",
+        },
+        channelId: "msteams",
+        serviceUrl: "https://attacker.example.com/teams/",
+        channelData: {},
+        attachments: [],
+      },
+      sendActivity: vi.fn(async () => undefined),
+    } as unknown as Parameters<typeof handler>[0]);
+
+    expect(conversationStore.upsert).toHaveBeenCalledTimes(1);
+    const storedRef = recordFromMockCall(mockCallArg(conversationStore.upsert, 0, 1));
+    expect("serviceUrl" in storedRef).toBe(false);
   });
 
   it("stores no tenantId when channelData.tenant is missing", async () => {
@@ -583,6 +642,44 @@ describe("msteams monitor handler authz", () => {
     ).toBe("19:group@thread.tacv2");
   });
 
+  it.each([
+    {
+      name: "missing",
+      accessGroups: undefined,
+    },
+    {
+      name: "unsupported",
+      accessGroups: {
+        operators: {
+          type: "discord.channelAudience" as const,
+          guildId: "guild-1",
+          channelId: "channel-1",
+        },
+      },
+    },
+  ])("fails closed when a group sender access group is $name", async ({ accessGroups }) => {
+    resetThreadMocks();
+    const { conversationStore, deps } = createDeps({
+      accessGroups,
+      channels: {
+        msteams: {
+          groupPolicy: "allowlist",
+          groupAllowFrom: ["accessGroup:operators"],
+          requireMention: false,
+        },
+      },
+    } as OpenClawConfig);
+
+    const handler = createMSTeamsMessageHandler(deps);
+    await handler(createAttackerGroupActivity());
+
+    expect(conversationStore.upsert).not.toHaveBeenCalled();
+    expect(runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+    expect(logMeta(deps.log.info, "dropping group message (not in groupAllowFrom)").sender).toBe(
+      "attacker-aad",
+    );
+  });
+
   it("blocks unauthorized text control commands through shared ingress", async () => {
     resetThreadMocks();
     const hasControlCommand = vi.fn(() => true);
@@ -603,7 +700,172 @@ describe("msteams monitor handler authz", () => {
 
     expect(hasControlCommand).toHaveBeenCalledWith("/config set foo bar", deps.cfg);
     expect(conversationStore.upsert).not.toHaveBeenCalled();
-    expect(runtimeApiMockState.dispatchReplyFromConfigWithSettledDispatcher).not.toHaveBeenCalled();
+    expect(runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+  });
+
+  it("does not drop inline command-looking group text from non-command-authorized senders", async () => {
+    resetThreadMocks();
+    const isControlCommandMessage = vi.fn(() => false);
+    const shouldComputeCommandAuthorized = vi.fn(() => true);
+    const { deps } = createDeps(
+      {
+        commands: { useAccessGroups: true },
+        channels: {
+          msteams: {
+            groupPolicy: "open",
+            requireMention: false,
+          },
+        },
+      } as OpenClawConfig,
+      {
+        isControlCommandMessage,
+        shouldComputeCommandAuthorized,
+      },
+    );
+
+    const handler = createMSTeamsMessageHandler(deps);
+    await handler(createAttackerGroupActivity({ text: "hello /status" }));
+
+    expect(isControlCommandMessage).toHaveBeenCalledWith("hello /status", deps.cfg);
+    expect(runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
+    const dispatched = firstSettledDispatch();
+    const ctxPayload = recordFromMockCall(dispatched.ctxPayload);
+    expect(ctxPayload.BodyForAgent).toBe("hello /status");
+    expect(ctxPayload.CommandAuthorized).toBe(false);
+  });
+
+  it("marks skipped channel message system events as non-owner without duplicating body text", async () => {
+    resetThreadMocks();
+    const { deps, enqueueSystemEvent } = createDeps({
+      channels: {
+        msteams: {
+          groupPolicy: "open",
+          requireMention: true,
+        },
+      },
+    } as OpenClawConfig);
+
+    const handler = createMSTeamsMessageHandler(deps);
+    await handler(
+      createMessageActivity({
+        id: "msg-skip-mention",
+        text: "please run the deployment",
+        from: {
+          id: "member-id",
+          aadObjectId: "member-aad",
+          name: "Member",
+        },
+        conversation: {
+          id: "19:channel@thread.tacv2",
+          conversationType: "channel",
+        },
+        channelData: {
+          team: { id: "team123", name: "Team 123" },
+          channel: { name: "General" },
+        },
+      }),
+    );
+
+    expect(runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+    const systemEventCall = enqueueSystemEvent.mock.calls.find(
+      ([text]) => text === "Teams message in channel from Member",
+    );
+    if (!systemEventCall) {
+      throw new Error("expected skipped Teams message system event");
+    }
+    expect(systemEventCall[1]).toMatchObject({});
+    expect(systemEventCall[0]).not.toContain("please run the deployment");
+  });
+
+  it("keeps dispatched primary message system events owner-neutral without duplicating body text", async () => {
+    resetThreadMocks();
+    const { deps, enqueueSystemEvent } = createDeps({
+      channels: {
+        msteams: {
+          groupPolicy: "open",
+          requireMention: false,
+        },
+      },
+    } as OpenClawConfig);
+
+    const handler = createMSTeamsMessageHandler(deps);
+    await handler(
+      createMessageActivity({
+        id: "msg-active",
+        text: "please check the build",
+        from: {
+          id: "member-id",
+          aadObjectId: "member-aad",
+          name: "Member",
+        },
+        conversation: {
+          id: "19:channel@thread.tacv2",
+          conversationType: "channel",
+        },
+        channelData: {
+          team: { id: "team123", name: "Team 123" },
+          channel: { name: "General" },
+        },
+        extraActivity: {
+          entities: [{ type: "clientInfo", timezone: "America/New_York" }],
+        },
+      }),
+    );
+
+    expect(runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalled();
+    const systemEventCall = enqueueSystemEvent.mock.calls.find(
+      ([text]) => text === "Teams message in channel from Member",
+    );
+    if (!systemEventCall) {
+      throw new Error("expected active Teams message system event");
+    }
+    expect(systemEventCall[0]).not.toContain("please check the build");
+    const dispatched = firstSettledDispatch();
+    expect(recordFromMockCall(dispatched.ctxPayload).BodyForAgent).toBe("please check the build");
+    const dispatchParams = recordFromMockCall(
+      mockCallArg(runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher, 0, 0),
+    );
+    expect(dispatchParams.cfg).not.toBe(deps.cfg);
+    expect(recordFromMockCall(dispatchParams.cfg).agents).toEqual({
+      defaults: { userTimezone: "America/New_York" },
+    });
+  });
+
+  it("extracts message text from a mixed-case HTML attachment type", async () => {
+    resetThreadMocks();
+    const { deps } = createDeps({
+      channels: {
+        msteams: {
+          groupPolicy: "open",
+          requireMention: false,
+        },
+      },
+    } as OpenClawConfig);
+
+    const handler = createMSTeamsMessageHandler(deps);
+    await handler(
+      createMessageActivity({
+        id: "msg-html-attachment",
+        text: "",
+        from: {
+          id: "member-id",
+          aadObjectId: "member-aad",
+          name: "Member",
+        },
+        conversation: {
+          id: "19:channel@thread.tacv2",
+          conversationType: "channel",
+        },
+        channelData: {
+          team: { id: "team123", name: "Team 123" },
+          channel: { name: "General" },
+        },
+        attachments: [{ contentType: "TEXT/HTML", content: "<p>Hello Teams</p>" }],
+      }),
+    );
+
+    const dispatched = firstSettledDispatch();
+    expect(recordFromMockCall(dispatched.ctxPayload).BodyForAgent).toBe("Hello Teams");
   });
 
   it("authorizes text control commands from static access groups", async () => {
@@ -668,6 +930,7 @@ describe("msteams monitor handler authz", () => {
       "[Thread history]\nAlice: Allowed context\n[/Thread history]\n\nCurrent message",
     );
     expect(ctxPayload.GroupSpace).toBe("team123");
+    expect(ctxPayload.NativeChannelId).toBe("graph-team-123/19:graph-channel@thread.tacv2");
     expect(String((dispatched.ctxPayload as { BodyForAgent?: string }).BodyForAgent)).not.toContain(
       "Mallory",
     );
@@ -735,5 +998,82 @@ describe("msteams monitor handler authz", () => {
     expect(ctx.ReplyToBody).toBeUndefined();
     expect(ctx.ReplyToSender).toBeUndefined();
     expect(ctx.BodyForAgent).toBe("Current message");
+  });
+
+  it("does not fetch full quote text via Graph for group-chat quote replies", async () => {
+    resetThreadMocks();
+    const { deps } = createDeps({
+      channels: { msteams: { groupPolicy: "open", requireMention: false } },
+    } as OpenClawConfig);
+    const handler = createMSTeamsMessageHandler(deps);
+    await handler(
+      createMessageActivity({
+        id: "grp-quote-1",
+        text: "what about this?",
+        from: { id: "attacker-id", aadObjectId: "attacker-aad", name: "Attacker" },
+        conversation: { id: "19:group@thread.tacv2", conversationType: "groupChat" },
+        attachments: [
+          {
+            contentType: "text/html",
+            content:
+              '<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="1783379480258">' +
+              '<strong itemprop="mri">Victim</strong>' +
+              '<p itemprop="preview">secret snippet…</p></blockquote>',
+          },
+        ],
+      }),
+    );
+
+    // The group quote IS surfaced from the inbound preview (fix 1), proving the
+    // quote path ran — but the app-only Graph full-text fetch must NOT fire in a
+    // group chat: the fetched body would bypass the supplemental-quote visibility
+    // allowlist. Only 1:1 DMs may fetch full text.
+    const ctx = recordFromMockCall(firstSettledDispatch().ctxPayload);
+    expect(ctx.ReplyToBody).toBe("secret snippet…");
+    expect(graphThreadMockState.fetchChatMessageText).not.toHaveBeenCalled();
+  });
+
+  it("replaces a DM quote preview with the complete Graph message", async () => {
+    resetThreadMocks();
+    graphThreadMockState.fetchChatMessageText.mockResolvedValueOnce("complete quoted message");
+    const { deps } = createDeps({
+      channels: { msteams: { dmPolicy: "open", allowFrom: ["*"] } },
+    } as OpenClawConfig);
+    const handler = createMSTeamsMessageHandler(deps);
+
+    await handler(
+      createMessageActivity({
+        id: "dm-quote-1",
+        text: "what about this?",
+        from: { id: "user-id", aadObjectId: "user-aad", name: "User" },
+        conversation: { id: "19:dm@thread.v2", conversationType: "personal" },
+        attachments: [
+          {
+            contentType: "text/html",
+            content:
+              '<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="message-1">' +
+              '<strong itemprop="mri">Bot</strong>' +
+              '<p itemprop="preview">truncated preview…</p></blockquote>',
+          },
+        ],
+      }),
+    );
+
+    expect(deps.tokenProvider.getAccessToken).toHaveBeenCalledWith("https://graph.microsoft.com");
+    expect(graphThreadMockState.fetchChatMessageText).toHaveBeenCalledWith(
+      "token",
+      "19:dm@thread.v2",
+      "message-1",
+      expect.objectContaining({
+        label: "MS Teams inbound preprocessing",
+        timeoutMs: 10_000,
+      }),
+    );
+    const ctx = recordFromMockCall(firstSettledDispatch().ctxPayload);
+    expect(ctx.To).toBe("user:user-aad");
+    expect(ctx.OriginatingTo).toBe("conversation:19:dm@thread.v2");
+    expect(ctx.ReplyToId).toBe("message-1");
+    expect(ctx.ReplyToBody).toBe("complete quoted message");
+    expect(ctx.ReplyToSender).toBe("Bot");
   });
 });

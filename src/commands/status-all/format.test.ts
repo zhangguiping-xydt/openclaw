@@ -1,3 +1,4 @@
+// Status-all format tests cover dashboard URLs, gateway summaries, overview rows, and JSON payload shapes.
 import { describe, expect, it } from "vitest";
 import {
   baseStatusExpectedUpdateChannelInfo,
@@ -203,6 +204,37 @@ describe("status-all format", () => {
     });
   });
 
+  it("redacts credential-bearing Gateway URLs from text and JSON status", () => {
+    const gatewayConnection = {
+      url: "wss://user:password@gateway.example/ws?token=secret&key=api-key&X-Amz-Signature=signed",
+      urlSource: "cli --url",
+    };
+
+    const summary = buildGatewayStatusSummaryParts({
+      gatewayMode: "remote",
+      remoteUrlMissing: false,
+      gatewayConnection,
+      gatewayReachable: false,
+      gatewayProbe: { error: "unreachable" },
+      gatewayProbeAuth: null,
+    });
+    const json = buildGatewayStatusJsonPayload({
+      gatewayMode: "remote",
+      gatewayConnection,
+      remoteUrlMissing: false,
+      gatewayReachable: false,
+      gatewayProbe: { error: "unreachable" },
+      gatewaySelf: null,
+    });
+    const output = JSON.stringify({ summary, json });
+
+    expect(output).toContain("gateway.example/ws");
+    expect(output).not.toContain("password");
+    expect(output).not.toContain("secret");
+    expect(output).not.toContain("api-key");
+    expect(output).not.toContain("signed");
+  });
+
   it("builds shared gateway surface values for node and gateway views", () => {
     expect(
       buildStatusGatewaySurfaceValues({
@@ -241,6 +273,38 @@ describe("status-all format", () => {
       gatewayServiceValue: "LaunchAgent installed · loaded · running",
       nodeServiceValue: "node loaded · running (pid 42)",
     });
+  });
+
+  it("prefers advertised Control UI links for dashboard values", () => {
+    expect(
+      buildStatusGatewaySurfaceValues({
+        cfg: { gateway: { bind: "lan" } },
+        advertisedControlUiLinks: {
+          httpUrl: "http://10.211.55.3:18789/",
+          wsUrl: "ws://10.211.55.3:18789",
+        },
+        gatewayMode: "local",
+        remoteUrlMissing: false,
+        gatewayConnection: {
+          url: "ws://127.0.0.1:18789",
+          urlSource: "local loopback",
+        },
+        gatewayReachable: true,
+        gatewayProbe: { connectLatencyMs: 12, error: null },
+        gatewayProbeAuth: { token: "tok" },
+        gatewaySelf: null,
+        gatewayService: {
+          label: "LaunchAgent",
+          installed: true,
+          loadedText: "loaded",
+        },
+        nodeService: {
+          label: "node",
+          installed: true,
+          loadedText: "loaded",
+        },
+      }).dashboardUrl,
+    ).toBe("http://10.211.55.3:18789/");
   });
 
   it("prefers node-only gateway values when present", () => {

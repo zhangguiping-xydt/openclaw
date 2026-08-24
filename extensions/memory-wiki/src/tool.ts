@@ -1,4 +1,8 @@
+// Memory Wiki plugin module implements tool behavior.
 import path from "node:path";
+import { optionalFiniteNumberSchema } from "openclaw/plugin-sdk/channel-actions";
+import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import { asNonArrayRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { Type } from "typebox";
 import type { AnyAgentTool, OpenClawConfig } from "../api.js";
 import { applyMemoryWikiMutation, normalizeMemoryWikiMutationInput } from "./apply.js";
@@ -36,7 +40,7 @@ const WikiSearchModeSchema = Type.Union(WIKI_SEARCH_MODES.map((value) => Type.Li
 const WikiSearchSchema = Type.Object(
   {
     query: Type.String({ minLength: 1 }),
-    maxResults: Type.Optional(Type.Number({ minimum: 1 })),
+    maxResults: Type.Optional(Type.Integer({ minimum: 1 })),
     backend: Type.Optional(WikiSearchBackendSchema),
     corpus: Type.Optional(WikiSearchCorpusSchema),
     mode: Type.Optional(WikiSearchModeSchema),
@@ -46,8 +50,8 @@ const WikiSearchSchema = Type.Object(
 const WikiGetSchema = Type.Object(
   {
     lookup: Type.String({ minLength: 1 }),
-    fromLine: Type.Optional(Type.Number({ minimum: 1 })),
-    lineCount: Type.Optional(Type.Number({ minimum: 1 })),
+    fromLine: Type.Optional(Type.Integer({ minimum: 1 })),
+    lineCount: Type.Optional(Type.Integer({ minimum: 1 })),
     backend: Type.Optional(WikiSearchBackendSchema),
     corpus: Type.Optional(WikiSearchCorpusSchema),
   },
@@ -59,9 +63,9 @@ const WikiClaimEvidenceSchema = Type.Object(
     sourceId: Type.Optional(Type.String({ minLength: 1 })),
     path: Type.Optional(Type.String({ minLength: 1 })),
     lines: Type.Optional(Type.String({ minLength: 1 })),
-    weight: Type.Optional(Type.Number({ minimum: 0 })),
+    weight: optionalFiniteNumberSchema({ minimum: 0 }),
     note: Type.Optional(Type.String({ minLength: 1 })),
-    confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+    confidence: optionalFiniteNumberSchema({ minimum: 0, maximum: 1 }),
     privacyTier: Type.Optional(Type.String({ minLength: 1 })),
     updatedAt: Type.Optional(Type.String({ minLength: 1 })),
   },
@@ -72,7 +76,7 @@ const WikiClaimSchema = Type.Object(
     id: Type.Optional(Type.String({ minLength: 1 })),
     text: Type.String({ minLength: 1 }),
     status: Type.Optional(Type.String({ minLength: 1 })),
-    confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+    confidence: optionalFiniteNumberSchema({ minimum: 0, maximum: 1 }),
     evidence: Type.Optional(Type.Array(WikiClaimEvidenceSchema)),
     updatedAt: Type.Optional(Type.String({ minLength: 1 })),
   },
@@ -80,7 +84,12 @@ const WikiClaimSchema = Type.Object(
 );
 const WikiApplySchema = Type.Object(
   {
-    op: Type.Union([Type.Literal("create_synthesis"), Type.Literal("update_metadata")]),
+    op: Type.Union([
+      Type.Literal("create_synthesis"),
+      Type.Literal("update_metadata"),
+      Type.Literal("synthesis"),
+      Type.Literal("metadata"),
+    ]),
     title: Type.Optional(Type.String({ minLength: 1 })),
     body: Type.Optional(Type.String({ minLength: 1 })),
     lookup: Type.Optional(Type.String({ minLength: 1 })),
@@ -105,11 +114,13 @@ type WikiToolMemoryContext = {
   agentId?: string;
   agentSessionKey?: string;
   sandboxed?: boolean;
+  conversationRecall?: OpenClawPluginToolContext["conversationRecall"];
 };
 
 export function createWikiStatusTool(
   config: ResolvedMemoryWikiConfig,
   appConfig?: OpenClawConfig,
+  memoryContext: WikiToolMemoryContext = {},
 ): AnyAgentTool {
   return {
     name: "wiki_status",
@@ -121,6 +132,7 @@ export function createWikiStatusTool(
       await syncImportedSourcesIfNeeded(config, appConfig);
       const status = await resolveMemoryWikiStatus(config, {
         appConfig,
+        callerAgentId: memoryContext.agentId,
       });
       return {
         content: [{ type: "text", text: renderMemoryWikiStatus(status) }],
@@ -156,6 +168,7 @@ export function createWikiSearchTool(
         agentId: memoryContext.agentId,
         agentSessionKey: memoryContext.agentSessionKey,
         sandboxed: memoryContext.sandboxed,
+        conversationRecall: memoryContext.conversationRecall,
         query: params.query,
         maxResults: params.maxResults,
         ...(params.backend ? { searchBackend: params.backend } : {}),
@@ -265,13 +278,20 @@ export function createWikiGetTool(
       "Read a wiki page by id or relative path, or fall back to the active memory corpus when shared search is enabled.",
     parameters: WikiGetSchema,
     execute: async (_toolCallId, rawParams) => {
-      const params = rawParams as {
-        lookup: string;
+      const params = asNonArrayRecord(rawParams) as {
+        lookup?: string;
         fromLine?: number;
         lineCount?: number;
         backend?: ResolvedMemoryWikiConfig["search"]["backend"];
         corpus?: ResolvedMemoryWikiConfig["search"]["corpus"];
       };
+      const lookup = typeof params.lookup === "string" ? params.lookup.trim() : "";
+      if (!lookup) {
+        return {
+          content: [{ type: "text", text: "wiki_get requires a non-empty `lookup` path or id." }],
+          details: { found: false },
+        };
+      }
       await syncImportedSourcesIfNeeded(config, appConfig);
       const result = await getMemoryWikiPage({
         config,
@@ -279,7 +299,8 @@ export function createWikiGetTool(
         agentId: memoryContext.agentId,
         agentSessionKey: memoryContext.agentSessionKey,
         sandboxed: memoryContext.sandboxed,
-        lookup: params.lookup,
+        conversationRecall: memoryContext.conversationRecall,
+        lookup,
         fromLine: params.fromLine,
         lineCount: params.lineCount,
         ...(params.backend ? { searchBackend: params.backend } : {}),
@@ -287,7 +308,7 @@ export function createWikiGetTool(
       });
       if (!result) {
         return {
-          content: [{ type: "text", text: `Wiki page not found: ${params.lookup}` }],
+          content: [{ type: "text", text: `Wiki page not found: ${lookup}` }],
           details: { found: false },
         };
       }

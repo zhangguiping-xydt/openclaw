@@ -8,9 +8,21 @@ title: "Voicecall"
 
 # `openclaw voicecall`
 
-`voicecall` is a plugin-provided command. It only appears when the voice-call plugin is installed and enabled.
+`voicecall` is a plugin-provided command. It only appears when the voice-call
+plugin is installed and enabled.
 
-When the Gateway is running, operational commands (`call`, `start`, `continue`, `speak`, `dtmf`, `end`, `status`) are routed to that Gateway's voice-call runtime. If no Gateway is reachable, they fall back to a standalone CLI runtime.
+When the Gateway is running, operational commands (`call`, `start`,
+`continue`, `speak`, `dtmf`, `end`, `status`) route to that Gateway's
+voice-call runtime. If no Gateway is reachable, they fall back to a standalone
+CLI runtime. `status` uses the persisted call store instead of starting that
+runtime.
+
+Fallback is limited to transport-level absence. If the Gateway responds with a
+request or authentication error, or does not answer before the timeout, the
+command exits nonzero and points to `openclaw gateway status`; it does not start
+a second webhook server. If standalone fallback cannot bind the configured
+`serve.port`, the error identifies the likely running Gateway instead of
+printing a raw `EADDRINUSE` failure.
 
 ## Subcommands
 
@@ -57,7 +69,8 @@ openclaw voicecall setup --json
 
 ### `smoke`
 
-Runs the same readiness checks. It will not place a real phone call unless both `--to` and `--yes` are present.
+Runs the same readiness checks. Places a real phone call only when both
+`--to` and `--yes` are present.
 
 | Flag               | Default                           | Description                             |
 | ------------------ | --------------------------------- | --------------------------------------- |
@@ -74,7 +87,7 @@ openclaw voicecall smoke --to "+15555550123" --yes  # live notify call
 ```
 
 <Note>
-For external providers (`twilio`, `telnyx`, `plivo`), `setup` and `smoke` require a public webhook URL from `publicUrl`, a tunnel, or Tailscale exposure. A loopback or private serve fallback is rejected because carriers cannot reach it.
+For external providers (`plivo`, `telnyx`, `twilio`), `setup` and `smoke` require a public webhook URL from `publicUrl`, a tunnel, or Tailscale exposure. A loopback or private serve fallback is rejected because carriers cannot reach it.
 </Note>
 
 ## Call lifecycle
@@ -126,10 +139,10 @@ Speak a message without waiting for a response.
 
 Send DTMF digits to an active call.
 
-| Flag                | Required | Description                               |
-| ------------------- | -------- | ----------------------------------------- |
-| `--call-id <id>`    | yes      | Call ID.                                  |
-| `--digits <digits>` | yes      | DTMF digits (e.g. `ww123456#` for waits). |
+| Flag                | Required | Description                                      |
+| ------------------- | -------- | ------------------------------------------------ |
+| `--call-id <id>`    | yes      | Call ID.                                         |
+| `--digits <digits>` | yes      | DTMF digits (for example `ww123456#` for waits). |
 
 ### `end`
 
@@ -158,7 +171,8 @@ openclaw voicecall status --call-id <id>
 
 ### `tail`
 
-Tail the voice-call JSONL log. Prints the last `--since` lines on start, then streams new lines as they are written.
+Tail the voice-call JSONL log. Prints the last `--since` lines on start, then
+streams new lines as they are written.
 
 | Flag            | Default                    | Description                    |
 | --------------- | -------------------------- | ------------------------------ |
@@ -168,7 +182,8 @@ Tail the voice-call JSONL log. Prints the last `--since` lines on start, then st
 
 ### `latency`
 
-Summarize turn-latency and listen-wait metrics from `calls.jsonl`. Output is JSON with `recordsScanned`, `turnLatency`, and `listenWait` summaries.
+Summarize turn-latency and listen-wait metrics from `calls.jsonl`. Output is
+JSON with `recordsScanned`, `turnLatency`, and `listenWait` summaries.
 
 | Flag            | Default                    | Description                          |
 | --------------- | -------------------------- | ------------------------------------ |
@@ -179,7 +194,11 @@ Summarize turn-latency and listen-wait metrics from `calls.jsonl`. Output is JSO
 
 ### `expose`
 
-Enable, disable, or change the Tailscale serve/funnel configuration for the voice webhook.
+Enable, disable, or change the Tailscale serve/funnel configuration for the
+voice webhook. When realtime or streaming audio is enabled, the command also
+exposes or clears that mode's WebSocket stream path. The external HTTPS port
+comes from `tailscale.port` (default `443`); Funnel supports `443`, `8443`, or
+`10000`.
 
 | Flag                  | Default                                   | Description                                     |
 | --------------------- | ----------------------------------------- | ----------------------------------------------- |

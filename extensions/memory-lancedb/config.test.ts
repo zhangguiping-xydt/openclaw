@@ -1,13 +1,25 @@
+// Memory Lancedb tests cover config plugin behavior.
 import fs from "node:fs";
-import { type JsonSchemaObject, validateJsonSchemaValue } from "openclaw/plugin-sdk/config-schema";
+import {
+  type JsonSchemaObject,
+  validateJsonSchemaValue,
+} from "openclaw/plugin-sdk/json-schema-runtime";
 import { describe, expect, it } from "vitest";
 import { memoryConfigSchema } from "./config.js";
 
 const manifest = JSON.parse(
   fs.readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf-8"),
-) as { configSchema: JsonSchemaObject };
+) as { configSchema: JsonSchemaObject; uiHints?: Record<string, unknown> };
 
 describe("memory-lancedb config", () => {
+  it("keeps config presentation metadata manifest-owned", () => {
+    expect(memoryConfigSchema).not.toHaveProperty("uiHints");
+    expect(manifest.uiHints?.["embedding.apiKey"]).toMatchObject({
+      label: "Embedding API Key",
+      sensitive: true,
+    });
+  });
+
   it("accepts dreaming in the manifest schema and preserves it in runtime parsing", () => {
     const manifestResult = validateJsonSchemaValue({
       schema: manifest.configSchema,
@@ -73,7 +85,7 @@ describe("memory-lancedb config", () => {
     expect(manifestResult.ok).toBe(false);
     if (!manifestResult.ok) {
       expect(manifestResult.errors.map((error) => error.text)).toContain(
-        "embedding: must NOT have fewer than 1 properties",
+        "embedding: must not have fewer than 1 properties",
       );
     }
 
@@ -106,6 +118,40 @@ describe("memory-lancedb config", () => {
         },
       });
     }).toThrow("embedding.provider must not be empty");
+  });
+
+  it("defaults non-finite character budgets and rejects invalid dimensions", () => {
+    const manifestResult = validateJsonSchemaValue({
+      schema: manifest.configSchema,
+      cacheKey: "memory-lancedb.manifest.invalid-dimensions",
+      value: {
+        embedding: {
+          apiKey: "sk-test",
+          dimensions: 1024.5,
+        },
+      },
+    });
+    const parsed = memoryConfigSchema.parse({
+      embedding: {
+        apiKey: "sk-test",
+      },
+      captureMaxChars: Number.NaN,
+      recallMaxChars: Number.POSITIVE_INFINITY,
+    });
+
+    expect(parsed.captureMaxChars).toBe(500);
+    expect(parsed.recallMaxChars).toBe(1000);
+    expect(manifestResult.ok).toBe(false);
+    for (const dimensions of [Number.NaN, 1024.5]) {
+      expect(() => {
+        memoryConfigSchema.parse({
+          embedding: {
+            apiKey: "sk-test",
+            dimensions,
+          },
+        });
+      }).toThrow("embedding.dimensions must be a positive integer");
+    }
   });
 
   it("still rejects unrelated unknown top-level config keys", () => {

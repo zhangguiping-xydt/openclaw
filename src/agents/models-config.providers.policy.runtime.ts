@@ -1,3 +1,8 @@
+import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
+/**
+ * Runtime-policy bridge for provider config normalization. These helpers call
+ * plugin hooks without triggering runtime plugin loading from config assembly.
+ */
 import {
   applyProviderNativeStreamingUsageCompatWithPlugin,
   normalizeProviderConfigWithPlugin,
@@ -6,6 +11,9 @@ import {
 import { resolveProviderPluginLookupKey } from "./models-config.providers.policy.lookup.js";
 import type { ProviderConfig } from "./models-config.providers.secrets.js";
 
+export type ProviderPolicyManifestRegistry = Pick<PluginManifestRegistry, "plugins">;
+
+/** Apply provider native-streaming usage compatibility policy. */
 export function applyProviderNativeStreamingUsagePolicy(
   providerKey: string,
   provider: ProviderConfig,
@@ -23,15 +31,18 @@ export function applyProviderNativeStreamingUsagePolicy(
   );
 }
 
+/** Normalize provider config through any already-available plugin policy hook. */
 export function normalizeProviderConfigPolicy(
   providerKey: string,
   provider: ProviderConfig,
+  manifestRegistry?: ProviderPolicyManifestRegistry,
 ): ProviderConfig {
   const runtimeProviderKey = resolveProviderPluginLookupKey(providerKey, provider);
   return (
     normalizeProviderConfigWithPlugin({
       provider: runtimeProviderKey,
       allowRuntimePluginLoad: false,
+      ...(manifestRegistry ? { manifestRegistry } : {}),
       context: {
         provider: providerKey,
         providerConfig: provider,
@@ -40,15 +51,18 @@ export function normalizeProviderConfigPolicy(
   );
 }
 
+/** Resolve a provider API-key policy function from already-available plugin hooks. */
 export function resolveProviderConfigApiKeyPolicy(
   providerKey: string,
   provider?: ProviderConfig,
+  manifestRegistry?: ProviderPolicyManifestRegistry,
 ): ((env: NodeJS.ProcessEnv) => string | undefined) | undefined {
   const runtimeProviderKey = resolveProviderPluginLookupKey(providerKey, provider).trim();
   return (env) =>
     resolveProviderConfigApiKeyWithPlugin({
       provider: runtimeProviderKey,
       allowRuntimePluginLoad: false,
+      ...(manifestRegistry ? { manifestRegistry } : {}),
       context: {
         provider: providerKey,
         env,

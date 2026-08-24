@@ -1,3 +1,4 @@
+// ACP stateful target driver tests cover ACP target state persistence and routing.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const resetMocks = vi.hoisted(() => ({
@@ -5,6 +6,8 @@ const resetMocks = vi.hoisted(() => ({
     ok: true as const,
     key: "agent:claude:acp:binding:discord:default:9373ab192b2317f4",
     entry: { sessionId: "next-session", updatedAt: 1 },
+    agentId: "claude",
+    storePath: "/tmp/claude-sessions.json",
   })),
 }));
 const sessionMetaMocks = vi.hoisted(() => ({
@@ -15,10 +18,10 @@ const resolveMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../acp/persistent-bindings.lifecycle.js", () => ({
-  ensureConfiguredAcpBindingReady: vi.fn(),
+  ensureConfiguredAcpBindingReadyCore: vi.fn(),
   ensureConfiguredAcpBindingSession: vi.fn(),
 }));
-vi.mock("./acp-stateful-target-reset.runtime.js", () => ({
+vi.mock("../../gateway/session-reset-service.js", () => ({
   performGatewaySessionReset: resetMocks.performGatewaySessionReset,
 }));
 vi.mock("../../acp/runtime/session-meta.js", () => ({
@@ -52,12 +55,18 @@ describe("acpStatefulBindingTargetDriver", () => {
           agentId: "claude",
         },
       }),
-    ).resolves.toEqual({ ok: true });
+    ).resolves.toEqual({
+      ok: true,
+      sessionKey: "agent:claude:acp:binding:discord:default:9373ab192b2317f4",
+      sessionId: "next-session",
+      storePath: "/tmp/claude-sessions.json",
+    });
 
     expect(resetMocks.performGatewaySessionReset).toHaveBeenCalledWith({
       key: "agent:claude:acp:binding:discord:default:9373ab192b2317f4",
       reason: "new",
       commandSource: "discord:native",
+      armSessionDiffBaselineCapture: true,
     });
   });
 

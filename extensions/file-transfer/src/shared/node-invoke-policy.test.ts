@@ -1,9 +1,11 @@
-import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
+import { gzipSync } from "node:zlib";
 import type { OpenClawPluginNodeInvokePolicyContext } from "openclaw/plugin-sdk/plugin-entry";
+// File Transfer tests cover node invoke policy plugin behavior.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { appendFileTransferAudit } from "./audit.js";
 import { createFileTransferNodeInvokePolicy } from "./node-invoke-policy.js";
 
 vi.mock("./audit.js", () => ({
@@ -32,34 +34,54 @@ afterAll(() => {
   vi.resetModules();
 });
 
-async function tarEntries(entries: Record<string, string>): Promise<string> {
-  const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "node-policy-tar-")));
-  tmpRoots.push(tmpRoot);
+function tarEntries(entries: Record<string, string>): string {
+  const blocks: Buffer[] = [];
   for (const [relPath, contents] of Object.entries(entries)) {
-    const absPath = path.join(tmpRoot, relPath);
-    await fs.mkdir(path.dirname(absPath), { recursive: true });
-    await fs.writeFile(absPath, contents);
+    const payload = Buffer.from(contents);
+    blocks.push(createTarFileHeader(relPath, payload.byteLength), payload);
+    const padding = (512 - (payload.byteLength % 512)) % 512;
+    if (padding > 0) {
+      blocks.push(Buffer.alloc(padding));
+    }
   }
-  return await new Promise<string>((resolve, reject) => {
-    const tarBin = process.platform !== "win32" ? "/usr/bin/tar" : "tar";
-    const child = spawn(tarBin, ["-czf", "-", "-C", tmpRoot, "."], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const chunks: Buffer[] = [];
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(new Error(`tar exited ${code}: ${stderr}`));
-        return;
-      }
-      resolve(Buffer.concat(chunks).toString("base64"));
-    });
-    child.on("error", reject);
-  });
+  blocks.push(Buffer.alloc(1024));
+  return gzipSync(Buffer.concat(blocks)).toString("base64");
+}
+
+function archiveMetadata(tarBase64: string): { tarBytes: number; sha256: string } {
+  const buffer = Buffer.from(tarBase64, "base64");
+  return {
+    tarBytes: buffer.byteLength,
+    sha256: crypto.createHash("sha256").update(buffer).digest("hex"),
+  };
+}
+
+function writeTarString(header: Buffer, offset: number, length: number, value: string): void {
+  header.write(value.slice(0, length), offset, length, "utf8");
+}
+
+function writeTarOctal(header: Buffer, offset: number, length: number, value: number): void {
+  const text = value.toString(8).padStart(length - 1, "0");
+  header.write(`${text}\0`.slice(-length), offset, length, "ascii");
+}
+
+function createTarFileHeader(name: string, size: number): Buffer {
+  const header = Buffer.alloc(512);
+  writeTarString(header, 0, 100, name);
+  writeTarOctal(header, 100, 8, 0o644);
+  writeTarOctal(header, 108, 8, 0);
+  writeTarOctal(header, 116, 8, 0);
+  writeTarOctal(header, 124, 12, size);
+  writeTarOctal(header, 136, 12, 0);
+  header.fill(" ", 148, 156);
+  header.write("0", 156, 1, "ascii");
+  header.write("ustar\0", 257, 6, "ascii");
+  header.write("00", 263, 2, "ascii");
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  header.write(checksum.toString(8).padStart(6, "0"), 148, 6, "ascii");
+  header[154] = 0;
+  header[155] = 0x20;
+  return header;
 }
 
 function createCtx(overrides: {
@@ -107,12 +129,7 @@ function createCtx(overrides: {
   };
 }
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null) {
-    throw new Error(`${label} was not an object`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("object", "label-not-object");
 
 function expectRecordFields(record: Record<string, unknown>, fields: Record<string, unknown>) {
   for (const [key, value] of Object.entries(fields)) {
@@ -161,6 +178,77 @@ describe("file-transfer node invoke policy", () => {
     });
   });
 
+  it("normalizes string maxBytes before invoking the node", async () => {
+    const policy = createFileTransferNodeInvokePolicy();
+    const { ctx, invokeNode } = createCtx({
+      params: { path: "/tmp/file.txt", maxBytes: "1024" },
+      pluginConfig: {
+        nodes: {
+          "node-1": {
+            allowReadPaths: ["/tmp/**"],
+          },
+        },
+      },
+    });
+
+    const result = await policy.handle(ctx);
+
+    expect(result.ok).toBe(true);
+    expect(invokeNode).toHaveBeenNthCalledWith(1, {
+      params: {
+        path: "/tmp/file.txt",
+        maxBytes: 1024,
+        followSymlinks: false,
+        preflightOnly: true,
+      },
+    });
+  });
+
+  it("rejects malformed maxBytes before invoking the node", async () => {
+    const policy = createFileTransferNodeInvokePolicy();
+    const { ctx, invokeNode } = createCtx({
+      params: { path: "/tmp/file.txt", maxBytes: "1024.5" },
+    });
+
+    const result = await policy.handle(ctx);
+
+    expectResultFields(result, {
+      ok: false,
+      code: "INVALID_PARAMS",
+      message: "maxBytes must be a positive integer",
+    });
+    expect(invokeNode).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed maxBytes before requesting approval", async () => {
+    const policy = createFileTransferNodeInvokePolicy();
+    const approvals = {
+      request: vi.fn(async () => ({ id: "approval-1", decision: "allow-always" as const })),
+    };
+    const { ctx, invokeNode } = createCtx({
+      params: { path: "/tmp/new.txt", maxBytes: "1024.5" },
+      pluginConfig: {
+        nodes: {
+          "node-1": {
+            ask: "on-miss",
+            allowReadPaths: ["/allowed/**"],
+          },
+        },
+      },
+      approvals,
+    });
+
+    const result = await policy.handle(ctx);
+
+    expectResultFields(result, {
+      ok: false,
+      code: "INVALID_PARAMS",
+      message: "maxBytes must be a positive integer",
+    });
+    expect(approvals.request).not.toHaveBeenCalled();
+    expect(invokeNode).not.toHaveBeenCalled();
+  });
+
   it("denies raw node.invoke before the node when plugin policy is missing", async () => {
     const policy = createFileTransferNodeInvokePolicy();
     const { ctx, invokeNode } = createCtx({ pluginConfig: {} });
@@ -171,11 +259,95 @@ describe("file-transfer node invoke policy", () => {
     expect(invokeNode).not.toHaveBeenCalled();
   });
 
-  it("uses plugin approvals for ask-on-miss before invoking the node", async () => {
+  it.each(["allow-once", "allow-always"] as const)(
+    "uses exact %s plugin approval once across preflight and final invoke",
+    async (decision) => {
+      const policy = createFileTransferNodeInvokePolicy();
+      const approvals = {
+        request: vi.fn(async () => ({ id: "approval-1", decision })),
+      };
+      const { ctx, invokeNode } = createCtx({
+        params: { path: "/tmp/new.txt" },
+        pluginConfig: {
+          nodes: {
+            "node-1": {
+              ask: "on-miss",
+              allowReadPaths: ["/allowed/**"],
+              maxBytes: 256,
+            },
+          },
+        },
+        approvals,
+      });
+
+      const result = await policy.handle(ctx);
+
+      expect(result.ok).toBe(true);
+      expect(approvals.request).toHaveBeenCalledTimes(1);
+      expect(invokeNode).toHaveBeenCalledTimes(2);
+      const approvalCalls = approvals.request.mock.calls as unknown[][];
+      const approvalRequest = requireRecord(approvalCalls[0]?.[0], "approval request");
+      expectRecordFields(approvalRequest, {
+        title: "Read file: /tmp/new.txt",
+        severity: "info",
+        toolName: "file.fetch",
+      });
+      expect(invokeNode).toHaveBeenNthCalledWith(1, {
+        params: {
+          path: "/tmp/new.txt",
+          followSymlinks: false,
+          maxBytes: 256,
+          preflightOnly: true,
+        },
+      });
+      expect(invokeNode).toHaveBeenNthCalledWith(2, {
+        params: {
+          path: "/tmp/new.txt",
+          followSymlinks: false,
+          maxBytes: 256,
+        },
+      });
+    },
+  );
+
+  it.each([
+    {
+      label: "explicit deny",
+      decision: "deny",
+      code: "APPROVAL_DENIED",
+      message: "file.fetch APPROVAL_DENIED: operator denied the prompt",
+    },
+    {
+      label: "null decision",
+      decision: null,
+      code: "APPROVAL_UNAVAILABLE",
+      message:
+        "file.fetch APPROVAL_UNAVAILABLE: no operator client connected to approve the request",
+    },
+    {
+      label: "undefined decision",
+      decision: undefined,
+      code: "APPROVAL_UNAVAILABLE",
+      message:
+        "file.fetch APPROVAL_UNAVAILABLE: no operator client connected to approve the request",
+    },
+    {
+      label: "arbitrary truthy string",
+      decision: "accept",
+      code: "APPROVAL_DENIED",
+      message: "file.fetch APPROVAL_DENIED: invalid approval decision",
+    },
+    {
+      label: "arbitrary truthy object",
+      decision: { action: "accept" },
+      code: "APPROVAL_DENIED",
+      message: "file.fetch APPROVAL_DENIED: invalid approval decision",
+    },
+  ])("fails closed for $label", async ({ decision, code, message }) => {
     const policy = createFileTransferNodeInvokePolicy();
     const approvals = {
-      request: vi.fn(async () => ({ id: "approval-1", decision: "allow-once" as const })),
-    };
+      request: vi.fn(async () => ({ id: "approval-1", decision })),
+    } as unknown as NonNullable<OpenClawPluginNodeInvokePolicyContext["approvals"]>;
     const { ctx, invokeNode } = createCtx({
       params: { path: "/tmp/new.txt" },
       pluginConfig: {
@@ -183,7 +355,6 @@ describe("file-transfer node invoke policy", () => {
           "node-1": {
             ask: "on-miss",
             allowReadPaths: ["/allowed/**"],
-            maxBytes: 256,
           },
         },
       },
@@ -192,29 +363,9 @@ describe("file-transfer node invoke policy", () => {
 
     const result = await policy.handle(ctx);
 
-    expect(result.ok).toBe(true);
-    const approvalCalls = approvals.request.mock.calls as unknown[][];
-    const approvalRequest = requireRecord(approvalCalls[0]?.[0], "approval request");
-    expectRecordFields(approvalRequest, {
-      title: "Read file: /tmp/new.txt",
-      severity: "info",
-      toolName: "file.fetch",
-    });
-    expect(invokeNode).toHaveBeenNthCalledWith(1, {
-      params: {
-        path: "/tmp/new.txt",
-        followSymlinks: false,
-        maxBytes: 256,
-        preflightOnly: true,
-      },
-    });
-    expect(invokeNode).toHaveBeenNthCalledWith(2, {
-      params: {
-        path: "/tmp/new.txt",
-        followSymlinks: false,
-        maxBytes: 256,
-      },
-    });
+    expectResultFields(result, { ok: false, code, message });
+    expect(approvals.request).toHaveBeenCalledTimes(1);
+    expect(invokeNode).not.toHaveBeenCalled();
   });
 
   it("marks node transport failures as unavailable", async () => {
@@ -468,11 +619,42 @@ describe("file-transfer node invoke policy", () => {
     expect(invokeNode).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects oversized dir.fetch preflight entry lists before requesting the archive", async () => {
+    const policy = createFileTransferNodeInvokePolicy();
+    const entries = Array.from({ length: 5001 }, (_, index) => `file-${index}.txt`);
+    const { ctx, invokeNode } = createCtx({
+      command: "dir.fetch",
+      params: { path: "/home/me" },
+      pluginConfig: {
+        nodes: {
+          "node-1": {
+            allowReadPaths: ["/home/me", "/home/me/**"],
+          },
+        },
+      },
+    });
+    invokeNode.mockResolvedValueOnce({
+      ok: true,
+      payload: {
+        ok: true,
+        path: "/home/me",
+        entries,
+        fileCount: entries.length,
+        preflightOnly: true,
+      },
+    });
+
+    const result = await policy.handle(ctx);
+
+    expectResultFields(result, { ok: false, code: "PREFLIGHT_ENTRIES_TOO_MANY" });
+    expect(invokeNode).toHaveBeenCalledTimes(1);
+  });
+
   testUnlessWindows(
     "continues dir.fetch after preflight without forwarding caller preflightOnly",
     async () => {
       const policy = createFileTransferNodeInvokePolicy();
-      const tarBase64 = await tarEntries({
+      const tarBase64 = tarEntries({
         "a.txt": "a",
         "sub/b.txt": "b",
       });
@@ -497,8 +679,7 @@ describe("file-transfer node invoke policy", () => {
             ok: true,
             path: "/tmp/project",
             tarBase64,
-            tarBytes: 7,
-            sha256: "c".repeat(64),
+            ...archiveMetadata(tarBase64),
             fileCount: 2,
             entries: ["a.txt", "sub/b.txt"],
           },
@@ -516,11 +697,102 @@ describe("file-transfer node invoke policy", () => {
     },
   );
 
+  testUnlessWindows("audits dir.fetch archive bytes after a successful transfer", async () => {
+    const policy = createFileTransferNodeInvokePolicy();
+    const tarBase64 = tarEntries({
+      "a.txt": "a",
+    });
+    const { tarBytes, sha256 } = archiveMetadata(tarBase64);
+    const { ctx } = createCtx({
+      command: "dir.fetch",
+      params: { path: "/tmp/project" },
+    });
+    const invokeNode = vi.mocked(ctx.invokeNode);
+    invokeNode
+      .mockResolvedValueOnce({
+        ok: true,
+        payload: {
+          ok: true,
+          path: "/tmp/project",
+          entries: ["a.txt"],
+          fileCount: 1,
+          preflightOnly: true,
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        payload: {
+          ok: true,
+          path: "/tmp/project",
+          tarBase64,
+          tarBytes,
+          sha256,
+          fileCount: 1,
+        },
+      });
+
+    const result = await policy.handle(ctx);
+
+    expectResultFields(result, { ok: true });
+    expect(appendFileTransferAudit).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        op: "dir.fetch",
+        requestedPath: "/tmp/project",
+        canonicalPath: "/tmp/project",
+        decision: "allowed",
+        sizeBytes: tarBytes,
+        sha256,
+      }),
+    );
+  });
+
+  testUnlessWindows("rejects mismatched dir.fetch archive integrity metadata", async () => {
+    const policy = createFileTransferNodeInvokePolicy();
+    const tarBase64 = tarEntries({ "a.txt": "a" });
+    const { ctx, invokeNode } = createCtx({
+      command: "dir.fetch",
+      params: { path: "/tmp/project" },
+    });
+    invokeNode
+      .mockResolvedValueOnce({
+        ok: true,
+        payload: {
+          ok: true,
+          path: "/tmp/project",
+          entries: ["a.txt"],
+          fileCount: 1,
+          preflightOnly: true,
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        payload: {
+          ok: true,
+          path: "/tmp/project",
+          tarBase64,
+          tarBytes: 1,
+          sha256: "c".repeat(64),
+          fileCount: 1,
+        },
+      });
+
+    const result = await policy.handle(ctx);
+
+    expectResultFields(result, { ok: false, code: "ARCHIVE_SIZE_MISMATCH" });
+    expect(appendFileTransferAudit).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        op: "dir.fetch",
+        decision: "error",
+        errorCode: "ARCHIVE_SIZE_MISMATCH",
+      }),
+    );
+  });
+
   testUnlessWindows(
     "checks final dir.fetch archive entries before returning the archive",
     async () => {
       const policy = createFileTransferNodeInvokePolicy();
-      const tarBase64 = await tarEntries({
+      const tarBase64 = tarEntries({
         "ok.txt": "ok",
         ".ssh/id_rsa": "secret",
       });
@@ -553,8 +825,7 @@ describe("file-transfer node invoke policy", () => {
             ok: true,
             path: "/home/me",
             tarBase64,
-            tarBytes: 7,
-            sha256: "c".repeat(64),
+            ...archiveMetadata(tarBase64),
             fileCount: 2,
           },
         });
@@ -568,6 +839,50 @@ describe("file-transfer node invoke policy", () => {
       expect(invokeNode).toHaveBeenCalledTimes(2);
     },
   );
+
+  testUnlessWindows("rejects oversized final dir.fetch archive entry lists", async () => {
+    const policy = createFileTransferNodeInvokePolicy();
+    const tarBase64 = tarEntries(
+      Object.fromEntries(Array.from({ length: 5001 }, (_, index) => [`file-${index}.txt`, "x"])),
+    );
+    const { ctx, invokeNode } = createCtx({
+      command: "dir.fetch",
+      params: { path: "/tmp/project" },
+      pluginConfig: {
+        nodes: {
+          "node-1": {
+            allowReadPaths: ["/tmp/project", "/tmp/project/**"],
+          },
+        },
+      },
+    });
+    invokeNode
+      .mockResolvedValueOnce({
+        ok: true,
+        payload: {
+          ok: true,
+          path: "/tmp/project",
+          entries: ["file-0.txt"],
+          fileCount: 1,
+          preflightOnly: true,
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        payload: {
+          ok: true,
+          path: "/tmp/project",
+          tarBase64,
+          ...archiveMetadata(tarBase64),
+          fileCount: 5001,
+        },
+      });
+
+    const result = await policy.handle(ctx);
+
+    expectResultFields(result, { ok: false, code: "ARCHIVE_ENTRIES_TOO_MANY" });
+    expect(invokeNode).toHaveBeenCalledTimes(2);
+  });
 
   it("rejects final dir.fetch archive responses without readable archive entries", async () => {
     const policy = createFileTransferNodeInvokePolicy();

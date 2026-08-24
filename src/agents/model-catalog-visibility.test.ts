@@ -1,94 +1,299 @@
+/**
+ * Regression coverage for model catalog visibility filtering.
+ * Keeps provider/model allow and hide rules aligned with catalog row metadata.
+ */
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { resolveVisibleModelCatalog } from "./model-catalog-visibility.js";
+import {
+  resolveLogicalModelCatalogEntryState,
+  resolveLogicalVisibleModelCatalog,
+} from "./model-catalog-visibility.js";
 import type { ModelCatalogEntry } from "./model-catalog.types.js";
+import { createModelVisibilityPolicy } from "./model-visibility-policy.js";
+import { openAIModelCatalogRoutePolicy } from "./openai-model-routes.js";
 
-describe("resolveVisibleModelCatalog", () => {
-  it("can use static auth checks for gateway read-only model lists", () => {
-    const authChecker = vi.fn((provider: string) => provider === "openai");
-    const catalog: ModelCatalogEntry[] = [
-      { provider: "anthropic", id: "claude-test", name: "Claude Test" },
-      { provider: "openai", id: "gpt-test", name: "GPT Test" },
-    ];
-    const cfg = {} as OpenClawConfig;
+describe("resolveLogicalVisibleModelCatalog", () => {
+  const selectedRoute = {
+    api: "openai-chatgpt-responses" as const,
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    authRequirement: "subscription" as const,
+    requestTransportOverrides: "none" as const,
+  };
+  const platform: ModelCatalogEntry = {
+    provider: "openai",
+    id: "gpt-5.5",
+    name: "Platform GPT-5.5",
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+    contextWindow: 1_000_000,
+    reasoning: true,
+    input: ["text", "image"],
+  };
+  const chatGPT: ModelCatalogEntry = {
+    provider: "openai",
+    id: "gpt-5.5",
+    name: "ChatGPT GPT-5.5",
+    api: "openai-chatgpt-responses",
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    contextWindow: 400_000,
+    reasoning: false,
+    input: ["text"],
+  };
 
-    const result = resolveVisibleModelCatalog({
-      cfg,
-      catalog,
-      defaultProvider: "openai",
-      runtimeAuthDiscovery: false,
-      providerAuthChecker: authChecker,
+  const evaluateAvailableEntry = async (entry: ModelCatalogEntry) =>
+    resolveLogicalModelCatalogEntryState({
+      entry,
+      evaluation: { availability: true, routeResolution: null },
+      routePolicy: openAIModelCatalogRoutePolicy,
     });
 
-    expect(authChecker).toHaveBeenNthCalledWith(1, "anthropic");
-    expect(authChecker).toHaveBeenNthCalledWith(2, "openai");
-    expect(authChecker).toHaveBeenCalledTimes(2);
-    expect(result).toEqual([{ provider: "openai", id: "gpt-test", name: "GPT Test" }]);
+  it.each(["default", "configured"] as const)(
+    "hides deprecated and disabled rows from the %s picker view",
+    async (view) => {
+      const catalog: ModelCatalogEntry[] = [
+        { provider: "demo", id: "current", name: "Current", status: "available" },
+        { provider: "demo", id: "old", name: "Old", status: "deprecated" },
+        { provider: "demo", id: "off", name: "Off", status: "disabled" },
+      ];
+
+      const result = await resolveLogicalVisibleModelCatalog({
+        cfg: {} as OpenClawConfig,
+        catalog,
+        defaultProvider: "demo",
+        view,
+        routePolicy: openAIModelCatalogRoutePolicy,
+        evaluateEntry: evaluateAvailableEntry,
+      });
+
+      expect(result.map((entry) => entry.id)).toEqual(["current"]);
+    },
+  );
+
+  it("keeps deprecated and disabled rows in the all inventory", async () => {
+    const catalog: ModelCatalogEntry[] = [
+      { provider: "demo", id: "old", name: "Old", status: "deprecated" },
+      { provider: "demo", id: "off", name: "Off", status: "disabled" },
+    ];
+
+    const result = await resolveLogicalVisibleModelCatalog({
+      cfg: {} as OpenClawConfig,
+      catalog,
+      defaultProvider: "demo",
+      view: "all",
+      routePolicy: openAIModelCatalogRoutePolicy,
+      evaluateEntry: evaluateAvailableEntry,
+    });
+
+    expect(result.map((entry) => entry.id)).toEqual(["off", "old"]);
   });
 
-  it("limits visible catalog to provider wildcard entries after default discovery", () => {
-    const authChecker = vi.fn((provider: string) => provider !== "blocked");
+  it("preserves provider-owned strongest-first order through route projection", async () => {
     const catalog: ModelCatalogEntry[] = [
-      { provider: "anthropic", id: "claude-test", name: "Claude Test" },
-      { provider: "openai-codex", id: "gpt-codex-test", name: "GPT Codex Test" },
-      { provider: "vllm", id: "qwen-local", name: "Qwen Local" },
-      { provider: "blocked", id: "blocked-test", name: "Blocked Test" },
+      { provider: "openai", id: "gpt-5.4", name: "GPT-5.4", providerOrder: 3 },
+      { provider: "openai", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", providerOrder: 2 },
+      { provider: "openai", id: "gpt-5.6-sol", name: "GPT-5.6 Sol", providerOrder: 0 },
+      { provider: "openai", id: "gpt-5.6-terra", name: "GPT-5.6 Terra", providerOrder: 1 },
     ];
 
-    const cfg = {
-      agents: {
-        defaults: {
-          models: {
-            "vllm/*": {},
-            "openai-codex/*": {},
-            "blocked/*": {},
-          },
-        },
-      },
-    } as OpenClawConfig;
-
-    const result = resolveVisibleModelCatalog({
-      cfg,
+    const result = await resolveLogicalVisibleModelCatalog({
+      cfg: {} as OpenClawConfig,
       catalog,
-      defaultProvider: "anthropic",
-      runtimeAuthDiscovery: true,
-      providerAuthChecker: authChecker,
+      defaultProvider: "openai",
+      view: "all",
+      routePolicy: openAIModelCatalogRoutePolicy,
+      evaluateEntry: async (entry) =>
+        resolveLogicalModelCatalogEntryState({
+          entry,
+          evaluation: {
+            availability: true,
+            routeResolution: { kind: "routes", routes: [selectedRoute] },
+            selectedRoute,
+          },
+          routePolicy: openAIModelCatalogRoutePolicy,
+        }),
     });
 
-    expect(authChecker).toHaveBeenNthCalledWith(1, "anthropic");
-    expect(authChecker).toHaveBeenNthCalledWith(2, "openai-codex");
-    expect(authChecker).toHaveBeenNthCalledWith(3, "vllm");
-    expect(authChecker).toHaveBeenNthCalledWith(4, "blocked");
-    expect(authChecker).toHaveBeenCalledTimes(4);
-    expect(result).toEqual([
-      { provider: "openai-codex", id: "gpt-codex-test", name: "GPT Codex Test" },
-      { provider: "vllm", id: "qwen-local", name: "Qwen Local" },
+    expect(result.map((entry) => entry.id)).toEqual([
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.4",
     ]);
   });
 
-  it("does not broaden visibility when selected providers have no catalog rows", () => {
-    const authChecker = vi.fn(() => true);
-
+  it("keeps deprecated configured primary and alias-key rows visible", async () => {
+    const catalog: ModelCatalogEntry[] = [
+      { provider: "demo", id: "primary", name: "Primary", status: "deprecated" },
+      { provider: "demo", id: "alias-key", name: "Alias Key", status: "deprecated" },
+      { provider: "demo", id: "hidden", name: "Hidden", status: "deprecated" },
+    ];
     const cfg = {
       agents: {
         defaults: {
-          models: {
-            "vllm/*": {},
-          },
+          model: { primary: "demo/primary" },
+          models: { "demo/alias-key": { alias: "legacy" } },
         },
       },
     } as OpenClawConfig;
-
-    const result = resolveVisibleModelCatalog({
+    // This unit test covers configured-row retention, not runtime plugin
+    // discovery. Keep fake provider refs on the deterministic static path.
+    const policy = createModelVisibilityPolicy({
       cfg,
-      catalog: [{ provider: "anthropic", id: "claude-test", name: "Claude Test" }],
-      defaultProvider: "anthropic",
-      runtimeAuthDiscovery: true,
-      providerAuthChecker: authChecker,
+      catalog,
+      defaultProvider: "demo",
+      defaultModel: "primary",
+      allowManifestNormalization: false,
+      allowPluginNormalization: false,
     });
 
-    expect(authChecker).toHaveBeenCalledWith("anthropic");
-    expect(authChecker).toHaveBeenCalledTimes(1);
-    expect(result).toEqual([]);
+    const result = await resolveLogicalVisibleModelCatalog({
+      cfg,
+      catalog,
+      defaultProvider: "demo",
+      defaultModel: "primary",
+      view: "configured",
+      policy,
+      routePolicy: openAIModelCatalogRoutePolicy,
+      evaluateEntry: evaluateAvailableEntry,
+    });
+
+    expect(result.map((entry) => entry.id)).toEqual(["alias-key", "primary"]);
   });
+
+  it("dedupes physical routes after selected-route projection", async () => {
+    const catalog = [platform, chatGPT];
+    const result = await resolveLogicalVisibleModelCatalog({
+      cfg: {} as OpenClawConfig,
+      catalog,
+      defaultProvider: "openai",
+      view: "all",
+      routePolicy: openAIModelCatalogRoutePolicy,
+      evaluateEntry: async (entry) =>
+        resolveLogicalModelCatalogEntryState({
+          entry,
+          evaluation: {
+            availability: true,
+            routeResolution: { kind: "routes", routes: [selectedRoute] },
+            selectedRoute,
+          },
+          routePolicy: openAIModelCatalogRoutePolicy,
+        }),
+    });
+
+    expect(result).toEqual([
+      {
+        provider: "openai",
+        id: "gpt-5.5",
+        name: "ChatGPT GPT-5.5",
+        api: "openai-chatgpt-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        contextWindow: 400_000,
+        reasoning: false,
+        input: ["text"],
+      },
+    ]);
+  });
+
+  it.each([
+    ["deprecated", []],
+    ["available", ["gpt-5.5"]],
+  ] as const)("uses the selected route's %s lifecycle status", async (status, expectedIds) => {
+    const platformAvailable = { ...platform, status: "available" as const };
+    const chatGPTSelected = { ...chatGPT, status };
+    const catalog = [platformAvailable, chatGPTSelected];
+    const result = await resolveLogicalVisibleModelCatalog({
+      cfg: {} as OpenClawConfig,
+      catalog,
+      routeVariants: catalog,
+      defaultProvider: "openai",
+      routePolicy: openAIModelCatalogRoutePolicy,
+      evaluateEntry: async (entry) =>
+        resolveLogicalModelCatalogEntryState({
+          entry,
+          evaluation: {
+            availability: true,
+            routeResolution: { kind: "routes", routes: [selectedRoute] },
+            selectedRoute,
+          },
+          routePolicy: openAIModelCatalogRoutePolicy,
+        }),
+    });
+
+    expect(result.map((entry) => entry.id)).toEqual(expectedIds);
+  });
+
+  it("omits physical capabilities while managed route selection is unresolved", async () => {
+    const result = await resolveLogicalVisibleModelCatalog({
+      cfg: {} as OpenClawConfig,
+      catalog: [platform],
+      defaultProvider: "openai",
+      view: "all",
+      routePolicy: openAIModelCatalogRoutePolicy,
+      evaluateEntry: async (entry) =>
+        resolveLogicalModelCatalogEntryState({
+          entry,
+          evaluation: {
+            availability: false,
+            routeResolution: { kind: "indeterminate", defaultRuntimeId: "codex" },
+          },
+          routePolicy: openAIModelCatalogRoutePolicy,
+        }),
+    });
+
+    expect(result).toEqual([{ provider: "openai", id: "gpt-5.5", name: "Platform GPT-5.5" }]);
+  });
+
+  it.each([false, true])(
+    "projects one canonical nano row from reversed physical variants (reverse=%s)",
+    async (reverse) => {
+      const platformNano: ModelCatalogEntry = {
+        ...platform,
+        id: "gpt-5.4-nano",
+        name: "Platform Nano",
+      };
+      const chatGPTNano: ModelCatalogEntry = {
+        ...chatGPT,
+        id: "gpt-5.4-nano",
+        name: "ChatGPT Nano",
+      };
+      const routeVariants = reverse ? [platformNano, chatGPTNano] : [chatGPTNano, platformNano];
+      const evaluateEntry = vi.fn(
+        async (entry: ModelCatalogEntry, _variants: readonly ModelCatalogEntry[]) =>
+          resolveLogicalModelCatalogEntryState({
+            entry,
+            evaluation: {
+              availability: true,
+              routeResolution: { kind: "routes", routes: [selectedRoute] },
+              selectedRoute,
+            },
+            routePolicy: openAIModelCatalogRoutePolicy,
+          }),
+      );
+
+      const result = await resolveLogicalVisibleModelCatalog({
+        cfg: {} as OpenClawConfig,
+        catalog: [platformNano],
+        routeVariants,
+        defaultProvider: "openai",
+        view: "all",
+        routePolicy: openAIModelCatalogRoutePolicy,
+        evaluateEntry,
+      });
+
+      expect(evaluateEntry).toHaveBeenCalledOnce();
+      expect(evaluateEntry.mock.calls[0]?.[1]).toEqual(routeVariants);
+      expect(result).toEqual([
+        {
+          provider: "openai",
+          id: "gpt-5.4-nano",
+          name: "ChatGPT Nano",
+          api: "openai-chatgpt-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          contextWindow: 400_000,
+          reasoning: false,
+          input: ["text"],
+        },
+      ]);
+    },
+  );
 });

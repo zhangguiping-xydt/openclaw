@@ -1,24 +1,20 @@
+/** Session update helpers for skill snapshots, compaction, and lifecycle hooks. */
 import crypto from "node:crypto";
-import path from "node:path";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
-import { canExecRequestNode } from "../../agents/exec-defaults.js";
-import { buildWorkspaceSkillSnapshot, type SkillSnapshot } from "../../agents/skills.js";
-import { matchesSkillFilter } from "../../agents/skills/filter.js";
+import { clearAllCliSessions } from "../../agents/cli-session.js";
+import type { EmbeddedAgentCompactResult } from "../../agents/embedded-agent-runner/types.js";
 import {
-  getSkillsSnapshotVersion,
-  shouldRefreshSnapshotForVersion,
-} from "../../agents/skills/refresh-state.js";
-import { ensureSkillsWatcher } from "../../agents/skills/refresh.js";
-import { hydrateResolvedSkills } from "../../agents/skills/snapshot-hydration.js";
-import { stableStringify } from "../../agents/stable-stringify.js";
+  type ExecPolicyOverrides,
+  resolveNodeExecEligibility,
+} from "../../agents/exec-defaults.js";
+import { SESSION_TOTAL_TOKENS_VERSION, type SessionEntry } from "../../config/sessions.js";
+import { formatSqliteSessionFileMarker } from "../../config/sessions/legacy-sqlite-marker.js";
 import {
-  canonicalizeAbsoluteSessionFilePath,
-  resolveSessionFilePath,
-  resolveSessionFilePathOptions,
-  rewriteSessionFileForNewSessionId,
-  type SessionEntry,
-  updateSessionStore,
-} from "../../config/sessions.js";
+  patchSessionEntryCore,
+  updateSessionEntry,
+} from "../../config/sessions/session-accessor.js";
+import { resolveSessionStorePathForScope } from "../../config/sessions/session-store-path.js";
+import { projectCanonicalSessionEntryShape } from "../../config/sessions/store-entry-shape.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
   forgetActiveSessionForShutdown,
@@ -26,132 +22,69 @@ import {
 } from "../../gateway/active-sessions-shutdown-tracker.js";
 import { resolveStableSessionEndTranscript } from "../../gateway/session-transcript-files.fs.js";
 import { logVerbose } from "../../globals.js";
-import { getRemoteSkillEligibility } from "../../infra/skills-remote.js";
+import { isFastTestRuntimeEnv } from "../../infra/env.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import { runWithGatewayIndependentRootWorkContinuation } from "../../process/gateway-work-admission.js";
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
+import { getRemoteSkillEligibility } from "../../skills/runtime/remote.js";
+import { resolveReusableWorkspaceSkillSnapshot } from "../../skills/runtime/session-snapshot.js";
+import type { ReplySessionEntryHandle } from "./session-entry-handle.js";
 import { buildSessionEndHookPayload, buildSessionStartHookPayload } from "./session-hooks.js";
-export { drainFormattedSystemEvents } from "./session-system-events.js";
 
-// Warm-start resolvedSkills cache: avoids redundant buildSnapshot calls when
-// stripPersistedSkillsCache has removed resolvedSkills between turns.
-// Bounded to 10 entries to prevent unbounded growth in long-lived gateways.
-const resolvedSkillsCache = new Map<string, SkillSnapshot["resolvedSkills"]>();
-const RESOLVED_SKILLS_CACHE_MAX = 10;
-
-export function resetResolvedSkillsCacheForTests(): void {
-  resolvedSkillsCache.clear();
-}
-
-function isSensitiveConfigKey(key: string): boolean {
-  const normalized = key.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
-  return (
-    normalized.endsWith("apikey") ||
-    normalized.endsWith("token") ||
-    normalized.endsWith("secret") ||
-    normalized.endsWith("password") ||
-    normalized.endsWith("privatekey") ||
-    normalized.endsWith("clientsecret")
-  );
-}
-
-function redactSensitiveConfigValue(value: unknown): unknown {
-  if (value === undefined || value === null || value === false || value === "") {
-    return value;
-  }
-  if (typeof value === "string") {
-    return value.trim() ? "[redacted:string]" : "";
-  }
-  if (typeof value === "number") {
-    return Number.isFinite(value) && value !== 0 ? "[redacted:number]" : value;
-  }
-  if (typeof value === "boolean") {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return value.length === 0 ? [] : "[redacted:array]";
-  }
-  return "[redacted:object]";
-}
-
-function redactConfigForSkillSnapshotCache(value: unknown, stack = new WeakSet<object>()): unknown {
-  if (!value || typeof value !== "object") {
-    return value;
-  }
-  if (stack.has(value)) {
-    return "[Circular]";
-  }
-  stack.add(value);
-  try {
-    if (Array.isArray(value)) {
-      return value.map((entry) => redactConfigForSkillSnapshotCache(entry, stack));
-    }
-    const redacted: Record<string, unknown> = {};
-    for (const key of Object.keys(value as Record<string, unknown>).toSorted()) {
-      const field = (value as Record<string, unknown>)[key];
-      redacted[key] = isSensitiveConfigKey(key)
-        ? redactSensitiveConfigValue(field)
-        : redactConfigForSkillSnapshotCache(field, stack);
-    }
-    return redacted;
-  } finally {
-    stack.delete(value);
-  }
-}
-
-// Skill frontmatter `requires.config` reads the full OpenClaw config, so cache
-// reuse must follow the same boundary without putting raw secrets in Map keys.
-function fingerprintSkillSnapshotConfig(config: OpenClawConfig): string {
-  return crypto
-    .createHash("sha256")
-    .update(stableStringify(redactConfigForSkillSnapshotCache(config)))
-    .digest("hex");
-}
-
-function cacheResolvedSkills(cacheKey: string, snapshot: SkillSnapshot): SkillSnapshot {
-  resolvedSkillsCache.set(cacheKey, snapshot.resolvedSkills);
-  if (resolvedSkillsCache.size > RESOLVED_SKILLS_CACHE_MAX) {
-    const oldest = resolvedSkillsCache.keys().next().value;
-    if (oldest !== undefined) {
-      resolvedSkillsCache.delete(oldest);
-    }
-  }
-  return snapshot;
-}
-
-// nextEntry.skillsSnapshot may carry resolvedSkills (full Skill[] with
-// SKILL.md bodies) for in-turn use. The persistence layer in
-// src/config/sessions/store-load.ts strips resolvedSkills before serializing,
-// so the on-disk sessions.json stays small. The in-memory params.sessionStore
-// reference still carries the runtime cache for the rest of this turn.
 async function persistSessionEntryUpdate(params: {
+  expectedSessionId: string | undefined;
+  sessionEntryHandle?: ReplySessionEntryHandle;
   sessionStore?: Record<string, SessionEntry>;
   sessionKey?: string;
   storePath?: string;
   nextEntry: SessionEntry;
-}) {
-  if (!params.sessionStore || !params.sessionKey) {
-    return;
+  updates: Partial<SessionEntry>;
+}): Promise<SessionEntry | undefined> {
+  if (!params.sessionEntryHandle && (!params.sessionStore || !params.sessionKey)) {
+    return undefined;
   }
-  params.sessionStore[params.sessionKey] = {
-    ...params.sessionStore[params.sessionKey],
-    ...params.nextEntry,
-  };
-  if (!params.storePath) {
-    return;
+  if (!params.storePath || !params.sessionKey) {
+    if (params.sessionEntryHandle) {
+      params.sessionEntryHandle.replaceCurrent(params.nextEntry);
+    } else if (params.sessionStore && params.sessionKey) {
+      params.sessionStore[params.sessionKey] = {
+        ...params.sessionStore[params.sessionKey],
+        ...params.nextEntry,
+      };
+    }
+    return params.nextEntry;
   }
-  await updateSessionStore(params.storePath, (store) => {
-    store[params.sessionKey!] = { ...store[params.sessionKey!], ...params.nextEntry };
-  });
+  const persistedEntry = await updateSessionEntry(
+    {
+      storePath: params.storePath,
+      sessionKey: params.sessionKey,
+    },
+    (entry) => (entry.sessionId === params.expectedSessionId ? params.updates : null),
+  );
+  if (persistedEntry) {
+    if (params.sessionEntryHandle) {
+      params.sessionEntryHandle.replaceCurrent(persistedEntry);
+    } else if (params.sessionStore && params.sessionKey) {
+      params.sessionStore[params.sessionKey] = persistedEntry;
+    }
+    return persistedEntry;
+  }
+  params.sessionEntryHandle?.clearCurrent();
+  if (params.sessionStore && params.sessionKey) {
+    delete params.sessionStore[params.sessionKey];
+  }
+  return undefined;
 }
 
 function emitCompactionSessionLifecycleHooks(params: {
+  agentId?: string;
   cfg: OpenClawConfig;
   sessionKey: string;
   storePath?: string;
   previousEntry: SessionEntry;
   nextEntry: SessionEntry;
 }) {
+  const agentId = params.agentId ?? resolveAgentIdFromSessionKey(params.sessionKey);
   if (params.previousEntry.sessionId) {
     forgetActiveSessionForShutdown(params.previousEntry.sessionId);
   }
@@ -161,8 +94,8 @@ function emitCompactionSessionLifecycleHooks(params: {
       sessionKey: params.sessionKey,
       sessionId: params.nextEntry.sessionId,
       storePath: params.storePath,
-      sessionFile: params.nextEntry.sessionFile,
-      agentId: resolveAgentIdFromSessionKey(params.sessionKey),
+      sessionFile: params.sessionKey,
+      agentId,
     });
   }
   const hookRunner = getGlobalHookRunner();
@@ -171,22 +104,39 @@ function emitCompactionSessionLifecycleHooks(params: {
   }
 
   if (hookRunner.hasHooks("session_end")) {
+    const storePath =
+      agentId && params.storePath
+        ? resolveSessionStorePathForScope({
+            agentId,
+            sessionKey: params.sessionKey,
+            storePath: params.storePath,
+          })
+        : params.storePath;
     const transcript = resolveStableSessionEndTranscript({
       sessionId: params.previousEntry.sessionId,
-      storePath: params.storePath,
-      sessionFile: params.previousEntry.sessionFile,
-      agentId: resolveAgentIdFromSessionKey(params.sessionKey),
+      storePath,
+      agentId,
     });
     const payload = buildSessionEndHookPayload({
       sessionId: params.previousEntry.sessionId,
       sessionKey: params.sessionKey,
-      cfg: params.cfg,
+      agentId,
       reason: "compaction",
-      sessionFile: transcript.sessionFile,
+      sessionFile:
+        transcript.sessionFile ??
+        (agentId && storePath
+          ? formatSqliteSessionFileMarker({
+              agentId,
+              sessionId: params.previousEntry.sessionId,
+              storePath,
+            })
+          : undefined),
       transcriptArchived: transcript.transcriptArchived,
       nextSessionId: params.nextEntry.sessionId,
     });
-    void hookRunner.runSessionEnd(payload.event, payload.context).catch((err) => {
+    void runWithGatewayIndependentRootWorkContinuation(async () => {
+      await hookRunner.runSessionEnd(payload.event, payload.context);
+    }).catch((err: unknown) => {
       logVerbose(`session_end hook failed: ${String(err)}`);
     });
   }
@@ -195,38 +145,45 @@ function emitCompactionSessionLifecycleHooks(params: {
     const payload = buildSessionStartHookPayload({
       sessionId: params.nextEntry.sessionId,
       sessionKey: params.sessionKey,
-      cfg: params.cfg,
+      agentId,
       resumedFrom: params.previousEntry.sessionId,
     });
-    void hookRunner.runSessionStart(payload.event, payload.context).catch((err) => {
+    void runWithGatewayIndependentRootWorkContinuation(async () => {
+      await hookRunner.runSessionStart(payload.event, payload.context);
+    }).catch((err: unknown) => {
       logVerbose(`session_start hook failed: ${String(err)}`);
     });
   }
 }
 
-function resolvePositiveTokenCount(value: number | undefined): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value > 0
+function resolveNonNegativeTokenCount(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? Math.floor(value)
     : undefined;
 }
 
+/** Ensures a session entry has the reusable skill snapshot needed for reply runs. */
 export async function ensureSkillSnapshot(params: {
   sessionEntry?: SessionEntry;
+  sessionEntryHandle?: ReplySessionEntryHandle;
   sessionStore?: Record<string, SessionEntry>;
   sessionKey?: string;
   storePath?: string;
   sessionId?: string;
   isFirstTurnInSession: boolean;
   workspaceDir: string;
+  executionSkillsDir?: string;
   cfg: OpenClawConfig;
+  execOverrides?: ExecPolicyOverrides;
   /** If provided, only load skills with these names (for per-channel skill filtering) */
   skillFilter?: string[];
+  skillOverrides?: Record<string, boolean>;
 }): Promise<{
   sessionEntry?: SessionEntry;
   skillsSnapshot?: SessionEntry["skillsSnapshot"];
   systemSent: boolean;
 }> {
-  if (process.env.OPENCLAW_TEST_FAST === "1") {
+  if (isFastTestRuntimeEnv()) {
     // In fast unit-test runs we skip filesystem scanning, watchers, and session-store writes.
     // Dedicated skills tests cover snapshot generation behavior.
     return {
@@ -238,6 +195,7 @@ export async function ensureSkillSnapshot(params: {
 
   const {
     sessionEntry,
+    sessionEntryHandle,
     sessionStore,
     sessionKey,
     storePath,
@@ -246,64 +204,48 @@ export async function ensureSkillSnapshot(params: {
     workspaceDir,
     cfg,
     skillFilter,
+    skillOverrides,
   } = params;
 
-  let nextEntry = sessionEntry;
+  let nextEntry = sessionEntryHandle?.getCurrent() ?? sessionEntry;
   let systemSent = sessionEntry?.systemSent ?? false;
   const sessionAgentId = resolveSessionAgentId({ sessionKey, config: cfg });
+  const nodeSkillsEligibility = resolveNodeExecEligibility({
+    cfg,
+    sessionEntry,
+    sessionKey,
+    agentId: sessionAgentId,
+    execOverrides: params.execOverrides,
+  });
   const remoteEligibility = getRemoteSkillEligibility({
-    advertiseExecNode: canExecRequestNode({
-      cfg,
-      sessionEntry,
-      sessionKey,
-      agentId: sessionAgentId,
-    }),
+    advertiseExecNode: nodeSkillsEligibility.canExec,
   });
   const existingSnapshot = nextEntry?.skillsSnapshot;
-  ensureSkillsWatcher({ workspaceDir, config: cfg });
-  const snapshotVersion = getSkillsSnapshotVersion(workspaceDir);
-  const shouldRefreshSnapshot =
-    shouldRefreshSnapshotForVersion(existingSnapshot?.version, snapshotVersion) ||
-    !matchesSkillFilter(existingSnapshot?.skillFilter, skillFilter);
-  const buildSnapshot = () => {
-    return buildWorkspaceSkillSnapshot(workspaceDir, {
+  const resolveSnapshot = (snapshot: SessionEntry["skillsSnapshot"]) =>
+    resolveReusableWorkspaceSkillSnapshot({
+      workspaceDir,
+      ...(params.executionSkillsDir ? { executionSkillsDir: params.executionSkillsDir } : {}),
       config: cfg,
       agentId: sessionAgentId,
       skillFilter,
-      eligibility: { remote: remoteEligibility },
-      snapshotVersion,
+      skillOverrides,
+      eligibility: { nodeSkills: nodeSkillsEligibility, remote: remoteEligibility },
+      existingSnapshot: snapshot,
     });
-  };
+  const initialSnapshotState = resolveSnapshot(existingSnapshot);
+  const shouldRefreshSnapshot = initialSnapshotState.shouldRefresh;
 
-  const configFingerprint = fingerprintSkillSnapshotConfig(cfg);
-  const snapshotCacheKey = JSON.stringify([
-    workspaceDir,
-    snapshotVersion,
-    skillFilter,
-    sessionAgentId,
-    remoteEligibility,
-    configFingerprint,
-  ]);
-
-  const cachedRebuild = (): SkillSnapshot => {
-    if (resolvedSkillsCache.has(snapshotCacheKey)) {
-      return { resolvedSkills: resolvedSkillsCache.get(snapshotCacheKey) } as SkillSnapshot;
-    }
-    return cacheResolvedSkills(snapshotCacheKey, buildSnapshot());
-  };
-
-  const buildAndCache = (): SkillSnapshot => cacheResolvedSkills(snapshotCacheKey, buildSnapshot());
-
-  if (isFirstTurnInSession && sessionStore && sessionKey) {
+  if (isFirstTurnInSession && (sessionEntryHandle || sessionStore) && sessionKey) {
     const current = nextEntry ??
-      sessionStore[sessionKey] ?? {
+      sessionEntryHandle?.get(sessionKey) ??
+      sessionStore?.[sessionKey] ?? {
         sessionId: sessionId ?? crypto.randomUUID(),
         updatedAt: Date.now(),
       };
     const skillSnapshot =
       !current.skillsSnapshot || shouldRefreshSnapshot
-        ? buildAndCache()
-        : hydrateResolvedSkills(current.skillsSnapshot, cachedRebuild);
+        ? initialSnapshotState.snapshot
+        : resolveSnapshot(current.skillsSnapshot).snapshot;
     nextEntry = {
       ...current,
       sessionId: sessionId ?? current.sessionId ?? crypto.randomUUID(),
@@ -311,8 +253,22 @@ export async function ensureSkillSnapshot(params: {
       systemSent: true,
       skillsSnapshot: skillSnapshot,
     };
-    await persistSessionEntryUpdate({ sessionStore, sessionKey, storePath, nextEntry });
-    systemSent = true;
+    const persistedEntry = await persistSessionEntryUpdate({
+      expectedSessionId: current.sessionId,
+      sessionEntryHandle,
+      sessionStore,
+      sessionKey,
+      storePath,
+      nextEntry,
+      updates: {
+        sessionId: nextEntry.sessionId,
+        updatedAt: nextEntry.updatedAt,
+        systemSent: nextEntry.systemSent,
+        skillsSnapshot: nextEntry.skillsSnapshot,
+      },
+    });
+    nextEntry = persistedEntry;
+    systemSent = persistedEntry?.systemSent ?? systemSent;
   }
 
   const hasFreshSnapshotInEntry =
@@ -320,13 +276,13 @@ export async function ensureSkillSnapshot(params: {
     (nextEntry?.skillsSnapshot !== existingSnapshot || !shouldRefreshSnapshot);
   const skillsSnapshot =
     hasFreshSnapshotInEntry && nextEntry?.skillsSnapshot
-      ? hydrateResolvedSkills(nextEntry.skillsSnapshot, cachedRebuild)
+      ? resolveSnapshot(nextEntry.skillsSnapshot).snapshot
       : shouldRefreshSnapshot || !nextEntry?.skillsSnapshot
-        ? buildAndCache()
-        : hydrateResolvedSkills(nextEntry.skillsSnapshot, cachedRebuild);
+        ? initialSnapshotState.snapshot
+        : resolveSnapshot(nextEntry.skillsSnapshot).snapshot;
   if (
     skillsSnapshot &&
-    sessionStore &&
+    (sessionEntryHandle || sessionStore) &&
     sessionKey &&
     !isFirstTurnInSession &&
     (!nextEntry?.skillsSnapshot || shouldRefreshSnapshot)
@@ -341,13 +297,27 @@ export async function ensureSkillSnapshot(params: {
       updatedAt: Date.now(),
       skillsSnapshot,
     };
-    await persistSessionEntryUpdate({ sessionStore, sessionKey, storePath, nextEntry });
+    nextEntry = await persistSessionEntryUpdate({
+      expectedSessionId: current.sessionId,
+      sessionEntryHandle,
+      sessionStore,
+      sessionKey,
+      storePath,
+      nextEntry,
+      updates: {
+        sessionId: nextEntry.sessionId,
+        updatedAt: nextEntry.updatedAt,
+        skillsSnapshot: nextEntry.skillsSnapshot,
+      },
+    });
   }
 
   return { sessionEntry: nextEntry, skillsSnapshot, systemSent };
 }
 
+/** Increments compaction count and persists the updated session entry. */
 export async function incrementCompactionCount(params: {
+  agentId?: string;
   sessionEntry?: SessionEntry;
   sessionStore?: Record<string, SessionEntry>;
   sessionKey?: string;
@@ -357,12 +327,14 @@ export async function incrementCompactionCount(params: {
   amount?: number;
   /** Token count after compaction - if provided, updates session token counts */
   tokensAfter?: number;
-  /** Session id after compaction, when the runtime rotated transcripts. */
+  /** Session id after compaction when a context engine changed identity. */
   newSessionId?: string;
-  /** Session file after compaction, when the runtime rotated transcripts. */
-  newSessionFile?: string;
+  compactionKind?: EmbeddedAgentCompactResult["compactionKind"];
+  expectedSession?: Pick<SessionEntry, "sessionId" | "lifecycleRevision">;
+  authorize?: () => boolean;
 }): Promise<number | undefined> {
   const {
+    agentId,
     sessionEntry,
     sessionStore,
     sessionKey,
@@ -372,7 +344,9 @@ export async function incrementCompactionCount(params: {
     amount = 1,
     tokensAfter,
     newSessionId,
-    newSessionFile,
+    compactionKind,
+    expectedSession,
+    authorize,
   } = params;
   if (!sessionStore || !sessionKey) {
     return undefined;
@@ -381,95 +355,97 @@ export async function incrementCompactionCount(params: {
   if (!entry) {
     return undefined;
   }
+  const canApply = (current: SessionEntry) =>
+    (authorize?.() ?? true) &&
+    (!expectedSession ||
+      (current.sessionId === expectedSession.sessionId &&
+        current.lifecycleRevision === expectedSession.lifecycleRevision));
+  if (!canApply(entry)) {
+    return undefined;
+  }
   const incrementBy = Math.max(0, amount);
   const nextCount = (entry.compactionCount ?? 0) + incrementBy;
-  // Build update payload with compaction count and optionally updated token counts
   const updates: Partial<SessionEntry> = {
     compactionCount: nextCount,
     updatedAt: now,
   };
-  const explicitNewSessionFile = normalizeOptionalString(newSessionFile);
+  if (compactionKind === "context-engine") {
+    clearAllCliSessions(updates);
+  }
   const sessionIdChanged = Boolean(newSessionId && newSessionId !== entry.sessionId);
-  const sessionFileChanged = Boolean(
-    explicitNewSessionFile && explicitNewSessionFile !== entry.sessionFile,
-  );
   if (sessionIdChanged && newSessionId) {
     updates.sessionId = newSessionId;
-    updates.sessionFile =
-      explicitNewSessionFile ??
-      resolveCompactionSessionFile({
-        entry,
-        sessionKey,
-        storePath,
-        newSessionId,
-      });
     updates.usageFamilyKey = entry.usageFamilyKey ?? sessionKey;
     updates.usageFamilySessionIds = Array.from(
       new Set([...(entry.usageFamilySessionIds ?? []), entry.sessionId, newSessionId]),
     );
-  } else if (sessionFileChanged && explicitNewSessionFile) {
-    updates.sessionFile = explicitNewSessionFile;
   }
-  // If tokensAfter is provided, update the cached token counts to reflect post-compaction state
-  const tokensAfterCompaction = resolvePositiveTokenCount(tokensAfter);
+  const tokensAfterCompaction = resolveNonNegativeTokenCount(tokensAfter);
   if (tokensAfterCompaction !== undefined) {
     updates.totalTokens = tokensAfterCompaction;
     updates.totalTokensFresh = true;
-    // Clear input/output breakdown since we only have the total estimate after compaction
+    updates.totalTokensVersion = SESSION_TOTAL_TOKENS_VERSION;
     updates.inputTokens = undefined;
     updates.outputTokens = undefined;
     updates.cacheRead = undefined;
     updates.cacheWrite = undefined;
   } else if (incrementBy > 0) {
     updates.totalTokensFresh = false;
+    updates.totalTokensVersion = undefined;
   }
-  sessionStore[sessionKey] = {
-    ...entry,
-    ...updates,
-  };
-  if (storePath) {
-    await updateSessionStore(storePath, (store) => {
-      store[sessionKey] = {
-        ...store[sessionKey],
-        ...updates,
-      };
-    });
+  const nextEntry = projectCanonicalSessionEntryShape({ ...entry, ...updates });
+  const effectiveStorePath = storePath
+    ? resolveSessionStorePathForScope({ agentId, sessionKey, storePath })
+    : undefined;
+  if (effectiveStorePath) {
+    let committed = false;
+    const authorityRevoked = new Error("compaction accounting authority revoked");
+    let persistedEntry: SessionEntry | null;
+    try {
+      persistedEntry = await patchSessionEntryCore(
+        { ...(agentId ? { agentId } : {}), storePath: effectiveStorePath, sessionKey },
+        (current) => {
+          if (!canApply(current)) {
+            return null;
+          }
+          committed = true;
+          return updates;
+        },
+        {
+          ...(expectedSession ? {} : { fallbackEntry: nextEntry }),
+          ...(authorize
+            ? {
+                assertCommitAllowed: () => {
+                  if (!authorize()) {
+                    throw authorityRevoked;
+                  }
+                },
+              }
+            : {}),
+        },
+      );
+    } catch (error) {
+      if (error === authorityRevoked) {
+        return undefined;
+      }
+      throw error;
+    }
+    if (!committed || !persistedEntry) {
+      return undefined;
+    }
+    sessionStore[sessionKey] = persistedEntry;
+  } else {
+    sessionStore[sessionKey] = nextEntry;
   }
-  if ((sessionIdChanged || sessionFileChanged) && cfg) {
+  if (sessionIdChanged && cfg) {
     emitCompactionSessionLifecycleHooks({
+      agentId,
       cfg,
       sessionKey,
-      storePath,
+      storePath: effectiveStorePath,
       previousEntry: entry,
       nextEntry: sessionStore[sessionKey],
     });
   }
   return nextCount;
-}
-
-function resolveCompactionSessionFile(params: {
-  entry: SessionEntry;
-  sessionKey: string;
-  storePath?: string;
-  newSessionId: string;
-}): string {
-  const agentId = resolveAgentIdFromSessionKey(params.sessionKey);
-  const pathOpts = resolveSessionFilePathOptions({
-    agentId,
-    storePath: params.storePath,
-  });
-  const rewrittenSessionFile = rewriteSessionFileForNewSessionId({
-    sessionFile: params.entry.sessionFile,
-    previousSessionId: params.entry.sessionId,
-    nextSessionId: params.newSessionId,
-  });
-  const normalizedRewrittenSessionFile =
-    rewrittenSessionFile && path.isAbsolute(rewrittenSessionFile)
-      ? canonicalizeAbsoluteSessionFilePath(rewrittenSessionFile)
-      : rewrittenSessionFile;
-  return resolveSessionFilePath(
-    params.newSessionId,
-    normalizedRewrittenSessionFile ? { sessionFile: normalizedRewrittenSessionFile } : undefined,
-    pathOpts,
-  );
 }

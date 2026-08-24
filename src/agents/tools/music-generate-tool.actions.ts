@@ -1,3 +1,8 @@
+/**
+ * music_generate action helpers.
+ *
+ * Handles provider listing, task status, and duplicate-guard output for the music generation tool.
+ */
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { listSupportedMusicGenerationModes } from "../../music-generation/capabilities.js";
 import { listRuntimeMusicGenerationProviders } from "../../music-generation/runtime.js";
@@ -6,15 +11,17 @@ import {
   buildMusicGenerationTaskStatusDetails,
   buildMusicGenerationTaskStatusText,
   findActiveMusicGenerationTaskForSession,
-} from "../music-generation-task-status.js";
+  findDuplicateGuardMusicGenerationTaskForSession,
+} from "../media-generation-task-status.js";
 import {
   createMediaGenerateProviderListActionResult,
-  createMediaGenerateTaskStatusActions,
+  createMediaGenerateTaskActions,
   type MediaGenerateActionResult,
 } from "./media-generate-tool-actions-shared.js";
 
 type MusicGenerateActionResult = MediaGenerateActionResult;
 
+/** Formats provider capability details for the music generation `list` action. */
 function summarizeMusicGenerationCapabilities(
   provider: ReturnType<typeof listRuntimeMusicGenerationProviders>[number],
 ): string {
@@ -55,9 +62,10 @@ function summarizeMusicGenerationCapabilities(
   return capabilities;
 }
 
+/** Builds the music-generation provider listing result shown to the agent. */
 export function createMusicGenerateListActionResult(
   config?: OpenClawConfig,
-  options?: { agentDir?: string; authStore?: AuthProfileStore },
+  options?: { workspaceDir?: string; agentDir?: string; authStore?: AuthProfileStore },
 ): MusicGenerateActionResult {
   const providers = listRuntimeMusicGenerationProviders({ config });
   return createMediaGenerateProviderListActionResult({
@@ -65,6 +73,7 @@ export function createMusicGenerateListActionResult(
     providers,
     emptyText: "No music-generation providers are registered.",
     cfg: config,
+    workspaceDir: options?.workspaceDir,
     agentDir: options?.agentDir,
     authStore: options?.authStore,
     listModes: listSupportedMusicGenerationModes,
@@ -72,21 +81,17 @@ export function createMusicGenerateListActionResult(
   });
 }
 
-const musicGenerateTaskStatusActions = createMediaGenerateTaskStatusActions({
+/** Builds status and duplicate-guard output for music-generation tasks. */
+export const {
+  createStatusActionResult: createMusicGenerateStatusActionResult,
+  createDuplicateGuardResult: createMusicGenerateDuplicateGuardResult,
+} = createMediaGenerateTaskActions({
   inactiveText: "No active music generation task is currently running for this session.",
-  findActiveTask: (sessionKey) => findActiveMusicGenerationTaskForSession(sessionKey) ?? undefined,
+  findActiveTask: (sessionKey, agentId) =>
+    findActiveMusicGenerationTaskForSession(sessionKey, { agentId }),
+  // Prompt-only imports must not resolve duplicate guards until an action runs.
+  findDuplicateTask: (sessionKey, request) =>
+    findDuplicateGuardMusicGenerationTaskForSession(sessionKey, request),
   buildStatusText: buildMusicGenerationTaskStatusText,
   buildStatusDetails: buildMusicGenerationTaskStatusDetails,
 });
-
-export function createMusicGenerateStatusActionResult(
-  sessionKey?: string,
-): MusicGenerateActionResult {
-  return musicGenerateTaskStatusActions.createStatusActionResult(sessionKey);
-}
-
-export function createMusicGenerateDuplicateGuardResult(
-  sessionKey?: string,
-): MusicGenerateActionResult | undefined {
-  return musicGenerateTaskStatusActions.createDuplicateGuardResult(sessionKey);
-}

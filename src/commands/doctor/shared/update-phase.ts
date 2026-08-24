@@ -1,3 +1,4 @@
+// Update-phase helpers that gate doctor repairs during package swaps and convergence.
 import { isTruthyEnvValue } from "../../../infra/env.js";
 
 export const UPDATE_IN_PROGRESS_ENV = "OPENCLAW_UPDATE_IN_PROGRESS";
@@ -6,6 +7,12 @@ export const UPDATE_DEFER_CONFIGURED_PLUGIN_INSTALL_REPAIR_ENV =
   "OPENCLAW_UPDATE_DEFER_CONFIGURED_PLUGIN_INSTALL_REPAIR";
 export const UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE_ENV =
   "OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE";
+export const UPDATE_PARENT_SUPPORTS_GATEWAY_RESTART_ENV =
+  "OPENCLAW_UPDATE_PARENT_SUPPORTS_GATEWAY_RESTART";
+export const UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR_ENV =
+  "OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR";
+export const UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION_ENV =
+  "OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION";
 
 /**
  * True iff the caller is the doctor pass that runs WHILE the core package
@@ -39,10 +46,10 @@ export function isUpdatePackageSwapInProgress(env: NodeJS.ProcessEnv): boolean {
 
 /**
  * True iff configured plugin install repair should be deferred because the
- * updater guarantees a later post-core convergence pass. Shipped writable
- * parents predate the explicit defer marker but still resume after the
- * candidate doctor exits, so the candidate pass must not install payloads
- * that the parent will immediately repair again from stale in-memory records.
+ * updater guarantees a later post-core convergence pass. Older shipped
+ * parents may set only the writable-config marker. Those parents still have a
+ * post-core handoff, but their in-memory install records are stale after the
+ * candidate doctor exits, so defer payload repair to the updated child process.
  */
 export function shouldDeferConfiguredPluginInstallRepair(env: NodeJS.ProcessEnv): boolean {
   return (
@@ -68,9 +75,9 @@ export function isLegacyParentWritableUpdateDoctorPass(env: NodeJS.ProcessEnv): 
 }
 
 /**
- * True iff this newer doctor is running under an older updater. Legacy
- * updaters set only `OPENCLAW_UPDATE_IN_PROGRESS`; they do not opt into the
- * post-core convergence pass, so configured plugin repair must happen now.
+ * True iff this newer doctor is running under an older updater that does not
+ * advertise any post-core handoff marker. Those parents set only
+ * `OPENCLAW_UPDATE_IN_PROGRESS`, so configured plugin repair must happen now.
  */
 export function isLegacyPackageUpdateDoctorPass(env: NodeJS.ProcessEnv): boolean {
   return isUpdatePackageSwapInProgress(env) && !shouldDeferConfiguredPluginInstallRepair(env);

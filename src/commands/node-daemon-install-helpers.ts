@@ -1,30 +1,47 @@
-import { formatNodeServiceDescription } from "../daemon/constants.js";
+/** Node-based daemon install plan builder for managed gateway services. */
 import { resolveNodeProgramArguments } from "../daemon/program-args.js";
 import { buildNodeServiceEnvironment } from "../daemon/service-env.js";
+import type { GatewayServiceEnvironmentValueSource } from "../daemon/service-types.js";
 import {
   emitDaemonInstallRuntimeWarning,
   resolveDaemonInstallRuntimeInputs,
   resolveDaemonNodeBinDir,
 } from "./daemon-install-plan.shared.js";
 import type { DaemonInstallWarnFn } from "./daemon-install-runtime-warning.js";
-import type { NodeDaemonRuntime } from "./node-daemon-runtime.js";
+import type { GatewayDaemonRuntime } from "./daemon-runtime.js";
 
 type NodeInstallPlan = {
   programArguments: string[];
   workingDirectory?: string;
   environment: Record<string, string | undefined>;
+  environmentValueSources?: Record<string, GatewayServiceEnvironmentValueSource | undefined>;
   description?: string;
 };
 
+function buildNodeInstallEnvironmentValueSources(): Record<
+  string,
+  GatewayServiceEnvironmentValueSource | undefined
+> {
+  return {
+    OPENCLAW_GATEWAY_TOKEN: "file",
+    OPENCLAW_GATEWAY_PASSWORD: "file", // pragma: allowlist secret
+    CF_ACCESS_CLIENT_ID: "file",
+    CF_ACCESS_CLIENT_SECRET: "file", // pragma: allowlist secret
+  };
+}
+
+/** Builds launch arguments, environment, and metadata for a Node daemon service install. */
 export async function buildNodeInstallPlan(params: {
   env: Record<string, string | undefined>;
   host: string;
   port: number;
+  contextPath?: string;
   tls?: boolean;
   tlsFingerprint?: string;
   nodeId?: string;
   displayName?: string;
-  runtime: NodeDaemonRuntime;
+  installedAppsSharing?: boolean;
+  runtime: GatewayDaemonRuntime;
   devMode?: boolean;
   nodePath?: string;
   warn?: DaemonInstallWarnFn;
@@ -38,12 +55,13 @@ export async function buildNodeInstallPlan(params: {
   const { programArguments, workingDirectory } = await resolveNodeProgramArguments({
     host: params.host,
     port: params.port,
+    contextPath: params.contextPath,
     tls: params.tls,
     tlsFingerprint: params.tlsFingerprint,
     nodeId: params.nodeId,
     displayName: params.displayName,
+    installedAppsSharing: params.installedAppsSharing,
     dev: devMode,
-    runtime: params.runtime,
     nodePath,
   });
 
@@ -61,9 +79,11 @@ export async function buildNodeInstallPlan(params: {
     // node toolchain on PATH for sibling binaries like npm/pnpm when needed.
     extraPathDirs: resolveDaemonNodeBinDir(nodePath),
   });
-  const description = formatNodeServiceDescription({
-    version: environment.OPENCLAW_SERVICE_VERSION,
-  });
-
-  return { programArguments, workingDirectory, environment, description };
+  return {
+    programArguments,
+    workingDirectory,
+    environment,
+    environmentValueSources: buildNodeInstallEnvironmentValueSources(),
+    description: "OpenClaw Node Host",
+  };
 }

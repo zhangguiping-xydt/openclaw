@@ -1,8 +1,12 @@
+// Model auth overview tests cover provider auth overview rows for model listings.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NON_ENV_SECRETREF_MARKER } from "../../agents/model-auth-markers.js";
 import { resolveEnvApiKey } from "../../agents/model-auth.js";
 import { withEnv } from "../../test-utils/env.js";
-import { resolveProviderAuthOverview } from "./list.auth-overview.js";
+import {
+  formatProviderAuthProfileCounts,
+  resolveProviderAuthOverview,
+} from "./list.auth-overview.js";
 
 const persistedStores = vi.hoisted(() => new Map<string, { profiles: Record<string, unknown> }>());
 
@@ -58,7 +62,7 @@ vi.mock("../../agents/model-auth.js", () => {
         provider: string;
       }) => {
         const apiKey = resolveConfigKey(params.cfg, params.provider);
-        if (!apiKey || apiKey === "secretref-managed") {
+        if (!apiKey || apiKey === "secretref-managed" || apiKey.startsWith("oauth:")) {
           return null;
         }
         if (apiKey === "OPENAI_API_KEY") {
@@ -98,6 +102,31 @@ describe("resolveProviderAuthOverview", () => {
     vi.mocked(resolveEnvApiKey).mockClear();
   });
 
+  it("projects synthetic auth to value/source and drops runtime credential fields", () => {
+    // #104713: status callers pass their richer runtime object (credential,
+    // mode, expiresAt); the overview must not let those reach JSON output.
+    const runtimeSyntheticAuth = {
+      value: "plugin-owned",
+      source: "xAI plugin config",
+      credential: "xai-raw-credential-material",
+      mode: "api-key",
+      expiresAt: Date.now() + 60_000,
+    };
+    const overview = resolveProviderAuthOverview({
+      provider: "xai",
+      cfg: {},
+      store: { version: 1, profiles: {} } as never,
+      modelsPath: "/tmp/models.json",
+      syntheticAuth: runtimeSyntheticAuth,
+    });
+
+    expect(overview.syntheticAuth).toStrictEqual({
+      value: "plugin-owned",
+      source: "xAI plugin config",
+    });
+    expect(JSON.stringify(overview)).not.toContain("xai-raw-credential-material");
+  });
+
   it("labels token profiles that only have tokenRef", () => {
     const overview = resolveProviderAuthOverview({
       provider: "github-copilot",
@@ -121,18 +150,18 @@ describe("resolveProviderAuthOverview", () => {
   it("reports the selected agent auth store when profiles are effective", () => {
     persistedStores.set("/tmp/openclaw-agent-custom", {
       profiles: {
-        "openai-codex:peter@example.test": {},
+        "openai:peter@example.test": {},
       },
     });
     const overview = resolveProviderAuthOverview({
-      provider: "openai-codex",
+      provider: "openai",
       cfg: {},
       store: {
         version: 1,
         profiles: {
-          "openai-codex:peter@example.test": {
+          "openai:peter@example.test": {
             type: "oauth",
-            provider: "openai-codex",
+            provider: "openai",
             access: "access-token",
             refresh: "refresh-token",
             expires: Date.now() + 60_000,
@@ -152,18 +181,18 @@ describe("resolveProviderAuthOverview", () => {
   it("reports the main auth store for inherited profiles", () => {
     persistedStores.set("__main__", {
       profiles: {
-        "openai-codex:peter@example.test": {},
+        "openai:peter@example.test": {},
       },
     });
     const overview = resolveProviderAuthOverview({
-      provider: "openai-codex",
+      provider: "openai",
       cfg: {},
       store: {
         version: 1,
         profiles: {
-          "openai-codex:peter@example.test": {
+          "openai:peter@example.test": {
             type: "oauth",
-            provider: "openai-codex",
+            provider: "openai",
             access: "access-token",
             refresh: "refresh-token",
             expires: Date.now() + 60_000,
@@ -188,6 +217,18 @@ describe("resolveProviderAuthOverview", () => {
     expect(overview.effective.kind).toBe("missing");
     expect(overview.effective.detail).toBe("missing");
     expect(overview.modelsJson?.value).toContain(`marker(${NON_ENV_SECRETREF_MARKER})`);
+  });
+
+  it("treats OAuth delegation markers as effective models.json auth", () => {
+    const overview = withEnv({ OPENAI_API_KEY: undefined }, () =>
+      resolveOpenAiOverview("oauth:openai"),
+    );
+
+    expect(overview.effective).toEqual({
+      kind: "models.json",
+      detail: "marker(oauth:openai)",
+    });
+    expect(overview.modelsJson?.value).toBe("marker(oauth:openai)");
   });
 
   it("keeps env-var-shaped models.json values masked to avoid accidental plaintext exposure", () => {
@@ -255,5 +296,16 @@ describe("resolveProviderAuthOverview", () => {
         skipSetupProviderFallback: true,
       }),
     );
+  });
+});
+
+describe("formatProviderAuthProfileCounts", () => {
+  it("renders the exact count line and survives console secret redaction", async () => {
+    const { redactSensitiveText } = await import("../../logging/redact.js");
+    const line = formatProviderAuthProfileCounts({ count: 2, oauth: 1, token: 1, apiKey: 0 });
+    expect(line).toBe("2 (1 oauth, 1 token, 0 api-key)");
+    // Regression: `token=1, api_key=0)` matched the console redactor's
+    // key=value secret patterns and printed as `token=*** api_key=*** |`.
+    expect(redactSensitiveText(`profiles=${line}`)).toBe(`profiles=${line}`);
   });
 });

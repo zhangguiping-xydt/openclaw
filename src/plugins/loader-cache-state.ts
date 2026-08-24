@@ -1,6 +1,8 @@
+/** Cache state helper for plugin loader registries, in-flight loads, and warning suppression. */
 import { PluginLruCache } from "./plugin-cache-primitives.js";
 
-export class PluginLoadReentryError extends Error {
+/** Error thrown when one plugin registry cache key attempts nested loading. */
+class PluginLoadReentryError extends Error {
   readonly cacheKey: string;
 
   constructor(cacheKey: string) {
@@ -10,6 +12,7 @@ export class PluginLoadReentryError extends Error {
   }
 }
 
+/** Small registry cache with reentry detection and per-key warning memory. */
 export class PluginLoaderCacheState<T> {
   readonly #registryCache: PluginLruCache<T>;
   readonly #inFlightLoads = new Set<string>();
@@ -17,14 +20,6 @@ export class PluginLoaderCacheState<T> {
 
   constructor(defaultMaxEntries: number) {
     this.#registryCache = new PluginLruCache<T>(defaultMaxEntries);
-  }
-
-  get maxEntries(): number {
-    return this.#registryCache.maxEntries;
-  }
-
-  setMaxEntriesForTest(value?: number): void {
-    this.#registryCache.setMaxEntriesForTest(value);
   }
 
   clear(): void {

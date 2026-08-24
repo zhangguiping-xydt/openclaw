@@ -1,3 +1,6 @@
+// Text-mode status runtime barrel.
+// Kept separate from command orchestration so JSON/fast status does not import table/theme helpers.
+
 export { formatCliCommand } from "../cli/command-format.js";
 export { info } from "../globals.js";
 export { formatTimeAgo } from "../infra/format-time/format-relative.ts";
@@ -10,9 +13,9 @@ export {
 export {
   formatPluginCompatibilityNotice,
   summarizePluginCompatibility,
-} from "../plugins/status.js";
-export { getTerminalTableWidth, renderTable } from "../terminal/table.js";
-export { theme } from "../terminal/theme.js";
+} from "../plugins/status-compatibility.js";
+export { getTerminalTableWidth, renderTable } from "../../packages/terminal-core/src/table.js";
+export { theme } from "../../packages/terminal-core/src/theme.js";
 export { formatHealthChannelLines } from "./health-format.js";
 export { groupChannelIssuesByChannel } from "./status-all/channel-issues.js";
 export {
@@ -37,6 +40,7 @@ export {
   formatDuration,
   formatKTokens,
   formatPromptCacheCompact,
+  formatStatusConfigDiagnosticEntries,
   formatTokensCompact,
   shortenText,
 } from "./status.format.js";

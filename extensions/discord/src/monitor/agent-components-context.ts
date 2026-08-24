@@ -1,12 +1,13 @@
+// Discord plugin module implements agent components context behavior.
 import { ChannelType } from "discord-api-types/v10";
 import { logError } from "openclaw/plugin-sdk/logging-core";
 import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
-import {
-  type AgentComponentContext,
-  type AgentComponentInteraction,
-  type AgentComponentMessageInteraction,
-  type ComponentInteractionContext,
-  type DiscordChannelContext,
+import type {
+  AgentComponentContext,
+  AgentComponentInteraction,
+  AgentComponentMessageInteraction,
+  ComponentInteractionContext,
+  DiscordChannelContext,
 } from "./agent-components.types.js";
 import { normalizeDiscordDisplaySlug, normalizeDiscordSlug } from "./allow-list.js";
 import { resolveDiscordChannelInfoSafe } from "./channel-access.js";
@@ -62,6 +63,17 @@ export async function ackComponentInteraction(params: {
     });
   } catch (err) {
     logError(`${params.label}: failed to acknowledge interaction: ${String(err)}`);
+  }
+}
+
+export async function replyUnavailableComponentInteraction(
+  interaction: AgentComponentInteraction,
+  content: string,
+): Promise<void> {
+  try {
+    await interaction.reply({ content, ephemeral: true });
+  } catch {
+    // The interaction may have expired before its failure reply could be delivered.
   }
 }
 

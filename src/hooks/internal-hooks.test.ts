@@ -1,4 +1,7 @@
+// Internal hook tests cover dispatch for command, session, agent, and gateway hooks.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
   clearInternalHooks,
@@ -29,6 +32,7 @@ describe("hooks", () => {
   afterEach(() => {
     clearInternalHooks();
     setInternalHooksEnabled(true);
+    resetPluginRuntimeStateForTest();
   });
 
   describe("registerInternalHook", () => {
@@ -270,6 +274,23 @@ describe("hooks", () => {
         } satisfies MessageSentHookContext),
         expected: false,
       },
+      {
+        name: "returns false when content is missing",
+        event: createInternalHookEvent("message", "received", "test-session", {
+          from: "+1234567890",
+          channelId: "whatsapp",
+        }),
+        expected: false,
+      },
+      {
+        name: "returns false when content is not a string",
+        event: createInternalHookEvent("message", "received", "test-session", {
+          from: "+1234567890",
+          content: 123,
+          channelId: "whatsapp",
+        }),
+        expected: false,
+      },
     ] satisfies Array<{
       name: string;
       event: ReturnType<typeof createInternalHookEvent>;
@@ -311,6 +332,25 @@ describe("hooks", () => {
           content: "Hello world",
           channelId: "whatsapp",
         } satisfies MessageReceivedHookContext),
+        expected: false,
+      },
+      {
+        name: "returns false when content is missing",
+        event: createInternalHookEvent("message", "sent", "test-session", {
+          to: "+1234567890",
+          success: true,
+          channelId: "telegram",
+        }),
+        expected: false,
+      },
+      {
+        name: "returns false when content is not a string",
+        event: createInternalHookEvent("message", "sent", "test-session", {
+          to: "+1234567890",
+          content: false,
+          success: true,
+          channelId: "telegram",
+        }),
         expected: false,
       },
     ] satisfies Array<{
@@ -471,6 +511,22 @@ describe("hooks", () => {
 
       const keys = getRegisteredEventKeys();
       expect(keys).toStrictEqual([]);
+    });
+
+    it("removes legacy hooks from the active plugin registry", () => {
+      const active = createEmptyPluginRegistry();
+      active.legacyInternalHooks.push({
+        pluginId: "active-plugin",
+        name: "active-plugin",
+        event: "command:stop",
+        handler: vi.fn(),
+      });
+      setActivePluginRegistry(active);
+
+      clearInternalHooks();
+
+      expect(active.legacyInternalHooks).toStrictEqual([]);
+      expect(getRegisteredEventKeys()).toStrictEqual([]);
     });
   });
 });

@@ -1,14 +1,11 @@
-import type { RenderTableOptions, TableColumn } from "../terminal/table.js";
-import {
-  buildStatusChannelsTableSection,
-  buildStatusHealthSection,
-  buildStatusOverviewSection,
-  buildStatusSessionsSection,
-  buildStatusSystemEventsSection,
-  buildStatusUsageSection,
-} from "./status-all/report-sections.js";
+// Renders the standard `openclaw status` report from prebuilt section data.
+// Report data assembly stays separate so tests can validate rows without terminal formatting.
+
+import type { RenderTableOptions, TableColumn } from "../../packages/terminal-core/src/table.js";
+import { statusOverviewTableColumns } from "./status-all/report-tables.js";
 import { appendStatusReportSections } from "./status-all/text-report.js";
 
+/** Builds terminal lines for the standard status report. */
 export async function buildStatusCommandReportLines(params: {
   heading: (text: string) => string;
   muted: (text: string) => string;
@@ -17,8 +14,11 @@ export async function buildStatusCommandReportLines(params: {
   overviewRows: Array<{ Item: string; Value: string }>;
   showTaskMaintenanceHint: boolean;
   taskMaintenanceHint: string;
+  taskRegistryMigrationHint?: string | null;
+  retainedLostTaskLine?: string | null;
   pluginCompatibilityLines: string[];
   pairingRecoveryLines: string[];
+  modelSelectionLines: string[];
   securityAuditLines: string[];
   channelsColumns: readonly TableColumn[];
   channelsRows: Array<Record<string, string>>;
@@ -39,15 +39,29 @@ export async function buildStatusCommandReportLines(params: {
     heading: params.heading,
     sections: [
       {
-        ...buildStatusOverviewSection({
-          width: params.width,
-          renderTable: params.renderTable,
-          rows: params.overviewRows,
-        }),
+        kind: "table",
+        title: "Overview",
+        width: params.width,
+        renderTable: params.renderTable,
+        columns: [...statusOverviewTableColumns],
+        rows: params.overviewRows,
       },
       {
         kind: "raw",
-        body: params.showTaskMaintenanceHint ? ["", params.muted(params.taskMaintenanceHint)] : [],
+        body:
+          params.showTaskMaintenanceHint ||
+          params.taskRegistryMigrationHint ||
+          params.retainedLostTaskLine
+            ? [
+                "",
+                // Raw section keeps maintenance hints directly below the overview table.
+                ...(params.showTaskMaintenanceHint
+                  ? [params.muted(params.taskMaintenanceHint)]
+                  : []),
+                ...(params.taskRegistryMigrationHint ? [params.taskRegistryMigrationHint] : []),
+                ...(params.retainedLostTaskLine ? [params.retainedLostTaskLine] : []),
+              ]
+            : [],
         skipIfEmpty: true,
       },
       {
@@ -63,6 +77,12 @@ export async function buildStatusCommandReportLines(params: {
       },
       {
         kind: "lines",
+        title: "Model selection",
+        body: params.modelSelectionLines,
+        skipIfEmpty: true,
+      },
+      {
+        kind: "lines",
         title: "Security audit",
         body: params.securityAuditLines,
       },
@@ -73,12 +93,12 @@ export async function buildStatusCommandReportLines(params: {
             body: [params.muted("No channels configured")],
           }
         : {
-            ...buildStatusChannelsTableSection({
-              width: params.width,
-              renderTable: params.renderTable,
-              columns: params.channelsColumns,
-              rows: params.channelsRows,
-            }),
+            kind: "table",
+            title: "Channels",
+            width: params.width,
+            renderTable: params.renderTable,
+            columns: [...params.channelsColumns],
+            rows: params.channelsRows,
           },
       params.sessionsRows.length === 0
         ? {
@@ -87,31 +107,37 @@ export async function buildStatusCommandReportLines(params: {
             body: [params.muted("No sessions")],
           }
         : {
-            ...buildStatusSessionsSection({
-              width: params.width,
-              renderTable: params.renderTable,
-              columns: params.sessionsColumns,
-              rows: params.sessionsRows,
-            }),
+            kind: "table",
+            title: "Sessions",
+            width: params.width,
+            renderTable: params.renderTable,
+            columns: [...params.sessionsColumns],
+            rows: params.sessionsRows,
           },
       {
-        ...buildStatusSystemEventsSection({
-          width: params.width,
-          renderTable: params.renderTable,
-          rows: params.systemEventsRows,
-          trailer: params.systemEventsTrailer,
-        }),
+        kind: "table",
+        title: "System events",
+        width: params.width,
+        renderTable: params.renderTable,
+        columns: [{ key: "Event", header: "Event", flex: true, minWidth: 24 }],
+        rows: params.systemEventsRows ?? [],
+        trailer: params.systemEventsTrailer,
+        skipIfEmpty: true,
       },
       {
-        ...buildStatusHealthSection({
-          width: params.width,
-          renderTable: params.renderTable,
-          columns: params.healthColumns,
-          rows: params.healthRows,
-        }),
+        kind: "table",
+        title: "Health",
+        width: params.width,
+        renderTable: params.renderTable,
+        columns: [...(params.healthColumns ?? [])],
+        rows: params.healthRows ?? [],
+        skipIfEmpty: true,
       },
       {
-        ...buildStatusUsageSection({ usageLines: params.usageLines }),
+        kind: "lines",
+        title: "Usage",
+        body: params.usageLines ?? [],
+        skipIfEmpty: true,
       },
       {
         kind: "raw",

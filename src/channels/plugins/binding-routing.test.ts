@@ -1,3 +1,4 @@
+// Binding routing tests cover channel binding selection and message routing behavior.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   testing,
@@ -9,11 +10,9 @@ import type { ResolvedAgentRoute } from "../../routing/resolve-route.js";
 import {
   ensureConfiguredBindingRouteReady,
   resolveRuntimeConversationBindingRoute,
+  type RuntimeConversationBindingRouteResult,
 } from "./binding-routing.js";
-import {
-  registerStatefulBindingTargetDriver,
-  unregisterStatefulBindingTargetDriver,
-} from "./stateful-target-drivers.js";
+import { registerStatefulBindingTargetDriver } from "./stateful-target-drivers.js";
 
 function createRoute(): ResolvedAgentRoute {
   return {
@@ -62,6 +61,15 @@ function registerAdapter(record: SessionBindingRecord | null): {
 describe("runtime conversation binding route", () => {
   beforeEach(() => {
     testing.resetSessionBindingAdaptersForTests();
+  });
+
+  it("keeps the stable runtime-route result structurally assignable", () => {
+    const result: RuntimeConversationBindingRouteResult = {
+      bindingRecord: null,
+      route: createRoute(),
+    };
+
+    expect(result.bindingOwnerAvailable).toBeUndefined();
   });
 
   it("rewrites the route to a runtime-bound ACP session and touches the binding", () => {
@@ -122,6 +130,24 @@ describe("runtime conversation binding route", () => {
     expect(result.route).toBe(route);
   });
 
+  it("inspects a runtime-bound route without touching the binding", () => {
+    const { touch } = registerAdapter(createBinding());
+
+    const result = resolveRuntimeConversationBindingRoute({
+      route: createRoute(),
+      touchBinding: false,
+      conversation: {
+        channel: "demo",
+        accountId: "default",
+        conversationId: "room-1",
+      },
+    });
+
+    expect(touch).not.toHaveBeenCalled();
+    expect(result.bindingOwnerAvailable).toBe(true);
+    expect(result.boundSessionKey).toBe("agent:review:acp:session-1");
+  });
+
   it("ignores runtime bindings that target isolated cron run sessions", () => {
     const route = createRoute();
     const binding = createBinding({
@@ -146,14 +172,16 @@ describe("runtime conversation binding route", () => {
 });
 
 describe("ensureConfiguredBindingRouteReady", () => {
+  let unregisterDriver: (() => void) | undefined;
+
   afterEach(() => {
     vi.useRealTimers();
-    unregisterStatefulBindingTargetDriver("slow");
+    unregisterDriver?.();
   });
 
   it("returns a bounded failure when target readiness never settles", async () => {
     vi.useFakeTimers();
-    registerStatefulBindingTargetDriver({
+    unregisterDriver = registerStatefulBindingTargetDriver({
       id: "slow",
       ensureReady: async () => await new Promise<never>(() => {}),
       ensureSession: async () => ({

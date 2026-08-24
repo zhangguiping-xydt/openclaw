@@ -1,21 +1,28 @@
-import type { EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness-runtime";
+/**
+ * Resolves the provider/api attribution used when a local Codex runtime is
+ * backed by OpenAI auth but should still report Codex Responses semantics.
+ */
+import type { AgentHarnessAttemptParamsV2 } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { normalizeLowercaseStringOrEmpty as normalizeRuntimeId } from "openclaw/plugin-sdk/string-coerce-runtime";
+
+export type CodexLocalRuntimeAttributionParams = Pick<
+  AgentHarnessAttemptParamsV2,
+  "model" | "provider" | "runtimePlan"
+>;
 
 const OPENAI_PROVIDER_ID = "openai";
 const OPENAI_RESPONSES_API = "openai-responses";
-const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
-const OPENAI_CODEX_RESPONSES_API = "openai-codex-responses";
+const OPENAI_CODEX_RESPONSES_API = "openai-chatgpt-responses";
 
-export type CodexLocalRuntimeAttribution = {
+/** Provider identity that downstream telemetry should attribute to the local Codex turn. */
+type CodexLocalRuntimeAttribution = {
   provider: string;
   api?: string;
 };
 
-function normalizeRuntimeId(value: string | undefined): string {
-  return value?.trim().toLowerCase() ?? "";
-}
-
+/** Maps local Codex runtime plans onto the provider/api pair exposed to event projection. */
 export function resolveCodexLocalRuntimeAttribution(
-  params: EmbeddedRunAttemptParams,
+  params: CodexLocalRuntimeAttributionParams,
 ): CodexLocalRuntimeAttribution {
   const authProfileProvider = normalizeRuntimeId(
     params.runtimePlan?.auth?.authProfileProviderForAuth,
@@ -27,7 +34,7 @@ export function resolveCodexLocalRuntimeAttribution(
     normalizeRuntimeId(params.model.api) === OPENAI_RESPONSES_API
   ) {
     return {
-      provider: OPENAI_CODEX_PROVIDER_ID,
+      provider: OPENAI_PROVIDER_ID,
       api: OPENAI_CODEX_RESPONSES_API,
     };
   }

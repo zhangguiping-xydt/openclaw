@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+/** Builds runtime command arguments for gateway and node service installs. */
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -7,14 +7,11 @@ import {
   findFirstAccessibleGatewayEntrypoint,
   isGatewayDistEntrypointPath,
 } from "./gateway-entrypoint.js";
-import { isBunRuntime, isNodeRuntime } from "./runtime-binary.js";
 
 type GatewayProgramArgs = {
   programArguments: string[];
   workingDirectory?: string;
 };
-
-type GatewayRuntimePreference = "auto" | "node" | "bun";
 
 export const OPENCLAW_WRAPPER_ENV_KEY = "OPENCLAW_WRAPPER";
 
@@ -28,6 +25,8 @@ async function resolveCliEntrypointPathForService(): Promise<string> {
   const resolvedPath = await resolveRealpathSafe(normalized);
   const looksLikeDist = isGatewayDistEntrypointPath(resolvedPath);
   if (looksLikeDist) {
+    // Existing installed command lines may point at versioned pnpm realpaths.
+    // Repair prefers stable package symlink paths when they still exist.
     const preferredDistEntrypoint = await findFirstAccessibleGatewayEntrypoint(
       buildGatewayDistEntrypointCandidates(normalized, resolvedPath),
       async (candidate) => {
@@ -130,6 +129,7 @@ function appendNodeModulesBinCandidates(
   if (parts[binIndex - 1] !== "node_modules") {
     return;
   }
+  // openclaw from node_modules/.bin points at the package root sibling.
   const binName = path.basename(inputPath);
   const nodeModulesDir = parts.slice(0, binIndex).join(path.sep);
   const packageRoot = path.join(nodeModulesDir, binName);
@@ -150,36 +150,6 @@ function resolveRepoRootForDev(): string {
   return parts.slice(0, srcIndex).join(path.sep);
 }
 
-async function resolveBunPath(): Promise<string> {
-  const bunPath = await resolveBinaryPath("bun");
-  return bunPath;
-}
-
-async function resolveNodePath(): Promise<string> {
-  const nodePath = await resolveBinaryPath("node");
-  return nodePath;
-}
-
-async function resolveBinaryPath(binary: string): Promise<string> {
-  const cmd = process.platform === "win32" ? "where" : "which";
-  try {
-    const output = execFileSync(cmd, [binary], { encoding: "utf8" }).trim();
-    const resolved = output.split(/\r?\n/)[0]?.trim();
-    if (!resolved) {
-      throw new Error("empty");
-    }
-    await fs.access(resolved);
-    return resolved;
-  } catch {
-    if (binary === "bun") {
-      throw new Error("Bun not found in PATH. Install bun: https://bun.sh");
-    }
-    throw new Error(
-      "Node not found in PATH. Install Node 24 (recommended) or Node 22 LTS (22.19+).",
-    );
-  }
-}
-
 export async function resolveOpenClawWrapperPath(
   inputPath: string | undefined,
 ): Promise<string | undefined> {
@@ -193,6 +163,8 @@ export async function resolveOpenClawWrapperPath(
     if (!stat.isFile()) {
       throw new Error("not a regular file");
     }
+    // Wrappers replace the runtime executable, so require execute permission up
+    // front rather than generating a service that fails at boot.
     await fs.access(resolved, fsConstants.X_OK);
   } catch (error) {
     const detail = error instanceof Error ? ` (${error.message})` : "";
@@ -207,7 +179,6 @@ export async function resolveOpenClawWrapperPath(
 async function resolveCliProgramArguments(params: {
   args: string[];
   dev?: boolean;
-  runtime?: GatewayRuntimePreference;
   nodePath?: string;
   wrapperPath?: string;
 }): Promise<GatewayProgramArgs> {
@@ -216,77 +187,32 @@ async function resolveCliProgramArguments(params: {
     return { programArguments: [wrapperPath, ...params.args] };
   }
 
-  const execPath = process.execPath;
-  const runtime = params.runtime ?? "auto";
-
-  if (runtime === "node") {
-    const nodePath =
-      params.nodePath ?? (isNodeRuntime(execPath) ? execPath : await resolveNodePath());
-    const cliEntrypointPath = await resolveCliEntrypointPathForService();
-    return {
-      programArguments: [nodePath, cliEntrypointPath, ...params.args],
-    };
+  if (!params.nodePath?.trim()) {
+    throw new Error(
+      "No supported Node runtime was selected for the daemon. Install Node 24.15+ (recommended) or Node 22 LTS (22.22.3+), then retry.",
+    );
   }
+  const nodePath = params.nodePath;
 
-  if (runtime === "bun") {
-    if (params.dev) {
-      const repoRoot = resolveRepoRootForDev();
-      const devCliPath = path.join(repoRoot, "src", "entry.ts");
-      await fs.access(devCliPath);
-      const bunPath = isBunRuntime(execPath) ? execPath : await resolveBunPath();
-      return {
-        programArguments: [bunPath, devCliPath, ...params.args],
-        workingDirectory: repoRoot,
-      };
-    }
-
-    const bunPath = isBunRuntime(execPath) ? execPath : await resolveBunPath();
-    const cliEntrypointPath = await resolveCliEntrypointPathForService();
+  if (params.dev) {
+    const repoRoot = resolveRepoRootForDev();
+    const devCliPath = path.join(repoRoot, "src", "entry.ts");
+    await fs.access(devCliPath);
     return {
-      programArguments: [bunPath, cliEntrypointPath, ...params.args],
-    };
-  }
-
-  if (!params.dev) {
-    try {
-      const cliEntrypointPath = await resolveCliEntrypointPathForService();
-      return {
-        programArguments: [execPath, cliEntrypointPath, ...params.args],
-      };
-    } catch (error) {
-      // If running under bun or another runtime that can execute TS directly
-      if (!isNodeRuntime(execPath)) {
-        return { programArguments: [execPath, ...params.args] };
-      }
-      throw error;
-    }
-  }
-
-  // Dev mode: use bun to run TypeScript directly
-  const repoRoot = resolveRepoRootForDev();
-  const devCliPath = path.join(repoRoot, "src", "entry.ts");
-  await fs.access(devCliPath);
-
-  // If already running under bun, use current execPath
-  if (isBunRuntime(execPath)) {
-    return {
-      programArguments: [execPath, devCliPath, ...params.args],
+      programArguments: [nodePath, "--import", "tsx", devCliPath, ...params.args],
       workingDirectory: repoRoot,
     };
   }
 
-  // Otherwise resolve bun from PATH
-  const bunPath = await resolveBunPath();
+  const cliEntrypointPath = await resolveCliEntrypointPathForService();
   return {
-    programArguments: [bunPath, devCliPath, ...params.args],
-    workingDirectory: repoRoot,
+    programArguments: [nodePath, cliEntrypointPath, ...params.args],
   };
 }
 
 export async function resolveGatewayProgramArguments(params: {
   port: number;
   dev?: boolean;
-  runtime?: GatewayRuntimePreference;
   nodePath?: string;
   wrapperPath?: string;
 }): Promise<GatewayProgramArgs> {
@@ -294,7 +220,6 @@ export async function resolveGatewayProgramArguments(params: {
   return resolveCliProgramArguments({
     args: gatewayArgs,
     dev: params.dev,
-    runtime: params.runtime,
     nodePath: params.nodePath,
     wrapperPath: params.wrapperPath,
   });
@@ -303,20 +228,28 @@ export async function resolveGatewayProgramArguments(params: {
 export async function resolveNodeProgramArguments(params: {
   host: string;
   port: number;
+  contextPath?: string;
   tls?: boolean;
   tlsFingerprint?: string;
   nodeId?: string;
   displayName?: string;
+  installedAppsSharing?: boolean;
   dev?: boolean;
-  runtime?: GatewayRuntimePreference;
   nodePath?: string;
 }): Promise<GatewayProgramArgs> {
   const args = ["node", "run", "--host", params.host, "--port", String(params.port)];
-  if (params.tls || params.tlsFingerprint) {
+  if (params.tls === false && !params.tlsFingerprint) {
+    // Managed services must carry plaintext explicitly; omission would let the
+    // node runtime re-inherit TLS from the operator's global Gateway config.
+    args.push("--no-tls");
+  } else if (params.tls || params.tlsFingerprint) {
     args.push("--tls");
   }
   if (params.tlsFingerprint) {
     args.push("--tls-fingerprint", params.tlsFingerprint);
+  }
+  if (params.contextPath) {
+    args.push("--context-path", params.contextPath);
   }
   if (params.nodeId) {
     args.push("--node-id", params.nodeId);
@@ -324,10 +257,12 @@ export async function resolveNodeProgramArguments(params: {
   if (params.displayName) {
     args.push("--display-name", params.displayName);
   }
+  if (params.installedAppsSharing !== undefined) {
+    args.push(params.installedAppsSharing ? "--share-installed-apps" : "--no-share-installed-apps");
+  }
   return resolveCliProgramArguments({
     args,
     dev: params.dev,
-    runtime: params.runtime,
     nodePath: params.nodePath,
   });
 }

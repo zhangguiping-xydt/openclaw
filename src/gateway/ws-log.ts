@@ -1,14 +1,20 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+// Gateway WebSocket log formatting.
+// Redacts and compacts request/response/event metadata for console diagnostics.
+import { readStringValue } from "@openclaw/normalization-core/string-coerce";
+import { sliceUtf16Safe, truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import chalk from "chalk";
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import { isVerbose } from "../globals.js";
 import { stringifyNonErrorCause } from "../infra/errors.js";
-import { shouldLogSubsystemToConsole } from "../logging/console.js";
 import { getDefaultRedactPatterns, redactSensitiveText } from "../logging/redact.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
-import { readStringValue } from "../shared/string-coerce.js";
 import { DEFAULT_WS_SLOW_MS, getGatewayWsLogStyle } from "./ws-logging.js";
 
+/**
+ * WebSocket logging helpers for gateway request, response, and event traffic.
+ */
 const LOG_VALUE_LIMIT = 240;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const WS_LOG_REDACT_OPTIONS = {
@@ -36,6 +42,8 @@ function collectWsRestMeta(meta?: Record<string, unknown>): string[] {
     return restMeta;
   }
   for (const [key, value] of Object.entries(meta)) {
+    // Core frame fields are rendered elsewhere; this loop only emits extra
+    // metadata so logs stay compact and stable.
     if (value === undefined) {
       continue;
     }
@@ -87,21 +95,32 @@ function logWsInfoLine(params: {
   wsLog.info(tokens.join(" "));
 }
 
-export function shouldLogWs(): boolean {
-  return shouldLogSubsystemToConsole("gateway/ws");
+/** Returns true when a frame can produce console output or required timing state. */
+function shouldLogWs(direction: "in" | "out", kind: string): boolean {
+  if (isVerbose()) {
+    return wsLog.isEnabled("info");
+  }
+  if (kind === "parse-error") {
+    return wsLog.isEnabled("warn");
+  }
+  const recordsTiming = direction === "in" && kind === "req";
+  const readsTiming = direction === "out" && kind === "res";
+  return (recordsTiming || readsTiming) && wsLog.isEnabled("info");
 }
 
-export function shortId(value: string): string {
+/** Compacts long ids while keeping enough entropy for log correlation. */
+function shortId(value: string): string {
   const s = value.trim();
   if (UUID_RE.test(s)) {
-    return `${s.slice(0, 8)}…${s.slice(-4)}`;
+    return `${sliceUtf16Safe(s, 0, 8)}…${sliceUtf16Safe(s, -4)}`;
   }
   if (s.length <= 24) {
     return s;
   }
-  return `${s.slice(0, 12)}…${s.slice(-4)}`;
+  return `${sliceUtf16Safe(s, 0, 12)}…${sliceUtf16Safe(s, -4)}`;
 }
 
+/** Formats and redacts arbitrary values before they are written to gateway logs. */
 export function formatForLog(value: unknown): string {
   try {
     if (value instanceof Error) {
@@ -109,7 +128,7 @@ export function formatForLog(value: unknown): string {
       if (combined) {
         const redacted = redactSensitiveText(combined, WS_LOG_REDACT_OPTIONS);
         return redacted.length > LOG_VALUE_LIMIT
-          ? `${redacted.slice(0, LOG_VALUE_LIMIT)}...`
+          ? `${truncateUtf16Safe(redacted, LOG_VALUE_LIMIT)}...`
           : redacted;
       }
     }
@@ -125,7 +144,7 @@ export function formatForLog(value: unknown): string {
         }
         const combined = redactSensitiveText(parts.join(": ").trim(), WS_LOG_REDACT_OPTIONS);
         return combined.length > LOG_VALUE_LIMIT
-          ? `${combined.slice(0, LOG_VALUE_LIMIT)}...`
+          ? `${truncateUtf16Safe(combined, LOG_VALUE_LIMIT)}...`
           : combined;
       }
     }
@@ -138,7 +157,7 @@ export function formatForLog(value: unknown): string {
     }
     const redacted = redactSensitiveText(str, WS_LOG_REDACT_OPTIONS);
     return redacted.length > LOG_VALUE_LIMIT
-      ? `${redacted.slice(0, LOG_VALUE_LIMIT)}...`
+      ? `${truncateUtf16Safe(redacted, LOG_VALUE_LIMIT)}...`
       : redacted;
   } catch {
     return String(value);
@@ -153,7 +172,7 @@ function renderSingleErrorForLog(error: Error): string {
   if (error.message) {
     parts.push(error.message);
   }
-  const codeValue = (error as unknown as { code?: unknown }).code;
+  const codeValue = isRecord(error) ? error.code : undefined;
   const code =
     typeof codeValue === "string" || typeof codeValue === "number" ? String(codeValue) : "";
   if (code) {
@@ -164,12 +183,12 @@ function renderSingleErrorForLog(error: Error): string {
 
 function renderErrorChainForLog(error: Error): string {
   const segments: string[] = [renderSingleErrorForLog(error)];
-  let current: unknown = (error as unknown as { cause?: unknown }).cause;
+  let current: unknown = error.cause;
   let depth = 0;
   while (current !== undefined && current !== null && depth < 8) {
     if (current instanceof Error) {
       segments.push(renderSingleErrorForLog(current));
-      current = (current as unknown as { cause?: unknown }).cause;
+      current = current.cause;
     } else {
       segments.push(stringifyNonErrorCause(current));
       current = undefined;
@@ -184,9 +203,10 @@ function compactPreview(input: string, maxLen = 160): string {
   if (oneLine.length <= maxLen) {
     return oneLine;
   }
-  return `${oneLine.slice(0, Math.max(0, maxLen - 1))}…`;
+  return `${truncateUtf16Safe(oneLine, Math.max(0, maxLen - 1))}…`;
 }
 
+/** Extracts small, non-sensitive fields from agent event payloads for WS logs. */
 export function summarizeAgentEventForWsLog(payload: unknown): Record<string, unknown> {
   if (!payload || typeof payload !== "object") {
     return {};
@@ -279,10 +299,15 @@ export function summarizeAgentEventForWsLog(payload: unknown): Record<string, un
   return extra;
 }
 
-export function logWs(direction: "in" | "out", kind: string, meta?: Record<string, unknown>) {
-  if (!shouldLogSubsystemToConsole("gateway/ws")) {
+export function logWs(
+  direction: "in" | "out",
+  kind: string,
+  metaInput?: Record<string, unknown> | (() => Record<string, unknown>),
+) {
+  if (!shouldLogWs(direction, kind)) {
     return;
   }
+  const meta = typeof metaInput === "function" ? metaInput() : metaInput;
   const style = getGatewayWsLogStyle();
   if (!isVerbose()) {
     logWsOptimized(direction, kind, meta);

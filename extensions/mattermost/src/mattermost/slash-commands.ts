@@ -1,9 +1,14 @@
+// Mattermost plugin module implements slash commands behavior.
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { truncateUtf8Prefix } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { MattermostClient } from "./client.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+// Mattermost rejects command descriptions above 128 UTF-8 bytes. Keep portable
+// descriptions intact until this API boundary so other channels retain their text.
 export const MATTERMOST_SLASH_POST_METHOD = "P";
+const MATTERMOST_COMMAND_DESCRIPTION_MAX_BYTES = 128;
 
 export type MattermostSlashCommandConfig = {
   /** Enable native slash commands. "auto" resolves to false for now (opt-in). */
@@ -171,6 +176,14 @@ export const DEFAULT_COMMAND_SPECS: MattermostCommandSpec[] = [
     autoComplete: true,
     autoCompleteHint: "[on|off]",
   },
+  {
+    trigger: "oc_queue",
+    originalName: "queue",
+    description: "Adjust active-run queue behavior",
+    autoComplete: true,
+    autoCompleteHint:
+      "[steer|followup|collect|interrupt] [debounce:2s] [cap:N] [drop:old|new|summarize]",
+  },
 ];
 
 // ─── Command registration ────────────────────────────────────────────────────
@@ -261,7 +274,7 @@ export async function registerSlashCommands(params: {
   }
 
   // Fetch existing commands to avoid duplicates
-  let existing: MattermostCommandResponse[] = [];
+  let existing: MattermostCommandResponse[];
   try {
     existing = await listMattermostCommands(client, teamId);
   } catch (err) {
@@ -282,6 +295,10 @@ export async function registerSlashCommands(params: {
   const registered: MattermostRegisteredCommand[] = [];
 
   for (const spec of commands) {
+    const description = truncateUtf8Prefix(
+      spec.description,
+      MATTERMOST_COMMAND_DESCRIPTION_MAX_BYTES,
+    );
     const existingForTrigger = existingByTrigger.get(spec.trigger) ?? [];
     const ownedCommands = existingForTrigger.filter(
       (cmd) => cmd.creator_id?.trim() === normalizedCreatorUserId,
@@ -336,9 +353,9 @@ export async function registerSlashCommands(params: {
           trigger: spec.trigger,
           method: MATTERMOST_SLASH_POST_METHOD,
           url: callbackUrl,
-          description: spec.description,
+          description,
           auto_complete: spec.autoComplete,
-          auto_complete_desc: spec.description,
+          auto_complete_desc: description,
           auto_complete_hint: spec.autoCompleteHint,
         });
         registered.push({
@@ -375,9 +392,9 @@ export async function registerSlashCommands(params: {
         trigger: spec.trigger,
         method: MATTERMOST_SLASH_POST_METHOD,
         url: callbackUrl,
-        description: spec.description,
+        description,
         auto_complete: spec.autoComplete,
-        auto_complete_desc: spec.description,
+        auto_complete_desc: description,
         auto_complete_hint: spec.autoCompleteHint,
       });
       log?.(`mattermost: registered command /${spec.trigger} (id=${created.id})`);

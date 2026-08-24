@@ -1,21 +1,27 @@
+// PTY adapter tests cover PTY lifecycle and termination behavior.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   expectRealExitWinsOverSigkillFallback,
   expectWaitStaysPendingUntilSigkillFallback,
+  mockLinuxOomWrapperShell,
 } from "./test-support.js";
 
-const { spawnMock, ptyKillMock, killProcessTreeMock } = vi.hoisted(() => ({
-  spawnMock: vi.fn(),
-  ptyKillMock: vi.fn(),
-  killProcessTreeMock: vi.fn(),
-}));
+const { spawnMock, ptyKillMock, signalProcessTreeMock, signalPtySessionTreeMock } = vi.hoisted(
+  () => ({
+    spawnMock: vi.fn(),
+    ptyKillMock: vi.fn(),
+    signalProcessTreeMock: vi.fn(),
+    signalPtySessionTreeMock: vi.fn(),
+  }),
+);
 
 vi.mock("@lydell/node-pty", () => ({
   spawn: (...args: unknown[]) => spawnMock(...args),
 }));
 
 vi.mock("../../kill-tree.js", () => ({
-  killProcessTree: (...args: unknown[]) => killProcessTreeMock(...args),
+  signalProcessTree: (...args: unknown[]) => signalProcessTreeMock(...args),
+  signalPtySessionTree: (...args: unknown[]) => signalPtySessionTreeMock(...args),
 }));
 
 function createStubPty(pid = 1234) {
@@ -39,15 +45,16 @@ function createStubPty(pid = 1234) {
   };
 }
 
-function expectSpawnEnv() {
+function expectSpawnOptions() {
   const options = firstSpawnCall()[2];
-  if (options === undefined) {
-    return undefined;
-  }
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new Error("expected spawn options to be an object");
   }
-  return (options as { env?: Record<string, string> }).env;
+  return options as { env?: Record<string, string>; name?: string };
+}
+
+function expectSpawnEnv() {
+  return expectSpawnOptions().env;
 }
 
 function expectSpawnCommand() {
@@ -76,18 +83,87 @@ describe("createPtyAdapter", () => {
   beforeEach(() => {
     spawnMock.mockClear();
     ptyKillMock.mockClear();
-    killProcessTreeMock.mockClear();
+    signalProcessTreeMock.mockClear();
+    signalPtySessionTreeMock.mockClear();
     vi.useRealTimers();
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
     vi.clearAllMocks();
   });
 
-  it("forwards explicit signals to node-pty kill on non-Windows", async () => {
+  it("uses the default terminal name and child env when Windows TERM is blank", async () => {
     const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
-    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      vi.stubEnv("TERM", "   ");
+      vi.stubEnv("OPENCLAW_PTY_TEST_SENTINEL", "ambient");
+      spawnMock.mockReturnValue(createStubPty());
+
+      await createPtyAdapter({ shell: "powershell.exe", args: ["-NoLogo"] });
+
+      expect(expectSpawnOptions()).toMatchObject({
+        name: "xterm-256color",
+        env: { OPENCLAW_PTY_TEST_SENTINEL: "ambient", TERM: "xterm-256color" },
+      });
+    } finally {
+      if (originalPlatform) {
+        Object.defineProperty(process, "platform", originalPlatform);
+      }
+    }
+  });
+
+  it("prefers the explicit child TERM without merging the Windows ambient env", async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      vi.stubEnv("TERM", "ambient-term");
+      vi.stubEnv("OPENCLAW_PTY_TEST_SENTINEL", "ambient");
+      spawnMock.mockReturnValue(createStubPty());
+
+      await createPtyAdapter({
+        shell: "powershell.exe",
+        args: ["-NoLogo"],
+        env: { Term: "screen-256color", ONLY_CHILD: "yes" },
+      });
+
+      expect(expectSpawnOptions()).toMatchObject({
+        name: "screen-256color",
+        env: { TERM: "screen-256color", ONLY_CHILD: "yes" },
+      });
+      expect(expectSpawnEnv()).not.toHaveProperty("Term");
+      expect(expectSpawnEnv()).not.toHaveProperty("OPENCLAW_PTY_TEST_SENTINEL");
+    } finally {
+      if (originalPlatform) {
+        Object.defineProperty(process, "platform", originalPlatform);
+      }
+    }
+  });
+
+  it.each([
+    { name: "vt100", expected: "vt100" },
+    { name: "   ", expected: "xterm-256color" },
+  ])("uses explicit terminal name '$name' over the child env", async ({ name, expected }) => {
+    spawnMock.mockReturnValue(createStubPty());
+
+    await createPtyAdapter({
+      shell: "bash",
+      args: ["-lc", "env"],
+      name,
+      env: { TERM: "screen-256color" },
+    });
+
+    expect(expectSpawnOptions()).toMatchObject({
+      name: expected,
+      env: { TERM: expected },
+    });
+  });
+
+  it("forwards non-SIGTERM explicit signals to node-pty kill on non-Windows", async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
     try {
       spawnMock.mockReturnValue(createStubPty());
 
@@ -96,14 +172,28 @@ describe("createPtyAdapter", () => {
         args: ["-lc", "sleep 10"],
       });
 
-      adapter.kill("SIGTERM");
-      expect(ptyKillMock).toHaveBeenCalledWith("SIGTERM");
-      expect(killProcessTreeMock).not.toHaveBeenCalled();
+      adapter.kill("SIGINT");
+      expect(ptyKillMock).toHaveBeenCalledWith("SIGINT");
+      expect(signalProcessTreeMock).not.toHaveBeenCalled();
     } finally {
       if (originalPlatform) {
         Object.defineProperty(process, "platform", originalPlatform);
       }
     }
+  });
+
+  it("uses process-tree kill for graceful SIGTERM cancellation", async () => {
+    spawnMock.mockReturnValue(createStubPty(1234));
+
+    const adapter = await createPtyAdapter({
+      shell: "bash",
+      args: ["-lc", "sleep 10"],
+    });
+
+    adapter.kill("SIGTERM");
+    expect(signalPtySessionTreeMock).toHaveBeenCalledWith(1234, "SIGTERM");
+    expect(signalProcessTreeMock).not.toHaveBeenCalled();
+    expect(ptyKillMock).not.toHaveBeenCalled();
   });
 
   it("uses process-tree kill for SIGKILL by default", async () => {
@@ -115,7 +205,8 @@ describe("createPtyAdapter", () => {
     });
 
     adapter.kill();
-    expect(killProcessTreeMock).toHaveBeenCalledWith(1234);
+    expect(signalPtySessionTreeMock).toHaveBeenCalledWith(1234, "SIGKILL");
+    expect(signalProcessTreeMock).not.toHaveBeenCalled();
     expect(ptyKillMock).not.toHaveBeenCalled();
   });
 
@@ -233,16 +324,21 @@ describe("createPtyAdapter", () => {
   it("wraps Linux PTY spawns so shell children inherit higher OOM score", async () => {
     const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
     Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    const restoreLinuxShell = mockLinuxOomWrapperShell();
+    vi.resetModules();
     try {
+      const { createPtyAdapter: createLinuxPtyAdapter } = await import("./pty.js");
       const stub = createStubPty();
       spawnMock.mockReturnValue(stub);
 
-      await createPtyAdapter({
+      const adapter = await createLinuxPtyAdapter({
         shell: "bash",
         args: ["-lc", "env"],
-        env: { PATH: "/usr/bin", BASH_ENV: "/tmp/bashenv" },
+        env: { PATH: "/usr/bin", BASH_ENV: "/tmp/bashenv", TERM: "dumb" },
       });
+      expect(adapter.oomScoreWrapperSelected).toBe(true);
     } finally {
+      restoreLinuxShell();
       if (originalPlatform) {
         Object.defineProperty(process, "platform", originalPlatform);
       }
@@ -256,7 +352,7 @@ describe("createPtyAdapter", () => {
       "-lc",
       "env",
     ]);
-    expect(expectSpawnEnv()).toEqual({ PATH: "/usr/bin" });
+    expect(expectSpawnEnv()).toEqual({ PATH: "/usr/bin", TERM: "xterm-256color" });
   });
 
   it("passes explicit env overrides as strings", async () => {
@@ -266,13 +362,14 @@ describe("createPtyAdapter", () => {
     await createPtyAdapter({
       shell: "bash",
       args: ["-lc", "env"],
+      name: "xterm-256color",
       env: { FOO: "bar", COUNT: "12", DROP_ME: undefined },
     });
 
-    expect(expectSpawnEnv()).toEqual({ FOO: "bar", COUNT: "12" });
+    expect(expectSpawnEnv()).toEqual({ FOO: "bar", COUNT: "12", TERM: "xterm-256color" });
   });
 
-  it("does not pass a signal to node-pty on Windows", async () => {
+  it("does not pass non-SIGTERM explicit signals to node-pty on Windows", async () => {
     const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
     Object.defineProperty(process, "platform", { value: "win32", configurable: true });
     try {
@@ -283,9 +380,9 @@ describe("createPtyAdapter", () => {
         args: ["-NoLogo"],
       });
 
-      adapter.kill("SIGTERM");
+      adapter.kill("SIGINT");
       expect(ptyKillMock).toHaveBeenCalledWith(undefined);
-      expect(killProcessTreeMock).not.toHaveBeenCalled();
+      expect(signalProcessTreeMock).not.toHaveBeenCalled();
     } finally {
       if (originalPlatform) {
         Object.defineProperty(process, "platform", originalPlatform);
@@ -305,7 +402,8 @@ describe("createPtyAdapter", () => {
       });
 
       adapter.kill("SIGKILL");
-      expect(killProcessTreeMock).toHaveBeenCalledWith(4567);
+      expect(signalPtySessionTreeMock).toHaveBeenCalledWith(4567, "SIGKILL");
+      expect(signalProcessTreeMock).not.toHaveBeenCalled();
       expect(ptyKillMock).not.toHaveBeenCalled();
     } finally {
       if (originalPlatform) {

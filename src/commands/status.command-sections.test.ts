@@ -1,8 +1,12 @@
+// Status command section tests cover footer, health, and report section rendering.
 import { describe, expect, it } from "vitest";
 import type { HealthSummary } from "./health.js";
 import {
   buildStatusFooterLines,
+  buildStatusAgentsValue,
   buildStatusHealthRows,
+  buildStatusHeartbeatValue,
+  buildStatusModelSelectionLines,
   buildStatusPairingRecoveryLines,
   buildStatusPluginCompatibilityLines,
   buildStatusSecurityAuditLines,
@@ -13,6 +17,62 @@ import {
 } from "./status.command-sections.ts";
 
 describe("status.command-sections", () => {
+  it("does not label an arbitrary agent as the default in an explicit fleet", () => {
+    expect(
+      buildStatusAgentsValue({
+        agentStatus: {
+          defaultId: null,
+          bootstrapPendingCount: 0,
+          totalSessions: 0,
+          agents: [
+            {
+              id: "alpha",
+              workspaceDir: "/tmp/alpha",
+              bootstrapPending: false,
+              sessionsPath: "/tmp/alpha/sessions.json",
+              sessionsCount: 0,
+              lastUpdatedAt: null,
+              lastActiveAgeMs: null,
+            },
+            {
+              id: "beta",
+              workspaceDir: "/tmp/beta",
+              bootstrapPending: false,
+              sessionsPath: "/tmp/beta/sessions.json",
+              sessionsCount: 0,
+              lastUpdatedAt: null,
+              lastActiveAgeMs: null,
+            },
+          ],
+        },
+        formatTimeAgo: () => "now",
+      }),
+    ).toBe("2 · no workspaces bootstrapping · sessions 0");
+  });
+
+  it("shows when heartbeat is waiting for a delivery route", () => {
+    expect(
+      buildStatusHeartbeatValue({
+        summary: {
+          heartbeat: {
+            defaultAgentId: "main",
+            agents: [
+              {
+                agentId: "main",
+                enabled: true,
+                every: "30m",
+                everyMs: 1_800_000,
+                waitingForRoute: true,
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(
+      "30m (main; waiting for delivery route — set commands.ownerAllowFrom or channel allowFrom, or heartbeat.target)",
+    );
+  });
+
   it("formats security audit lines with finding caps and follow-up commands", () => {
     const lines = buildStatusSecurityAuditLines({
       securityAudit: {
@@ -69,6 +129,9 @@ describe("status.command-sections", () => {
           remainingTokens: null,
           percentUsed: null,
           contextTokens: null,
+          configuredModel: "openai/gpt-5.4",
+          selectedModel: "openai/gpt-5.4",
+          modelSelectionReason: null,
           flags: [],
         },
         {
@@ -77,12 +140,15 @@ describe("status.command-sections", () => {
           updatedAt: 2,
           age: 7_000,
           model: "gpt-5.5",
-          runtime: "OpenClaw Pi Default",
+          runtime: "OpenClaw Default",
           totalTokens: null,
           totalTokensFresh: false,
           remainingTokens: null,
           percentUsed: null,
           contextTokens: null,
+          configuredModel: "openai/gpt-5.5",
+          selectedModel: "openai/gpt-5.5",
+          modelSelectionReason: null,
           flags: [],
         },
       ],
@@ -109,7 +175,7 @@ describe("status.command-sections", () => {
         Kind: "cron",
         Age: "7000ms",
         Model: "gpt-5.5",
-        Runtime: "OpenClaw Pi Default",
+        Runtime: "OpenClaw Default",
         Tokens: "12k",
         Cache: "cache ok",
       },
@@ -126,6 +192,78 @@ describe("status.command-sections", () => {
     });
 
     expect(emptyRows).toEqual([]);
+  });
+
+  it("shows configured default and selected session model when they differ", () => {
+    const lines = buildStatusModelSelectionLines({
+      recent: [
+        {
+          key: "agent:main:telegram:chat-1",
+          kind: "direct",
+          updatedAt: 1,
+          age: 5_000,
+          model: "deepseek-v4-flash",
+          configuredModel: "zhipu/glm-4.5-air",
+          selectedModel: "deepseek/deepseek-v4-flash",
+          modelSelectionReason: "session override",
+          runtime: "OpenClaw Default",
+          totalTokens: null,
+          totalTokensFresh: false,
+          remainingTokens: null,
+          percentUsed: null,
+          contextTokens: null,
+          flags: [],
+        },
+      ],
+      shortenText: (value) => value,
+      warn: (value) => `warn(${value})`,
+      muted: (value) => `muted(${value})`,
+    });
+
+    expect(lines).toEqual([
+      "warn(Session agent:main:telegram:chat-1 is pinned to deepseek/deepseek-v4-flash; config primary zhipu/glm-4.5-air will apply to new/unpinned sessions.)",
+      "  Configured default: zhipu/glm-4.5-air",
+      "  Session selected: deepseek/deepseek-v4-flash",
+      "  Reason: session override",
+      "  Clear with: /model default",
+      "  Docs: https://docs.openclaw.ai/concepts/models#selection-source-and-fallback-behavior",
+    ]);
+  });
+
+  it("shows fallback-specific wording for auto-fallback model mismatches", () => {
+    const lines = buildStatusModelSelectionLines({
+      recent: [
+        {
+          key: "agent:main:telegram:chat-2",
+          kind: "direct",
+          updatedAt: 1,
+          age: 5_000,
+          model: "qwen3.6-blue",
+          configuredModel: "minimax/MiniMax-M3",
+          selectedModel: "ollama/qwen3.6-blue:35b-a3b",
+          modelSelectionReason: "fallback selected",
+          runtime: "OpenClaw Default",
+          totalTokens: null,
+          totalTokensFresh: false,
+          remainingTokens: null,
+          percentUsed: null,
+          contextTokens: null,
+          flags: [],
+        },
+      ],
+      shortenText: (value) => value,
+      warn: (value) => `warn(${value})`,
+      muted: (value) => `muted(${value})`,
+    });
+
+    expect(lines).toEqual([
+      "warn(Session agent:main:telegram:chat-2 is running ollama/qwen3.6-blue:35b-a3b (auto fallback); config primary is minimax/MiniMax-M3.)",
+      "  Configured default: minimax/MiniMax-M3",
+      "  Session selected: ollama/qwen3.6-blue:35b-a3b",
+      "  Reason: fallback selected",
+      "  Action: check provider availability or retry with /model",
+      "  Docs: https://docs.openclaw.ai/concepts/models#selection-source-and-fallback-behavior",
+    ]);
   });
 
   it("maps health channel detail lines into status rows", () => {
@@ -159,6 +297,7 @@ describe("status.command-sections", () => {
         durationMs: 42,
         eventLoop: {
           degraded: true,
+          degradedSinceMs: 180_000,
           reasons: ["event_loop_delay"],
           intervalMs: 62_000,
           delayP99Ms: 61_000,
@@ -178,7 +317,8 @@ describe("status.command-sections", () => {
       {
         Item: "Event loop",
         Status: "warn(WARN)",
-        Detail: "reasons event_loop_delay · max 62000ms · p99 61000ms · util 1 · cpu 1",
+        Detail:
+          "degraded for 3m · reasons event_loop_delay · max 62000ms · p99 61000ms · util 1 · cpu 1",
       },
     ]);
   });

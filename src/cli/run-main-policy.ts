@@ -1,4 +1,10 @@
+// Main CLI startup policy helpers for fast paths, proxy startup, aliases, and missing commands.
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalLowercaseString,
+} from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { consumeRootOptionToken, FLAG_TERMINATOR } from "../infra/cli-root-options.js";
 import {
   resolveManifestCommandAliasOwnerInRegistry,
   resolveManifestToolOwnerInRegistry,
@@ -6,11 +12,8 @@ import {
   type PluginManifestCommandAliasRegistry,
   type PluginManifestToolOwnerRecord,
 } from "../plugins/manifest-command-aliases.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalLowercaseString,
-} from "../shared/string-coerce.js";
 import { resolveCliArgvInvocation } from "./argv-invocation.js";
+import { isSimpleCommandHelpInvocation } from "./argv.js";
 import {
   resolveCliCommandPathPolicy,
   resolveCliNetworkProxyPolicy,
@@ -20,6 +23,7 @@ import { getCoreCliParentDefaultHelpCommands } from "./program/core-command-desc
 import { getSubCliParentDefaultHelpCommands } from "./program/subcli-descriptors.js";
 
 const ROOT_HELP_ALIASES = new Set(["tools"]);
+const SETUP_ONBOARD_CONFIGURE_HELP_COMMANDS = new Set(["setup", "onboard", "configure"]);
 const BARE_PARENT_DEFAULT_HELP_COMMANDS = new Set([
   ...getCoreCliParentDefaultHelpCommands(),
   ...getSubCliParentDefaultHelpCommands(),
@@ -34,21 +38,41 @@ function isBareParentDefaultHelpArgv(argv: string[]): boolean {
 }
 
 export function rewriteUpdateFlagArgv(argv: string[]): string[] {
-  const index = argv.indexOf("--update");
-  if (index === -1) {
+  // Preserve the old root --update spelling by rewriting before Commander registration.
+  // Only rewrite --update while scanning the root-option prefix; once a command
+  // or `--` appears, later --update tokens belong to that command's arguments.
+  const updateIndex = argv.indexOf("--update");
+  if (updateIndex === -1) {
     return argv;
   }
 
-  const next = [...argv];
-  next.splice(index, 1, "update");
-  return next;
+  for (let i = 2; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!arg || arg === FLAG_TERMINATOR) {
+      return argv;
+    }
+    if (i === updateIndex) {
+      const next = [...argv];
+      next.splice(updateIndex, 1, "update");
+      return next;
+    }
+    const consumed = consumeRootOptionToken(argv, i);
+    if (consumed > 0) {
+      i += consumed - 1;
+      continue;
+    }
+    if (!arg.startsWith("-")) {
+      return argv;
+    }
+  }
+  return argv;
 }
 
 export function shouldEnsureCliPath(argv: string[]): boolean {
   const invocation = resolveCliArgvInvocation(argv);
   if (
     invocation.hasHelpOrVersion ||
-    shouldStartCrestodianForBareRoot(argv) ||
+    shouldHandleBareRoot(argv) ||
     isBareParentDefaultHelpArgv(argv)
   ) {
     return false;
@@ -73,33 +97,19 @@ export function shouldUseRootHelpFastPath(
   );
 }
 
-export function shouldUseBrowserHelpFastPath(
+export function shouldUseSetupOnboardConfigureHelpFastPath(
   argv: string[],
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   if (env.OPENCLAW_DISABLE_CLI_STARTUP_HELP_FAST_PATH === "1") {
     return false;
   }
-  const invocation = resolveCliArgvInvocation(argv);
-  return (
-    invocation.commandPath.length === 1 &&
-    invocation.commandPath[0] === "browser" &&
-    invocation.hasHelpOrVersion
-  );
+  return isSimpleCommandHelpInvocation(argv, SETUP_ONBOARD_CONFIGURE_HELP_COMMANDS);
 }
 
-export function shouldStartCrestodianForBareRoot(argv: string[]): boolean {
+export function shouldHandleBareRoot(argv: string[]): boolean {
   const invocation = resolveCliArgvInvocation(argv);
   return invocation.commandPath.length === 0 && !invocation.hasHelpOrVersion;
-}
-
-export function shouldStartCrestodianForModernOnboard(argv: string[]): boolean {
-  const invocation = resolveCliArgvInvocation(argv);
-  return (
-    invocation.commandPath[0] === "onboard" &&
-    argv.includes("--modern") &&
-    !invocation.hasHelpOrVersion
-  );
 }
 
 export function shouldStartProxyForCli(argv: string[]): boolean {

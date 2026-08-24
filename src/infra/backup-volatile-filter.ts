@@ -1,3 +1,4 @@
+// Filters volatile files from backup manifests.
 import path from "node:path";
 
 /**
@@ -12,6 +13,8 @@ import path from "node:path";
  */
 
 const STATE_TRANSIENT_EXTENSIONS = new Set([".sock", ".pid", ".tmp"]);
+const SQLITE_REINDEX_TRANSIENT_PATH_PATTERN =
+  /(?:^|\/)(?:[^/]+\.sqlite\.reindex-lock\.sqlite|[^/]+\.sqlite\.(?:backup|memory-reindex|tmp)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:-wal|-shm|-journal)?$/iu;
 
 function normalizePosix(input: string): string {
   if (!input) {
@@ -39,6 +42,11 @@ function hasExtensionInSet(filePosix: string, extensions: ReadonlySet<string>): 
   return extensions.has(path.posix.extname(filePosix).toLowerCase());
 }
 
+export function isTransientSqliteBackupPath(filePath: string): boolean {
+  const normalizedPath = normalizePosix(filePath);
+  return SQLITE_REINDEX_TRANSIENT_PATH_PATTERN.test(normalizedPath);
+}
+
 function isAgentSessionTranscriptPath(filePosix: string, stateDirPosix: string): boolean {
   const agentsRoot = path.posix.join(stateDirPosix, "agents");
   if (!isUnder(filePosix, agentsRoot)) {
@@ -59,7 +67,7 @@ function filePathCandidates(input: string): string[] {
   return [normalized, normalizePosix(`/${normalized}`)];
 }
 
-export type VolatileFilterPlan = {
+type VolatileFilterPlan = {
   /** Canonical state directories the filter should treat as volatile anchors. */
   stateDirs: string[];
 };
@@ -73,7 +81,7 @@ export type VolatileFilterPlan = {
  *   - `{stateDir}/agents/<agentId>/sessions/**`/`*.{jsonl,log}`
  *   - `{stateDir}/cron/runs/**`/`*.{jsonl,log}`
  *   - `{stateDir}/logs/**`/`*.{jsonl,log}`
- *   - `{stateDir}/{delivery-queue,session-delivery-queue}/**`/`*.{json,tmp}`
+ *   - `{stateDir}/{delivery-queue,session-delivery-queue}/**`/`*.{json,delivered,tmp}`
  *   - `{stateDir}/**`/`*.{sock,pid,tmp}`
  */
 export function isVolatileBackupPath(absolutePath: string, plan: VolatileFilterPlan): boolean {
@@ -113,7 +121,10 @@ export function isVolatileBackupPath(absolutePath: string, plan: VolatileFilterP
 
       for (const queueDir of ["delivery-queue", "session-delivery-queue"]) {
         const queueRoot = path.posix.join(stateDirPosix, queueDir);
-        if (isUnder(filePosix, queueRoot) && hasExtension(filePosix, [".json", ".tmp"])) {
+        if (
+          isUnder(filePosix, queueRoot) &&
+          hasExtension(filePosix, [".json", ".delivered", ".tmp"])
+        ) {
           return true;
         }
       }

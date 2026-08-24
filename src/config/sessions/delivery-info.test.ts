@@ -1,24 +1,58 @@
+// Session delivery info tests cover persisted delivery metadata.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { normalizeLegacySessionEntryDelivery } from "../../infra/state-migrations.legacy-session-store.js";
+import type { ChannelRouteRef } from "../../plugin-sdk/channel-route.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createSessionConversationTestRegistry } from "../../test-utils/session-conversation-registry.js";
-import type { SessionEntry } from "./types.js";
+import type { DeliveryContext } from "../../utils/delivery-context.types.js";
+import { parseSessionThreadInfo } from "./thread-info.js";
+import type { SessionEntry, SessionOrigin } from "./types.js";
 
-const storeState = vi.hoisted(() => ({
-  store: {} as Record<string, SessionEntry>,
-  stores: {} as Record<string, Record<string, SessionEntry>>,
-}));
+type SessionEntryFixture = SessionEntry & {
+  route?: ChannelRouteRef;
+  deliveryContext?: DeliveryContext;
+  origin?: SessionOrigin;
+  channel?: string;
+  lastChannel?: string;
+  lastTo?: string;
+  lastAccountId?: string;
+  lastThreadId?: string | number;
+};
+
+const storeState = vi.hoisted(() => {
+  const state = {
+    store: {} as Record<string, SessionEntryFixture>,
+    stores: {} as Record<string, Record<string, SessionEntryFixture>>,
+    // Mirrors the accessor view contract: raw exact-key get, enumeration only via entries().
+    openSessionEntryReadView: vi.fn((scope: { storePath?: string }) => {
+      const store = state.stores[scope.storePath ?? ""] ?? state.store;
+      return {
+        get: (sessionKey: string) =>
+          Object.hasOwn(store, sessionKey)
+            ? normalizeLegacySessionEntryDelivery(store[sessionKey] as SessionEntry)
+            : undefined,
+        entries: () =>
+          Object.entries(store).map(([sessionKey, entry]) => ({
+            sessionKey,
+            entry: normalizeLegacySessionEntryDelivery(entry),
+          })),
+      };
+    }),
+  };
+  return state;
+});
 
 vi.mock("../io.js", () => ({
   getRuntimeConfig: () => ({}),
 }));
 
 vi.mock("./paths.js", () => ({
-  resolveStorePath: (_store?: string, opts?: { agentId?: string }) =>
+  resolveSessionStorePathCore: (_store?: string, opts?: { agentId?: string }) =>
     opts?.agentId === "worker" ? "/tmp/worker-sessions.json" : "/tmp/sessions.json",
 }));
 
-vi.mock("./store.js", () => ({
-  loadSessionStore: (storePath: string) => storeState.stores[storePath] ?? storeState.store,
+vi.mock("./session-accessor.js", () => ({
+  openSessionEntryReadView: storeState.openSessionEntryReadView,
 }));
 
 vi.mock("./targets.js", () => ({
@@ -30,22 +64,30 @@ vi.mock("./targets.js", () => ({
 }));
 
 let extractDeliveryInfo: typeof import("./delivery-info.js").extractDeliveryInfo;
-let parseSessionThreadInfo: typeof import("./delivery-info.js").parseSessionThreadInfo;
 
-const buildEntry = (deliveryContext: SessionEntry["deliveryContext"]): SessionEntry => ({
+const buildEntry = (deliveryContext: DeliveryContext): SessionEntryFixture => ({
   sessionId: "session-1",
   updatedAt: Date.now(),
   deliveryContext,
 });
 
+function createMixedCaseMatrixDelivery(): DeliveryContext {
+  return { channel: "matrix", to: "room:!MixedCase:Example.Org", accountId: "matrix-account" };
+}
+
+function createTelegramUserDelivery(): DeliveryContext {
+  return { channel: "telegram", to: "telegram:user-123", accountId: "default" };
+}
+
 beforeAll(async () => {
-  ({ extractDeliveryInfo, parseSessionThreadInfo } = await import("./delivery-info.js"));
+  ({ extractDeliveryInfo } = await import("./delivery-info.js"));
 });
 
 beforeEach(() => {
   setActivePluginRegistry(createSessionConversationTestRegistry());
   storeState.store = {};
   storeState.stores = {};
+  storeState.openSessionEntryReadView.mockClear();
 });
 
 describe("extractDeliveryInfo", () => {
@@ -85,35 +127,26 @@ describe("extractDeliveryInfo", () => {
     });
   });
 
-  it("returns deliveryContext for direct session keys", () => {
-    const sessionKey = "agent:main:webchat:dm:user-123";
-    storeState.store[sessionKey] = buildEntry({
-      channel: "webchat",
-      to: "webchat:user-123",
-      accountId: "default",
-    });
+  it("reads borrowed accessor views for direct session keys", () => {
+    const sessionKey = "agent:main:telegram:dm:user-123";
+    storeState.store[sessionKey] = buildEntry(createTelegramUserDelivery());
 
     const result = extractDeliveryInfo(sessionKey);
 
-    expect(result).toEqual({
-      deliveryContext: {
-        channel: "webchat",
-        to: "webchat:user-123",
-        accountId: "default",
-      },
-      threadId: undefined,
+    expect(result.deliveryContext?.to).toBe("telegram:user-123");
+    expect(storeState.openSessionEntryReadView).toHaveBeenCalledWith({
+      storePath: "/tmp/sessions.json",
     });
   });
 
-  it("does not build the normalized index when an exact routable key is present", () => {
-    const sessionKey = "agent:main:webchat:dm:user-123";
+  it("does not enumerate the store when an exact routable key is present", () => {
+    const sessionKey = "agent:main:telegram:dm:user-123";
+    // Enumeration trap: the accessor-view mock lists rows via Object.entries, so
+    // building the normalized fallback index on this cheap path throws here and
+    // extractDeliveryInfo would return no delivery context.
     storeState.store = new Proxy(
       {
-        [sessionKey]: buildEntry({
-          channel: "webchat",
-          to: "webchat:user-123",
-          accountId: "default",
-        }),
+        [sessionKey]: buildEntry(createTelegramUserDelivery()),
       },
       {
         ownKeys() {
@@ -125,11 +158,19 @@ describe("extractDeliveryInfo", () => {
     const result = extractDeliveryInfo(sessionKey);
 
     expect(result).toEqual({
-      deliveryContext: {
-        channel: "webchat",
-        to: "webchat:user-123",
-        accountId: "default",
-      },
+      deliveryContext: createTelegramUserDelivery(),
+      threadId: undefined,
+    });
+  });
+
+  it("returns deliveryContext for direct session keys", () => {
+    const sessionKey = "agent:main:telegram:dm:user-123";
+    storeState.store[sessionKey] = buildEntry(createTelegramUserDelivery());
+
+    const result = extractDeliveryInfo(sessionKey);
+
+    expect(result).toEqual({
+      deliveryContext: createTelegramUserDelivery(),
       threadId: undefined,
     });
   });
@@ -156,12 +197,12 @@ describe("extractDeliveryInfo", () => {
   });
 
   it("looks up deliveryContext in per-agent session stores", () => {
-    const sessionKey = "agent:worker:webchat:dm:user-456";
+    const sessionKey = "agent:worker:telegram:dm:user-456";
     storeState.stores["/tmp/sessions.json"] = {};
     storeState.stores["/tmp/worker-sessions.json"] = {
       [sessionKey]: buildEntry({
-        channel: "webchat",
-        to: "webchat:user-456",
+        channel: "telegram",
+        to: "telegram:user-456",
         accountId: "worker-account",
       }),
     };
@@ -170,8 +211,8 @@ describe("extractDeliveryInfo", () => {
 
     expect(result).toEqual({
       deliveryContext: {
-        channel: "webchat",
-        to: "webchat:user-456",
+        channel: "telegram",
+        to: "telegram:user-456",
         accountId: "worker-account",
       },
       threadId: undefined,
@@ -179,7 +220,7 @@ describe("extractDeliveryInfo", () => {
   });
 
   it("continues across per-agent stores until it finds a routable deliveryContext", () => {
-    const sessionKey = "agent:shadow:webchat:dm:user-789";
+    const sessionKey = "agent:shadow:telegram:dm:user-789";
     storeState.stores["/tmp/sessions.json"] = {
       [sessionKey]: {
         sessionId: "stale-shadow",
@@ -188,8 +229,8 @@ describe("extractDeliveryInfo", () => {
     };
     storeState.stores["/tmp/shadow-sessions.json"] = {
       [sessionKey]: buildEntry({
-        channel: "webchat",
-        to: "webchat:user-789",
+        channel: "telegram",
+        to: "telegram:user-789",
         accountId: "shadow-account",
       }),
     };
@@ -198,8 +239,8 @@ describe("extractDeliveryInfo", () => {
 
     expect(result).toEqual({
       deliveryContext: {
-        channel: "webchat",
-        to: "webchat:user-789",
+        channel: "telegram",
+        to: "telegram:user-789",
         accountId: "shadow-account",
       },
       threadId: undefined,
@@ -213,8 +254,8 @@ describe("extractDeliveryInfo", () => {
       channel: "telegram",
       to: "group:98765",
       accountId: "main",
+      threadId: "55",
     });
-    storeState.store[baseKey].lastThreadId = "55";
 
     const result = extractDeliveryInfo(topicKey);
 
@@ -254,8 +295,9 @@ describe("extractDeliveryInfo", () => {
   });
 
   it("derives delivery info from stored last route metadata when deliveryContext is missing", () => {
-    const sessionKey = "agent:main:matrix:channel:!lowercased:example.org";
-    storeState.store[sessionKey] = {
+    const sessionKey = "agent:main:matrix:channel:!MixedCase:example.org";
+    const legacyKey = "agent:main:matrix:channel:!mixedcase:example.org";
+    storeState.store[legacyKey] = {
       sessionId: "session-1",
       updatedAt: Date.now(),
       origin: {
@@ -312,11 +354,7 @@ describe("extractDeliveryInfo", () => {
     storeState.store[sessionKey] = {
       sessionId: "direct-routable-session",
       updatedAt: Date.now() - 1_000,
-      deliveryContext: {
-        channel: "matrix",
-        to: "room:!MixedCase:Example.Org",
-        accountId: "matrix-account",
-      },
+      deliveryContext: createMixedCaseMatrixDelivery(),
     };
     storeState.store[canonicalKey] = {
       sessionId: "fresh-normalized-session",
@@ -329,33 +367,29 @@ describe("extractDeliveryInfo", () => {
     const result = extractDeliveryInfo(sessionKey);
 
     expect(result).toEqual({
-      deliveryContext: {
-        channel: "matrix",
-        to: "room:!MixedCase:Example.Org",
-        accountId: "matrix-account",
-      },
+      deliveryContext: createMixedCaseMatrixDelivery(),
       threadId: undefined,
     });
   });
 
-  it("prefers an older routable normalized alias over a fresher non-routable alias", () => {
-    const queriedKey = "agent:main:matrix:channel:!MiXeDCase:Example.Org";
-    const routableAlias = "agent:main:matrix:channel:!MixedCase:Example.Org";
-    const canonicalKey = "agent:main:matrix:channel:!mixedcase:example.org";
+  it("prefers an older routable normalized alias over a fresher non-routable alias for non-opaque keys", () => {
+    const queriedKey = "agent:main:telegram:group:MiXeDCase";
+    const routableAlias = "agent:main:telegram:group:MixedCase";
+    const canonicalKey = "agent:main:telegram:group:mixedcase";
     storeState.store[canonicalKey] = {
       sessionId: "fresh-normalized-session",
       updatedAt: Date.now(),
       origin: {
-        provider: "matrix",
+        provider: "telegram",
       },
     };
     storeState.store[routableAlias] = {
       sessionId: "older-routable-session",
       updatedAt: Date.now() - 1_000,
       deliveryContext: {
-        channel: "matrix",
-        to: "room:!MixedCase:Example.Org",
-        accountId: "matrix-account",
+        channel: "telegram",
+        to: "telegram:MixedCase",
+        accountId: "telegram-account",
       },
     };
 
@@ -363,9 +397,44 @@ describe("extractDeliveryInfo", () => {
 
     expect(result).toEqual({
       deliveryContext: {
-        channel: "matrix",
-        to: "room:!MixedCase:Example.Org",
-        accountId: "matrix-account",
+        channel: "telegram",
+        to: "telegram:MixedCase",
+        accountId: "telegram-account",
+      },
+      threadId: undefined,
+    });
+  });
+
+  it("keeps freshest routable alias ordering for non-opaque keys", () => {
+    const queriedKey = "agent:main:telegram:group:MiXeDCase";
+    const canonicalKey = "agent:main:telegram:group:mixedcase";
+    const routableAlias = "agent:main:telegram:group:MixedCase";
+    storeState.store[canonicalKey] = {
+      sessionId: "older-canonical-session",
+      updatedAt: Date.now() - 1_000,
+      deliveryContext: {
+        channel: "telegram",
+        to: "telegram:old-route",
+        accountId: "telegram-account",
+      },
+    };
+    storeState.store[routableAlias] = {
+      sessionId: "fresh-routable-session",
+      updatedAt: Date.now(),
+      deliveryContext: {
+        channel: "telegram",
+        to: "telegram:fresh-route",
+        accountId: "telegram-account",
+      },
+    };
+
+    const result = extractDeliveryInfo(queriedKey);
+
+    expect(result).toEqual({
+      deliveryContext: {
+        channel: "telegram",
+        to: "telegram:fresh-route",
+        accountId: "telegram-account",
       },
       threadId: undefined,
     });
@@ -393,26 +462,49 @@ describe("extractDeliveryInfo", () => {
     });
   });
 
-  it("prefers the freshest routable alias even when the normalized key is already routable", () => {
-    const queriedKey = "agent:main:matrix:channel:!MiXeDCase:Example.Org";
-    const canonicalKey = "agent:main:matrix:channel:!mixedcase:example.org";
-    const fresherAlias = "agent:main:matrix:channel:!MixedCase:Example.Org";
-    storeState.store[canonicalKey] = {
-      sessionId: "older-canonical-session",
+  it("prefers the exact mixed-case Matrix entry over a fresher folded legacy alias", () => {
+    // Matrix room IDs are case-sensitive (openclaw#75670): the exact mixed-case
+    // session is canonical and must win over a stale lowercased legacy alias even
+    // when the alias is fresher. (Previously these collapsed to one lowercased key
+    // and freshest won — that collapse was the bug.)
+    const queriedKey = "agent:main:matrix:channel:!MixedCase:Example.Org";
+    const legacyFoldedKey = "agent:main:matrix:channel:!mixedcase:example.org";
+    storeState.store[queriedKey] = {
+      sessionId: "exact-mixedcase-session",
       updatedAt: Date.now() - 1_000,
+      deliveryContext: createMixedCaseMatrixDelivery(),
+    };
+    storeState.store[legacyFoldedKey] = {
+      sessionId: "fresher-legacy-folded-session",
+      updatedAt: Date.now(),
       deliveryContext: {
         channel: "matrix",
         to: "room:!mixedcase:example.org",
         accountId: "matrix-account",
       },
     };
-    storeState.store[fresherAlias] = {
-      sessionId: "fresh-alias-session",
+
+    const result = extractDeliveryInfo(queriedKey);
+
+    expect(result).toEqual({
+      deliveryContext: createMixedCaseMatrixDelivery(),
+      threadId: undefined,
+    });
+  });
+
+  it("finds Matrix thread entries with a legacy lowercased room and preserved event id", () => {
+    const queriedKey =
+      "agent:main:matrix:channel:!MixedCase:Example.Org:thread:$RootEvent:Example.Org";
+    const legacyThreadKey =
+      "agent:main:matrix:channel:!mixedcase:example.org:thread:$RootEvent:Example.Org";
+    storeState.store[legacyThreadKey] = {
+      sessionId: "legacy-thread-session",
       updatedAt: Date.now(),
       deliveryContext: {
         channel: "matrix",
         to: "room:!MixedCase:Example.Org",
         accountId: "matrix-account",
+        threadId: "$RootEvent:Example.Org",
       },
     };
 
@@ -423,8 +515,104 @@ describe("extractDeliveryInfo", () => {
         channel: "matrix",
         to: "room:!MixedCase:Example.Org",
         accountId: "matrix-account",
+        threadId: "$RootEvent:Example.Org",
+      },
+      threadId: "$RootEvent:Example.Org",
+    });
+  });
+
+  it("does not return a case-distinct lowercase Matrix sibling when the mixed-case key has no exact entry", () => {
+    const queriedKey = "agent:main:matrix:channel:!MixedCase:Example.Org";
+    const lowercaseSiblingKey = "agent:main:matrix:channel:!mixedcase:example.org";
+    storeState.store[lowercaseSiblingKey] = buildEntry({
+      channel: "matrix",
+      to: "room:!mixedcase:example.org",
+      accountId: "matrix-account",
+    });
+
+    const result = extractDeliveryInfo(queriedKey);
+
+    expect(result).toEqual({
+      deliveryContext: undefined,
+      threadId: undefined,
+    });
+  });
+
+  it("does not return a mixed-case Matrix sibling for a lowercase room query", () => {
+    const queriedKey = "agent:main:matrix:channel:!mixedcase:example.org";
+    const mixedSiblingKey = "agent:main:matrix:channel:!MixedCase:Example.Org";
+    storeState.store[mixedSiblingKey] = buildEntry(createMixedCaseMatrixDelivery());
+
+    const result = extractDeliveryInfo(queriedKey);
+
+    expect(result).toEqual({
+      deliveryContext: undefined,
+      threadId: undefined,
+    });
+  });
+
+  it("does not return an exact lowercase Matrix key with mixed-case delivery metadata", () => {
+    const queriedKey = "agent:main:matrix:channel:!mixedcase:example.org";
+    storeState.store[queriedKey] = buildEntry(createMixedCaseMatrixDelivery());
+
+    const result = extractDeliveryInfo(queriedKey);
+
+    expect(result).toEqual({
+      deliveryContext: undefined,
+      threadId: undefined,
+    });
+  });
+
+  it("returns a confirmed lowercased Matrix legacy artifact for a mixed-case key", () => {
+    const queriedKey = "agent:main:matrix:channel:!MixedCase:Example.Org";
+    const legacyArtifactKey = "agent:main:matrix:channel:!mixedcase:example.org";
+    storeState.store[legacyArtifactKey] = buildEntry(createMixedCaseMatrixDelivery());
+
+    const result = extractDeliveryInfo(queriedKey);
+
+    expect(result).toEqual({
+      deliveryContext: createMixedCaseMatrixDelivery(),
+      threadId: undefined,
+    });
+  });
+
+  it("returns a confirmed lowercased Matrix room-alias artifact", () => {
+    const queriedKey = "agent:main:matrix:channel:#MixedAlias:Example.Org";
+    const legacyArtifactKey = "agent:main:matrix:channel:#mixedalias:example.org";
+    storeState.store[legacyArtifactKey] = buildEntry({
+      channel: "matrix",
+      to: "room:#MixedAlias:Example.Org",
+      accountId: "matrix-account",
+    });
+
+    const result = extractDeliveryInfo(queriedKey);
+
+    expect(result).toEqual({
+      deliveryContext: {
+        channel: "matrix",
+        to: "room:#MixedAlias:Example.Org",
+        accountId: "matrix-account",
       },
       threadId: undefined,
+    });
+  });
+
+  it("does not return a folded Matrix thread artifact when the stored thread id differs by case", () => {
+    const queriedKey = "agent:main:matrix:channel:!MixedCase:Example.Org:thread:$ThreadRootAbC";
+    const foldedThreadKey =
+      "agent:main:matrix:channel:!mixedcase:example.org:thread:$threadrootabc";
+    storeState.store[foldedThreadKey] = buildEntry({
+      channel: "matrix",
+      to: "room:!MixedCase:Example.Org",
+      accountId: "matrix-account",
+      threadId: "$threadrootabc",
+    });
+
+    const result = extractDeliveryInfo(queriedKey);
+
+    expect(result).toEqual({
+      deliveryContext: undefined,
+      threadId: "$ThreadRootAbC",
     });
   });
 

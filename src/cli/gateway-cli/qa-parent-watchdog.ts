@@ -1,10 +1,13 @@
+// QA watchdog for shutting down orphaned gateway children and cleaning staged temp roots.
 import fs from "node:fs/promises";
 import path from "node:path";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { isPathInside } from "../../infra/path-guards.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 
-export const QA_PARENT_PID_ENV = "OPENCLAW_QA_PARENT_PID";
-export const QA_TEMP_ROOT_ENV = "OPENCLAW_QA_TEMP_ROOT";
-export const QA_STAGED_RUNTIME_ROOT_ENV = "OPENCLAW_QA_STAGED_RUNTIME_ROOT";
+const QA_PARENT_PID_ENV = "OPENCLAW_QA_PARENT_PID";
+const QA_TEMP_ROOT_ENV = "OPENCLAW_QA_TEMP_ROOT";
+const QA_STAGED_RUNTIME_ROOT_ENV = "OPENCLAW_QA_STAGED_RUNTIME_ROOT";
 
 const DEFAULT_QA_PARENT_WATCHDOG_INTERVAL_MS = 1000;
 const QA_TEMP_ROOT_PREFIX = "openclaw-qa-suite-";
@@ -29,7 +32,7 @@ type QaParentWatchdogDeps = {
   setInterval?: (callback: () => void, ms: number) => QaParentWatchdogTimer;
 };
 
-export type QaParentWatchdogHandle = {
+type QaParentWatchdogHandle = {
   parentPid: number;
   stop: () => void;
 };
@@ -39,7 +42,7 @@ function resolveQaParentPid(env: NodeJS.ProcessEnv, ownPid: number): number | nu
   if (!raw) {
     return null;
   }
-  const parentPid = Number(raw);
+  const parentPid = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
   if (!Number.isSafeInteger(parentPid) || parentPid <= 0 || parentPid === ownPid) {
     return null;
   }
@@ -47,6 +50,7 @@ function resolveQaParentPid(env: NodeJS.ProcessEnv, ownPid: number): number | nu
 }
 
 function resolveQaCleanupRoot(rawValue: string | undefined): string | null {
+  // Only cleanup roots with the QA prefix; env values are external to the child process.
   const raw = rawValue?.trim();
   if (!raw) {
     return null;
@@ -59,19 +63,11 @@ function resolveQaCleanupRoot(rawValue: string | undefined): string | null {
 }
 
 function resolveQaCleanupRoots(env: NodeJS.ProcessEnv): string[] {
-  return [
-    resolveQaCleanupRoot(env[QA_TEMP_ROOT_ENV]),
-    resolveQaCleanupRoot(env[QA_STAGED_RUNTIME_ROOT_ENV]),
-  ].filter((target, index, array): target is string => {
-    return target !== null && array.indexOf(target) === index;
-  });
-}
-
-function pathContains(root: string, candidate: string): boolean {
-  const relative = path.relative(root, candidate);
-  return (
-    relative === "" ||
-    (relative.length > 0 && !relative.startsWith("..") && !path.isAbsolute(relative))
+  return uniqueStrings(
+    [
+      resolveQaCleanupRoot(env[QA_TEMP_ROOT_ENV]),
+      resolveQaCleanupRoot(env[QA_STAGED_RUNTIME_ROOT_ENV]),
+    ].filter((target): target is string => target !== null),
   );
 }
 
@@ -107,7 +103,6 @@ export function installQaParentWatchdog(
     ((callback: () => void, ms: number) => setInterval(callback, ms) as QaParentWatchdogTimer);
   let stopped = false;
   let exiting = false;
-  let timer: QaParentWatchdogTimer;
 
   const stop = () => {
     if (stopped) {
@@ -117,7 +112,7 @@ export function installQaParentWatchdog(
     clearIntervalFn(timer);
   };
 
-  timer = setIntervalFn(() => {
+  const timer: QaParentWatchdogTimer = setIntervalFn(() => {
     if (stopped || exiting) {
       return;
     }
@@ -131,7 +126,7 @@ export function installQaParentWatchdog(
         void (async () => {
           const currentCwd = path.resolve(cwd());
           const activeCwdRoot = qaCleanupRoots.find((cleanupRoot) =>
-            pathContains(cleanupRoot, currentCwd),
+            isPathInside(cleanupRoot, currentCwd),
           );
           if (activeCwdRoot) {
             const safeCwd = path.dirname(activeCwdRoot);
@@ -146,7 +141,7 @@ export function installQaParentWatchdog(
             }
           }
           for (const cleanupRoot of qaCleanupRoots) {
-            await rm(cleanupRoot).catch((cleanupError) => {
+            await rm(cleanupRoot).catch((cleanupError: unknown) => {
               logger.warn(
                 `QA gateway parent pid ${parentPid} exited; failed to clean runtime root ${cleanupRoot}: ${
                   cleanupError instanceof Error ? cleanupError.message : String(cleanupError)

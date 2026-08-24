@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+/** Tests model fallback notice formatting and transition state tracking. */
+import { afterEach, describe, expect, it } from "vitest";
+import { testing as cliBackendsTesting } from "../agents/cli-backends.test-support.js";
 import {
-  buildFallbackNotice,
   resolveActiveFallbackState,
-  resolveFallbackTransition,
   type FallbackNoticeState,
-} from "./fallback-state.js";
+} from "../status/fallback-notice-state.js";
+import { buildFallbackNotice, resolveFallbackTransition } from "./fallback-state.js";
 
 const baseAttempt = {
   provider: "demo-primary",
@@ -14,10 +15,27 @@ const baseAttempt = {
 };
 
 const activeFallbackState: FallbackNoticeState = {
-  fallbackNoticeSelectedModel: "demo-primary/model-a",
-  fallbackNoticeActiveModel: "demo-fallback/model-b",
-  fallbackNoticeReason: "rate limit",
+  fallbackNotice: {
+    kind: "active",
+    selectedModel: "demo-primary/model-a",
+    activeModel: "demo-fallback/model-b",
+    reason: "rate limit",
+  },
 };
+
+function registerAnthropicCliBackendForTest(): void {
+  cliBackendsTesting.setDepsForTest({
+    resolveRuntimeCliBackends: () => [
+      {
+        id: "claude-cli",
+        modelProvider: "anthropic",
+        pluginId: "anthropic",
+        config: { command: "claude" },
+        bundleMcp: false,
+      },
+    ],
+  });
+}
 
 function resolveDemoFallbackTransition(
   overrides: Partial<Parameters<typeof resolveFallbackTransition>[0]> = {},
@@ -34,6 +52,10 @@ function resolveDemoFallbackTransition(
 }
 
 describe("fallback-state", () => {
+  afterEach(() => {
+    cliBackendsTesting.resetDepsForTest();
+  });
+
   it.each([
     {
       name: "treats fallback as active only when state matches selected and active refs",
@@ -43,9 +65,12 @@ describe("fallback-state", () => {
     {
       name: "does not treat runtime drift as fallback when persisted state does not match",
       state: {
-        fallbackNoticeSelectedModel: "other-provider/other-model",
-        fallbackNoticeActiveModel: "demo-fallback/model-b",
-        fallbackNoticeReason: "rate limit",
+        fallbackNotice: {
+          kind: "active",
+          selectedModel: "other-provider/other-model",
+          activeModel: "demo-fallback/model-b",
+          reason: "rate limit",
+        },
       } satisfies FallbackNoticeState,
       expected: { active: false, reason: undefined },
     },
@@ -71,14 +96,6 @@ describe("fallback-state", () => {
     expect(resolved.nextState.activeModel).toBe("demo-fallback/model-b");
   });
 
-  it("normalizes fallback reason whitespace for summaries", () => {
-    const resolved = resolveDemoFallbackTransition({
-      attempts: [{ ...baseAttempt, reason: "rate_limit\n\tburst" }],
-    });
-
-    expect(resolved.reasonSummary).toBe("rate limit burst");
-  });
-
   it("prefers formatted transient error details over generic rate-limit labels", () => {
     const resolved = resolveDemoFallbackTransition({
       attempts: [
@@ -91,6 +108,46 @@ describe("fallback-state", () => {
 
     expect(resolved.reasonSummary).toContain("HTTP 429: Too Many Requests");
     expect(resolved.reasonSummary).toContain("Claude Max usage limit reached");
+  });
+
+  it.each([
+    // 真实 AWS Bedrock fixture，provenance 可追溯:
+    //   src/agents/failover-error.test.ts:54（引用 AWS troubleshooting 文档）
+    //   src/agents/failover-error.test.ts:688 / provider-error-patterns.test.ts:153
+    "ThrottlingException: Your request was denied due to exceeding the account quotas for Amazon Bedrock.",
+    "ThrottlingException: Too many concurrent requests",
+  ])(
+    "preserves throttle-flavored transient details over the generic rate-limit label (%j)",
+    (error) => {
+      const resolved = resolveDemoFallbackTransition({
+        attempts: [{ ...baseAttempt, error }],
+      });
+
+      // 回归: TRANSIENT_ERROR_DETAIL_HINT_RE 必须命中 throttle 词族
+      // (throttle/throttling/throttled/ThrottlingException)。原先裸 `throttl\b`
+      // 仅匹配不存在的词干 "throttl"，真实 Bedrock 消息全部失配，详细预览被
+      // 塌缩成通用 "rate limit" 标签。修复后预览得以保留。
+      expect(resolved.reasonSummary).toContain("ThrottlingException");
+      expect(resolved.reasonSummary).not.toBe("rate limit");
+    },
+  );
+
+  it("still collapses to the reason label when a transient reason lacks any transient-detail hint", () => {
+    // 防止过度匹配: 修复不得让门控对无 transient 提示的文本也放行。
+    const resolved = resolveDemoFallbackTransition({
+      attempts: [{ ...baseAttempt, error: "Unauthorized: invalid API key" }],
+    });
+
+    expect(resolved.reasonSummary).toBe("rate limit");
+  });
+
+  it("keeps truncated transient error details UTF-16 safe", () => {
+    const detail = "x".repeat(68);
+    const resolved = resolveDemoFallbackTransition({
+      attempts: [{ ...baseAttempt, error: `429 ${detail}😀tail` }],
+    });
+
+    expect(resolved.reasonSummary).toBe(`HTTP 429: ${detail}…`);
   });
 
   it("refreshes reason when fallback remains active with same model pair", () => {
@@ -123,6 +180,8 @@ describe("fallback-state", () => {
   });
 
   it("does not treat a CLI runtime alias as a model fallback", () => {
+    registerAnthropicCliBackendForTest();
+
     const resolved = resolveFallbackTransition({
       selectedProvider: "anthropic",
       selectedModel: "claude-opus-4-7",
@@ -130,10 +189,14 @@ describe("fallback-state", () => {
       activeModel: "claude-opus-4-7",
       attempts: [],
       state: {
-        fallbackNoticeSelectedModel: "anthropic/claude-opus-4-7",
-        fallbackNoticeActiveModel: "claude-cli/claude-opus-4-7",
-        fallbackNoticeReason: "selected model unavailable",
+        fallbackNotice: {
+          kind: "active",
+          selectedModel: "anthropic/claude-opus-4-7",
+          activeModel: "claude-cli/claude-opus-4-7",
+          reason: "selected model unavailable",
+        },
       },
+      cfg: {},
     });
 
     expect(resolved.fallbackActive).toBe(false);
@@ -143,7 +206,53 @@ describe("fallback-state", () => {
     expect(resolved.nextState.activeModel).toBeUndefined();
   });
 
+  it("does not repeat runtime alias comparison when persisted fallback refs match", () => {
+    let setupBackendLookups = 0;
+    cliBackendsTesting.setDepsForTest({
+      resolvePluginSetupCliBackend: ({ backend }) => {
+        setupBackendLookups += 1;
+        return backend === "claude-cli"
+          ? {
+              pluginId: "anthropic",
+              backend: {
+                id: "claude-cli",
+                modelProvider: "anthropic",
+                config: { command: "claude" },
+                bundleMcp: false,
+              },
+            }
+          : undefined;
+      },
+      resolvePluginSetupRegistry: () => {
+        throw new Error("full setup registry should not load for a single runtime alias");
+      },
+      resolveRuntimeCliBackends: () => [],
+    });
+
+    const resolved = resolveFallbackTransition({
+      selectedProvider: "anthropic",
+      selectedModel: "claude-opus-4-7",
+      activeProvider: "claude-cli",
+      activeModel: "claude-opus-4-7",
+      attempts: [],
+      state: {
+        fallbackNotice: {
+          kind: "active",
+          selectedModel: "anthropic/claude-opus-4-7",
+          activeModel: "claude-cli/claude-opus-4-7",
+          reason: "selected model unavailable",
+        },
+      },
+      cfg: {},
+    });
+
+    expect(resolved.fallbackActive).toBe(false);
+    expect(setupBackendLookups).toBe(2);
+  });
+
   it("does not build a fallback notice for equivalent CLI runtime aliases", () => {
+    registerAnthropicCliBackendForTest();
+
     expect(
       buildFallbackNotice({
         selectedProvider: "anthropic",
@@ -162,7 +271,7 @@ describe("fallback-state", () => {
         buildFallbackNotice({
           selectedProvider: "openai",
           selectedModel: model,
-          activeProvider: "openai-codex",
+          activeProvider: "openai",
           activeModel: model,
           attempts: [],
         }),
@@ -175,7 +284,7 @@ describe("fallback-state", () => {
       buildFallbackNotice({
         selectedProvider: "openai",
         selectedModel: "gpt-5.5",
-        activeProvider: "openai-codex",
+        activeProvider: "openai",
         activeModel: "gpt-5.4",
         attempts: [],
       }),

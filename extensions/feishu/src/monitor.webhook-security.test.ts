@@ -1,6 +1,7 @@
+// Feishu tests cover monitor.webhook security plugin behavior.
 import type { IncomingMessage } from "node:http";
 import { createConnection } from "node:net";
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   createFeishuClientMockModule,
   createFeishuRuntimeMockModule,
@@ -15,6 +16,7 @@ const probeFeishuMock = vi.hoisted(() => vi.fn());
 
 vi.mock("./probe.js", () => ({
   probeFeishu: probeFeishuMock,
+  registerFeishuAiAgent: vi.fn().mockResolvedValue({ ok: true }),
 }));
 
 vi.mock("./client.js", () => createFeishuClientMockModule());
@@ -38,16 +40,17 @@ vi.mock("./monitor.state.js", async (importOriginal) => {
 });
 
 import type { RuntimeEnv } from "../runtime-api.js";
+import { buildFeishuWebhookRateLimitKey } from "./monitor-rate-limit-key.js";
 import { resolveRequestClientIp } from "./monitor-transport-runtime-api.js";
-import {
-  clearFeishuWebhookRateLimitStateForTest,
-  getFeishuWebhookRateLimitStateSizeForTest,
-  isWebhookRateLimitedForTest,
-  monitorFeishuProvider,
-  stopFeishuMonitor,
-} from "./monitor.js";
-import { buildFeishuWebhookRateLimitKeyForTest, monitorWebhook } from "./monitor.transport.js";
+import { cleanupFeishuMonitorStateForTests } from "./monitor.cleanup.test-helpers.js";
+import { monitorFeishuProvider } from "./monitor.js";
+import { feishuWebhookRateLimiter } from "./monitor.state.js";
+import { monitorWebhook } from "./monitor.transport.js";
 import type { ResolvedFeishuAccount } from "./types.js";
+
+beforeAll(async () => {
+  await import("./monitor.account.js");
+});
 
 async function waitForSlowBodyTimeoutResponse(
   url: string,
@@ -57,6 +60,7 @@ async function waitForSlowBodyTimeoutResponse(
     const target = new URL(url);
     const startedAt = Date.now();
     let response = "";
+    let settled = false;
     const socket = createConnection(
       {
         host: target.hostname,
@@ -73,17 +77,27 @@ async function waitForSlowBodyTimeoutResponse(
     );
 
     socket.setEncoding("utf8");
-    socket.on("error", () => {});
     socket.on("data", (chunk) => {
-      response += chunk;
-      if (response.includes("Request body timeout")) {
+      response += chunk.toString();
+    });
+    socket.on("close", () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(failTimer);
+      resolve({ body: response, elapsedMs: Date.now() - startedAt });
+    });
+    socket.on("error", (error) => {
+      if (!settled) {
+        settled = true;
         clearTimeout(failTimer);
-        socket.destroy();
-        resolve({ body: response, elapsedMs: Date.now() - startedAt });
+        reject(error);
       }
     });
 
     const failTimer = setTimeout(() => {
+      settled = true;
       socket.destroy();
       reject(new Error(`timeout response did not arrive within ${timeoutMs}ms`));
     }, timeoutMs);
@@ -117,32 +131,26 @@ async function waitForOversizedBodyResponse(url: string): Promise<string> {
       }
       settled = true;
       clearTimeout(failTimer);
-      socket.destroy();
       resolve(result);
     };
 
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => {
-      response += chunk;
-      if (response.includes("Payload too large")) {
-        finish(response);
-      }
+      response += chunk.toString();
     });
     socket.on("close", () => {
-      if (response.includes("Payload too large")) {
-        finish(response);
-      }
+      finish(response);
     });
     socket.on("error", (error: NodeJS.ErrnoException) => {
-      if (response.includes("Payload too large")) {
-        finish(response);
-        return;
+      if (!settled) {
+        if (response.includes("Payload too large")) {
+          finish(response);
+          return;
+        }
+        settled = true;
+        clearTimeout(failTimer);
+        reject(new Error(`${error.message}; partial response: ${JSON.stringify(response)}`));
       }
-      if (error.code === "ECONNRESET") {
-        finish("ECONNRESET");
-        return;
-      }
-      reject(error);
     });
 
     const failTimer = setTimeout(() => {
@@ -159,9 +167,9 @@ function resolveTestClientIp(remoteAddress: string | undefined): string | undefi
   } as IncomingMessage);
 }
 
-afterEach(() => {
-  clearFeishuWebhookRateLimitStateForTest();
-  stopFeishuMonitor();
+afterEach(async () => {
+  feishuWebhookRateLimiter.clear();
+  cleanupFeishuMonitorStateForTests();
 });
 
 afterAll(() => {
@@ -264,12 +272,9 @@ describe("Feishu webhook security hardening", () => {
       async (url) => {
         const response = await waitForOversizedBodyResponse(url);
 
-        if (response === "ECONNRESET") {
-          expect(response).toBe("ECONNRESET");
-        } else {
-          expect(response).toContain("413 Payload Too Large");
-          expect(response).toContain("Payload too large");
-        }
+        expect(response).toContain("413 Payload Too Large");
+        expect(response).toContain("Payload too large");
+        expect(response).toMatch(/connection: close/i);
       },
     );
   });
@@ -288,6 +293,7 @@ describe("Feishu webhook security hardening", () => {
         const result = await waitForSlowBodyTimeoutResponse(url, 1_000);
         expect(result.body).toContain("408 Request Timeout");
         expect(result.body).toContain("Request body timeout");
+        expect(result.body).toMatch(/connection: close/i);
         expect(result.elapsedMs).toBeLessThan(500);
       },
     );
@@ -330,19 +336,19 @@ describe("Feishu webhook security hardening", () => {
     };
 
     expect([
-      buildFeishuWebhookRateLimitKeyForTest({
+      buildFeishuWebhookRateLimitKey({
         ...base,
         clientIp: resolveTestClientIp("127.0.0.1"),
       }),
-      buildFeishuWebhookRateLimitKeyForTest({
+      buildFeishuWebhookRateLimitKey({
         ...base,
         clientIp: resolveTestClientIp("127.0.0.42"),
       }),
-      buildFeishuWebhookRateLimitKeyForTest({
+      buildFeishuWebhookRateLimitKey({
         ...base,
         clientIp: resolveTestClientIp("::ffff:127.0.0.1"),
       }),
-      buildFeishuWebhookRateLimitKeyForTest({
+      buildFeishuWebhookRateLimitKey({
         ...base,
         clientIp: resolveTestClientIp("::1"),
       }),
@@ -360,10 +366,10 @@ describe("Feishu webhook security hardening", () => {
       path: "/hook-rate-limit-key",
     };
 
-    expect(buildFeishuWebhookRateLimitKeyForTest({ ...base, clientIp: "10.0.0.1" })).toBe(
+    expect(buildFeishuWebhookRateLimitKey({ ...base, clientIp: "10.0.0.1" })).toBe(
       "rate-limit-key:/hook-rate-limit-key:10.0.0.1",
     );
-    expect(buildFeishuWebhookRateLimitKeyForTest(base)).toBe(
+    expect(buildFeishuWebhookRateLimitKey(base)).toBe(
       "rate-limit-key:/hook-rate-limit-key:unknown",
     );
   });
@@ -371,19 +377,19 @@ describe("Feishu webhook security hardening", () => {
   it("caps tracked webhook rate-limit keys to prevent unbounded growth", () => {
     const now = 1_000_000;
     for (let i = 0; i < 4_500; i += 1) {
-      isWebhookRateLimitedForTest(`/feishu-rate-limit:key-${i}`, now);
+      feishuWebhookRateLimiter.isRateLimited(`/feishu-rate-limit:key-${i}`, now);
     }
-    expect(getFeishuWebhookRateLimitStateSizeForTest()).toBeLessThanOrEqual(4_096);
+    expect(feishuWebhookRateLimiter.size()).toBeLessThanOrEqual(4_096);
   });
 
   it("prunes stale webhook rate-limit state after window elapses", () => {
     const now = 2_000_000;
     for (let i = 0; i < 100; i += 1) {
-      isWebhookRateLimitedForTest(`/feishu-rate-limit-stale:key-${i}`, now);
+      feishuWebhookRateLimiter.isRateLimited(`/feishu-rate-limit-stale:key-${i}`, now);
     }
-    expect(getFeishuWebhookRateLimitStateSizeForTest()).toBe(100);
+    expect(feishuWebhookRateLimiter.size()).toBe(100);
 
-    isWebhookRateLimitedForTest("/feishu-rate-limit-stale:fresh", now + 60_001);
-    expect(getFeishuWebhookRateLimitStateSizeForTest()).toBe(1);
+    feishuWebhookRateLimiter.isRateLimited("/feishu-rate-limit-stale:fresh", now + 60_001);
+    expect(feishuWebhookRateLimiter.size()).toBe(1);
   });
 });

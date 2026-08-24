@@ -1,8 +1,10 @@
+import { resolveSessionAgentId } from "openclaw/plugin-sdk/agent-scope-runtime";
+// Discord plugin module implements thread bindings.manager behavior.
 import {
   registerSessionBindingAdapter,
   unregisterSessionBindingAdapter,
 } from "openclaw/plugin-sdk/conversation-runtime";
-import { normalizeAccountId, resolveAgentIdFromSessionKey } from "openclaw/plugin-sdk/routing";
+import { normalizeAccountId } from "openclaw/plugin-sdk/routing";
 import {
   getRuntimeConfigSnapshot,
   type OpenClawConfig,
@@ -37,7 +39,7 @@ import {
   normalizeTargetKind,
   normalizeThreadBindingDurationMs,
   normalizeThreadId,
-  rememberRecentUnboundWebhookEcho,
+  refreshUnboundThreadWebhookIdentity,
   removeBindingRecord,
   resolveBindingIdsForSession,
   resolveBindingRecordKey,
@@ -45,12 +47,10 @@ import {
   resolveThreadBindingInactivityExpiresAt,
   resolveThreadBindingMaxAgeExpiresAt,
   resolveThreadBindingMaxAgeMs,
-  resolveThreadBindingsPath,
   saveBindingsToDisk,
   setBindingRecord,
   THREAD_BINDING_TOUCH_PERSIST_MIN_INTERVAL_MS,
   shouldDefaultPersist,
-  resetThreadBindingsForTests,
 } from "./thread-bindings.state.js";
 import {
   DEFAULT_THREAD_BINDING_IDLE_TIMEOUT_MS,
@@ -70,8 +70,6 @@ function unregisterManager(accountId: string, manager: ThreadBindingManager) {
     MANAGERS_BY_ACCOUNT_ID.delete(accountId);
   }
 }
-
-const SWEEPERS_BY_ACCOUNT_ID = new Map<string, () => Promise<void>>();
 
 function createNoopManager(accountIdRaw?: string): ThreadBindingManager {
   const accountId = normalizeAccountId(accountIdRaw);
@@ -231,8 +229,6 @@ export function createThreadBindingManager(params: {
       }
     }
   };
-  SWEEPERS_BY_ACCOUNT_ID.set(accountId, runSweepOnce);
-
   const manager: ThreadBindingManager = {
     accountId,
     getIdleTimeoutMs: () => idleTimeoutMs,
@@ -274,8 +270,8 @@ export function createThreadBindingManager(params: {
       if (!key) {
         return null;
       }
-      const existing = BINDINGS_BY_THREAD_ID.get(key);
-      if (!existing || existing.accountId !== accountId) {
+      const existingResult = BINDINGS_BY_THREAD_ID.get(key);
+      if (!existingResult || existingResult.accountId !== accountId) {
         return null;
       }
       const now = Date.now();
@@ -284,8 +280,8 @@ export function createThreadBindingManager(params: {
           ? Math.max(0, Math.floor(touchParams.at))
           : now;
       const nextRecord: ThreadBindingRecord = {
-        ...existing,
-        lastActivityAt: Math.max(existing.lastActivityAt || 0, at),
+        ...existingResult,
+        lastActivityAt: Math.max(existingResult.lastActivityAt || 0, at),
       };
       setBindingRecord(nextRecord);
       if (touchParams.persist ?? persist) {
@@ -342,7 +338,7 @@ export function createThreadBindingManager(params: {
         return null;
       }
 
-      const existing = manager.getByThreadId(threadId);
+      const existingValue = manager.getByThreadId(threadId);
       const targetSessionKey = normalizeOptionalString(bindParams.targetSessionKey) ?? "";
       if (!targetSessionKey) {
         return null;
@@ -351,11 +347,11 @@ export function createThreadBindingManager(params: {
       const targetKind = normalizeTargetKind(bindParams.targetKind, targetSessionKey);
       let webhookId =
         normalizeOptionalString(bindParams.webhookId) ??
-        normalizeOptionalString(existing?.webhookId) ??
+        normalizeOptionalString(existingValue?.webhookId) ??
         "";
       let webhookToken =
         normalizeOptionalString(bindParams.webhookToken) ??
-        normalizeOptionalString(existing?.webhookToken) ??
+        normalizeOptionalString(existingValue?.webhookToken) ??
         "";
       if (!directConversationBinding && (!webhookId || !webhookToken)) {
         const cachedWebhook = findReusableWebhook({ accountId, channelId });
@@ -382,26 +378,29 @@ export function createThreadBindingManager(params: {
         targetSessionKey,
         agentId:
           normalizeOptionalString(bindParams.agentId) ??
-          normalizeOptionalString(existing?.agentId) ??
-          resolveAgentIdFromSessionKey(targetSessionKey),
+          normalizeOptionalString(existingValue?.agentId) ??
+          resolveSessionAgentId({ config: cfg, sessionKey: targetSessionKey }),
         label:
-          normalizeOptionalString(bindParams.label) ?? normalizeOptionalString(existing?.label),
+          normalizeOptionalString(bindParams.label) ??
+          normalizeOptionalString(existingValue?.label),
         webhookId: webhookId || undefined,
         webhookToken: webhookToken || undefined,
         boundBy:
           normalizeOptionalString(bindParams.boundBy) ??
-          normalizeOptionalString(existing?.boundBy) ??
+          normalizeOptionalString(existingValue?.boundBy) ??
           "system",
         boundAt: now,
         lastActivityAt: now,
         idleTimeoutMs:
-          typeof existing?.idleTimeoutMs === "number" ? existing.idleTimeoutMs : idleTimeoutMs,
-        maxAgeMs: typeof existing?.maxAgeMs === "number" ? existing.maxAgeMs : maxAgeMs,
+          typeof existingValue?.idleTimeoutMs === "number"
+            ? existingValue.idleTimeoutMs
+            : idleTimeoutMs,
+        maxAgeMs: typeof existingValue?.maxAgeMs === "number" ? existingValue.maxAgeMs : maxAgeMs,
         metadata:
           bindParams.metadata && typeof bindParams.metadata === "object"
-            ? { ...existing?.metadata, ...bindParams.metadata }
-            : existing?.metadata
-              ? { ...existing.metadata }
+            ? { ...existingValue?.metadata, ...bindParams.metadata }
+            : existingValue?.metadata
+              ? { ...existingValue.metadata }
               : undefined,
       };
 
@@ -424,15 +423,15 @@ export function createThreadBindingManager(params: {
       if (!bindingKey) {
         return null;
       }
-      const existing = BINDINGS_BY_THREAD_ID.get(bindingKey);
-      if (!existing || existing.accountId !== accountId) {
+      const existingLocal = BINDINGS_BY_THREAD_ID.get(bindingKey);
+      if (!existingLocal || existingLocal.accountId !== accountId) {
         return null;
       }
       const removed = removeBindingRecord(bindingKey);
       if (!removed) {
         return null;
       }
-      rememberRecentUnboundWebhookEcho(removed);
+      refreshUnboundThreadWebhookIdentity(removed);
       if (persist) {
         saveBindingsToDisk();
       }
@@ -495,7 +494,6 @@ export function createThreadBindingManager(params: {
         clearInterval(sweepTimer);
         sweepTimer = null;
       }
-      SWEEPERS_BY_ACCOUNT_ID.delete(accountId);
       unregisterManager(accountId, manager);
       unregisterSessionBindingAdapter({
         channel: "discord",
@@ -539,16 +537,3 @@ export function getThreadBindingManager(accountId?: string): ThreadBindingManage
   const normalized = normalizeAccountId(accountId);
   return MANAGERS_BY_ACCOUNT_ID.get(normalized) ?? null;
 }
-
-export const testing = {
-  resolveThreadBindingsPath,
-  resolveThreadBindingThreadName,
-  resetThreadBindingsForTests,
-  runThreadBindingSweepForAccount: async (accountId?: string) => {
-    const sweep = SWEEPERS_BY_ACCOUNT_ID.get(normalizeAccountId(accountId));
-    if (sweep) {
-      await sweep();
-    }
-  },
-};
-export { testing as __testing };

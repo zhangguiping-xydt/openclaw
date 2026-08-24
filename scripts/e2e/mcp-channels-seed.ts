@@ -1,3 +1,4 @@
+// Mcp Channels Seed script supports OpenClaw repository automation.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -19,7 +20,6 @@ async function main() {
     {
       gateway: {
         controlUi: {
-          allowInsecureAuth: true,
           enabled: false,
         },
       },
@@ -79,18 +79,19 @@ async function main() {
       JSON.stringify({
         id: "msg-attachment",
         message: {
-          role: "assistant",
-          content: [
-            { type: "text", text: "seeded image attachment" },
-            {
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: "image/png",
-                data: "abc",
+          role: "user",
+          content: "seeded image attachment",
+          __openclaw: {
+            media: [
+              {
+                url: "media://inbound/seeded-image.png",
+                contentType: "image/png",
+                kind: "image",
+                fileName: "seeded-image.png",
+                sizeBytes: 3,
               },
-            },
-          ],
+            ],
+          },
           timestamp: now + 1,
         },
       }),

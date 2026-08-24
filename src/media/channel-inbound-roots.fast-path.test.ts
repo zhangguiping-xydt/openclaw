@@ -1,6 +1,8 @@
+// Channel inbound root fast-path tests cover cached media root resolution.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MsgContext } from "../auto-reply/templating.js";
 import type { OpenClawConfig } from "../config/types.js";
+import { clearPluginMetadataLifecycleCaches } from "../plugins/plugin-metadata-lifecycle.js";
 
 const publicSurfaceLoaderMocks = vi.hoisted(() => ({
   loadBundledPluginPublicArtifactModuleSync: vi.fn(),
@@ -10,6 +12,7 @@ vi.mock("../plugins/public-surface-loader.js", () => publicSurfaceLoaderMocks);
 
 import {
   resolveChannelInboundAttachmentRoots,
+  resolveChannelInboundAttachmentRootsForChannel,
   resolveChannelRemoteInboundAttachmentRoots,
 } from "./channel-inbound-roots.js";
 
@@ -141,5 +144,67 @@ describe("channel inbound roots fast path", () => {
     expect(
       publicSurfaceLoaderMocks.loadBundledPluginPublicArtifactModuleSync,
     ).toHaveBeenCalledOnce();
+  });
+
+  it("resolves local inbound roots from explicit channel context", () => {
+    publicSurfaceLoaderMocks.loadBundledPluginPublicArtifactModuleSync.mockImplementation(
+      ({ artifactBasename, dirName }: { artifactBasename: string; dirName: string }) => {
+        if (dirName === "toolchat" && artifactBasename === "media-contract-api.js") {
+          return {
+            resolveInboundAttachmentRoots: ({ accountId }: { accountId?: string }) => [
+              `/tool/${accountId}`,
+            ],
+          };
+        }
+        throw unableToResolve(dirName, artifactBasename);
+      },
+    );
+
+    expect(
+      resolveChannelInboundAttachmentRootsForChannel({
+        cfg,
+        channelId: "toolchat",
+        accountId: "personal",
+      }),
+    ).toEqual(["/tool/personal"]);
+    expect(publicSurfaceLoaderMocks.loadBundledPluginPublicArtifactModuleSync).toHaveBeenCalledWith(
+      {
+        dirName: "toolchat",
+        artifactBasename: "media-contract-api.js",
+      },
+    );
+  });
+
+  it("reloads a channel media contract installed after the explicit plugin lifecycle reset", () => {
+    publicSurfaceLoaderMocks.loadBundledPluginPublicArtifactModuleSync.mockImplementation(
+      ({ artifactBasename, dirName }: { artifactBasename: string; dirName: string }) => {
+        throw unableToResolve(dirName, artifactBasename);
+      },
+    );
+    expect(
+      resolveChannelInboundAttachmentRootsForChannel({
+        cfg,
+        channelId: "installedchat",
+        accountId: "work",
+      }),
+    ).toBeUndefined();
+
+    publicSurfaceLoaderMocks.loadBundledPluginPublicArtifactModuleSync.mockReturnValue({
+      resolveInboundAttachmentRoots: ({ accountId }: { accountId?: string }) => [
+        `/installed/${accountId}`,
+      ],
+    });
+    clearPluginMetadataLifecycleCaches();
+
+    expect(
+      resolveChannelInboundAttachmentRootsForChannel({
+        cfg,
+        channelId: "installedchat",
+        accountId: "work",
+      }),
+    ).toEqual(["/installed/work"]);
+    expect(
+      publicSurfaceLoaderMocks.loadBundledPluginPublicArtifactModuleSync,
+    ).toHaveBeenCalledTimes(2);
   });
 });

@@ -1,3 +1,6 @@
+// Elevenlabs plugin module implements tts behavior.
+import { MAX_AUDIO_BYTES } from "openclaw/plugin-sdk/media-runtime";
+import { createBoundedProviderBinaryStream } from "openclaw/plugin-sdk/provider-binary-stream";
 import {
   assertOkOrThrowProviderError,
   assertProviderBinaryResponseContent,
@@ -34,6 +37,17 @@ function resolveElevenLabsAcceptHeader(outputFormat: string): string | undefined
     return "audio/mpeg";
   }
   return undefined;
+}
+
+function normalizeElevenLabsLatencyTier(latencyTier: number | undefined): number | undefined {
+  if (latencyTier === undefined || !Number.isFinite(latencyTier)) {
+    return undefined;
+  }
+  if (!Number.isSafeInteger(latencyTier)) {
+    throw new Error("latencyTier must be an integer");
+  }
+  requireInRange(latencyTier, 0, 4, "latencyTier");
+  return latencyTier;
 }
 
 type ElevenLabsTtsRequestParams = {
@@ -83,13 +97,7 @@ function prepareElevenLabsTtsRequest(params: ElevenLabsTtsRequestParams & { stre
   const normalizedNormalization = normalizeApplyTextNormalization(applyTextNormalization);
   const normalizedSeed = normalizeSeed(seed);
   const normalizedBaseUrl = normalizeElevenLabsBaseUrl(baseUrl);
-  const normalizedLatencyTier =
-    typeof latencyTier === "number" && Number.isFinite(latencyTier)
-      ? Math.trunc(latencyTier)
-      : undefined;
-  if (normalizedLatencyTier !== undefined) {
-    requireInRange(normalizedLatencyTier, 0, 4, "latencyTier");
-  }
+  const normalizedLatencyTier = normalizeElevenLabsLatencyTier(latencyTier);
   const url = new URL(
     `${normalizedBaseUrl}/v1/text-to-speech/${voiceId}${params.stream ? "/stream" : ""}`,
   );
@@ -185,10 +193,27 @@ export async function elevenLabsTTSStream(params: ElevenLabsTtsRequestParams): P
     if (!response.body) {
       throw new Error("ElevenLabs API response missing audio stream");
     }
+    const boundedStream = createBoundedProviderBinaryStream(response.body, {
+      maxBytes: MAX_AUDIO_BYTES,
+      createOverflowError: ({ maxBytes }) =>
+        new Error(`ElevenLabs API error: audio response exceeds ${maxBytes} bytes`),
+      createReleaseError: () => new Error("ElevenLabs TTS stream released"),
+    });
+    let releasePromise: Promise<void> | undefined;
+    const releaseAll = () => {
+      releasePromise ??= (async () => {
+        try {
+          await boundedStream.release();
+        } finally {
+          await release();
+        }
+      })();
+      return releasePromise;
+    };
     handedOff = true;
     return {
-      audioStream: response.body,
-      release,
+      audioStream: boundedStream.stream,
+      release: releaseAll,
     };
   } finally {
     if (!handedOff) {

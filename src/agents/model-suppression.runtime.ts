@@ -1,21 +1,28 @@
+/**
+ * Runtime seam for built-in model suppression.
+ * Lets tests and lazy catalog paths stub suppression behavior without importing
+ * the full suppression implementation at module load.
+ */
 import {
-  buildShouldSuppressBuiltInModel as buildShouldSuppressBuiltInModelImpl,
-  shouldSuppressBuiltInModel as shouldSuppressBuiltInModelImpl,
+  buildShouldSuppressBuiltInModelCore,
+  shouldSuppressBuiltInModelCore as shouldSuppressBuiltInModelImpl,
 } from "./model-suppression.js";
 
 type ShouldSuppressBuiltInModel =
-  typeof import("./model-suppression.js").shouldSuppressBuiltInModel;
+  typeof import("./model-suppression.js").shouldSuppressBuiltInModelCore;
 type BuildShouldSuppressBuiltInModel =
-  typeof import("./model-suppression.js").buildShouldSuppressBuiltInModel;
+  typeof import("./model-suppression.js").buildShouldSuppressBuiltInModelCore;
 
+/** Runtime-forwarded predicate for hiding bundled models. */
 export function shouldSuppressBuiltInModel(
   ...args: Parameters<ShouldSuppressBuiltInModel>
 ): ReturnType<ShouldSuppressBuiltInModel> {
   return shouldSuppressBuiltInModelImpl(...args);
 }
 
+/** Build a provider-aware predicate for hiding bundled models. */
 export function buildShouldSuppressBuiltInModel(
   ...args: Parameters<BuildShouldSuppressBuiltInModel>
 ): ReturnType<BuildShouldSuppressBuiltInModel> {
-  return buildShouldSuppressBuiltInModelImpl(...args);
+  return buildShouldSuppressBuiltInModelCore(...args);
 }

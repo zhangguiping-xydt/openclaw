@@ -1,5 +1,6 @@
+import { expectDefined } from "@openclaw/normalization-core";
+// Converts streaming reply directives into payload delivery decisions.
 import { hasOutboundReplyContent } from "openclaw/plugin-sdk/reply-payload";
-import { splitMediaFromOutput } from "../../media/parse.js";
 import { parseInlineDirectives } from "../../utils/directive-tags.js";
 import {
   isSilentReplyPrefixText,
@@ -25,53 +26,30 @@ type ConsumeOptions = {
   silentToken?: string;
 };
 
-type SplitTrailingDirectiveOptions = {
-  final?: boolean;
-};
-
-// Holds back incomplete streaming-directive tails so parseChunk only ever sees
-// complete directives. Otherwise, upstream token boundaries can split markers
-// like `MEDIA:<path>` between chunks and cause the first half to be emitted as
-// plain text (e.g. the `MEDIA` token leaking into a channel reply while the
-// matching file path is silently dropped on the next chunk).
-export const splitTrailingDirective = (
-  text: string,
-  options: SplitTrailingDirectiveOptions = {},
-): { text: string; tail: string } => {
+// TRANSITIONAL(marker-retirement): streaming tail-buffering exists only because
+// live drafts still carry inline markers mid-run. Delete alongside the marker
+// parser when the visibleReplies default flips to "message_tool".
+// Holds back incomplete inline directive tails so parseChunk only ever sees
+// complete reply/audio tags.
+export const splitTrailingDirective = (text: string): { text: string; tail: string } => {
   let bufferStart = text.length;
+  let trimTextBeforeTail = false;
 
   // 1. Unclosed `[[…` reply/audio directive tail.
   const openIndex = text.lastIndexOf("[[");
   if (openIndex >= 0 && !text.includes("]]", openIndex + 2)) {
     if (openIndex < bufferStart) {
       bufferStart = openIndex;
+      trimTextBeforeTail = true;
     }
   }
   if (text.endsWith("[") && text.length - 1 < bufferStart) {
     bufferStart = text.length - 1;
+    trimTextBeforeTail = true;
   }
 
-  if (options.final) {
-    if (bufferStart >= text.length) {
-      return { text, tail: "" };
-    }
-
-    return {
-      text: text.slice(0, bufferStart),
-      tail: text.slice(bufferStart),
-    };
-  }
-
-  // 2. `MEDIA:` line without a trailing newline — the URL may still be
-  //    streaming. `splitMediaFromOutput` in src/media/parse.ts treats a
-  //    line as a media directive only when `line.trimStart()` begins with
-  //    `MEDIA:`, so we match the same shape here: only buffer when the
-  //    last line looks like an actual directive line (optional leading
-  //    whitespace, then `MEDIA:`). Prose such as
-  //    "See the MEDIA: section for details" does NOT qualify and is
-  //    flushed as ordinary text — otherwise it could sit in pendingTail
-  //    and be silently dropped if a stream-item boundary calls `reset()`
-  //    without a preceding `consume("", { final: true })`.
+  // Keep a possible final-reply MEDIA directive out of partial streaming
+  // payloads. The final message parser still owns legacy MEDIA delivery.
   const lastNewline = text.lastIndexOf("\n");
   const lastLine = lastNewline < 0 ? text : text.slice(lastNewline + 1);
   if (/^\s*MEDIA:/i.test(lastLine)) {
@@ -81,16 +59,10 @@ export const splitTrailingDirective = (
     }
   }
 
-  // 3. Trailing `M|ME|MED|MEDI|MEDIA` prefix (no colon yet) at the start of
-  //    a line — the next chunk might turn this into `MEDIA:<url>`. Only a
-  //    line-start anchor (`^` or immediately after `\n`) is accepted so
-  //    mid-prose tokens like "_M", "3ME", or "token MEDIA" are not
-  //    speculatively buffered and cannot accidentally be glued to a
-  //    following `:` into a synthetic directive. Matches the canonical
-  //    MEDIA directive placement (own line after `\n\n`).
   const prefixMatch = text.match(/(?:^|\n)(MEDIA|MEDI|MED|ME|M)$/i);
   if (prefixMatch) {
-    const prefixStart = text.length - prefixMatch[1].length;
+    const prefixStart =
+      text.length - expectDefined(prefixMatch[1], "prefix match capture group 1").length;
     if (prefixStart < bufferStart) {
       bufferStart = prefixStart;
     }
@@ -101,21 +73,20 @@ export const splitTrailingDirective = (
   }
 
   return {
-    text: text.slice(0, bufferStart),
+    text: trimTextBeforeTail ? text.slice(0, bufferStart).trimEnd() : text.slice(0, bufferStart),
     tail: text.slice(bufferStart),
   };
 };
 
 const parseChunk = (raw: string, options?: { silentToken?: string }): ParsedChunk => {
-  const split = splitMediaFromOutput(raw);
-  let text = split.text ?? "";
+  let text = raw ?? "";
 
   const replyParsed = parseInlineDirectives(text, {
-    stripAudioTag: false,
+    stripAudioTag: true,
     stripReplyTags: true,
   });
 
-  if (replyParsed.hasReplyTag) {
+  if (replyParsed.hasReplyTag || replyParsed.hasAudioTag) {
     text = replyParsed.text;
   }
 
@@ -130,13 +101,11 @@ const parseChunk = (raw: string, options?: { silentToken?: string }): ParsedChun
 
   return {
     text,
-    mediaUrls: split.mediaUrls,
-    mediaUrl: split.mediaUrl,
     replyToId: replyParsed.replyToId,
     replyToExplicitId: replyParsed.replyToExplicitId,
     replyToCurrent: replyParsed.replyToCurrent,
     replyToTag: replyParsed.hasReplyTag,
-    audioAsVoice: split.audioAsVoice,
+    audioAsVoice: replyParsed.audioAsVoice,
     isSilent,
   };
 };
@@ -146,21 +115,34 @@ const hasRenderableContent = (parsed: ReplyDirectiveParseResult): boolean =>
 
 export function createStreamingDirectiveAccumulator() {
   let pendingTail = "";
+  let pendingSeparator = "";
   let pendingReply: PendingReplyState = { sawCurrent: false, hasTag: false };
   let activeReply: PendingReplyState = { sawCurrent: false, hasTag: false };
 
   const reset = () => {
     pendingTail = "";
+    pendingSeparator = "";
     pendingReply = { sawCurrent: false, hasTag: false };
     activeReply = { sawCurrent: false, hasTag: false };
   };
 
   const consume = (raw: string, options: ConsumeOptions = {}): ReplyDirectiveParseResult | null => {
+    const hadPendingTail = pendingTail.length > 0;
+    const heldSeparator = pendingSeparator;
     let combined = `${pendingTail}${raw ?? ""}`;
     pendingTail = "";
+    pendingSeparator = "";
 
     if (!options.final) {
       const split = splitTrailingDirective(combined);
+      if (split.tail) {
+        const tailStart = combined.length - split.tail.length;
+        const separator = combined.slice(split.text.length, tailStart);
+        // The separator is not part of a possible directive. Hold it separately
+        // so valid completions keep existing streaming behavior while a final
+        // malformed tail can be restored verbatim.
+        pendingSeparator = split.text ? separator : `${heldSeparator}${separator}`;
+      }
       combined = split.text;
       pendingTail = split.tail;
     }
@@ -170,6 +152,9 @@ export function createStreamingDirectiveAccumulator() {
     }
 
     const parsed = parseChunk(combined, { silentToken: options.silentToken });
+    if (hadPendingTail && heldSeparator && parsed.text.startsWith("[")) {
+      parsed.text = `${heldSeparator}${parsed.text}`;
+    }
     const hasTag = activeReply.hasTag || pendingReply.hasTag || parsed.replyToTag;
     const sawCurrent =
       activeReply.sawCurrent || pendingReply.sawCurrent || parsed.replyToCurrent === true;

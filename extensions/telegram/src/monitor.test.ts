@@ -1,8 +1,10 @@
+// Telegram tests cover monitor plugin behavior.
+import { toErrorObject as toLintErrorObject } from "openclaw/plugin-sdk/error-runtime";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-type MonitorTelegramOpts = import("./monitor.js").MonitorTelegramOpts;
+type MonitorTelegramOpts = import("./monitor.types.js").MonitorTelegramOpts;
 let monitorTelegramProvider: typeof import("./monitor.js").monitorTelegramProvider;
-let resetTelegramPollingLeasesForTests: typeof import("./polling-lease.js").resetTelegramPollingLeasesForTests;
+let resetTelegramPollingLeasesForTests: typeof import("./runtime.test-support.js").resetTelegramPollingLeasesForTest;
 
 type MockCtx = {
   message: {
@@ -325,7 +327,7 @@ vi.mock("./bot.js", () => ({
     createTelegramBotCalls.push(opts);
     const nextError = createTelegramBotErrors.shift();
     if (nextError) {
-      throw nextError;
+      throw toLintErrorObject(nextError, "Non-Error thrown");
     }
     const stop = vi.fn<() => void>();
     createdBotStops.push(stop);
@@ -389,7 +391,10 @@ describe("monitorTelegramProvider (grammY)", () => {
 
   beforeAll(async () => {
     ({ monitorTelegramProvider } = await import("./monitor.js"));
-    ({ resetTelegramPollingLeasesForTests } = await import("./polling-lease.js"));
+    ({ resetTelegramPollingLeasesForTest: resetTelegramPollingLeasesForTests } =
+      await import("./runtime.test-support.js"));
+    resetTelegramPollingLeasesForTests();
+    await monitorWithAutoAbort();
   });
 
   beforeEach(() => {
@@ -470,6 +475,46 @@ describe("monitorTelegramProvider (grammY)", () => {
     expect(runOptions?.runner?.silent).toBe(true);
     expect(runOptions?.runner?.maxRetryTime).toBe(60 * 60 * 1000);
     expect(runOptions?.runner?.retryInterval).toBe("exponential");
+  });
+
+  it("logs polling startup diagnostics without using the error channel", async () => {
+    const runtime = {
+      log: vi.fn(),
+      error: vi.fn(),
+      exit: vi.fn(),
+    };
+
+    await monitorWithAutoAbort({ runtime });
+
+    expect(runtime.log).toHaveBeenCalledWith(expect.stringContaining("polling cycle started"));
+    expect(runtime.error).not.toHaveBeenCalled();
+  });
+
+  it("keeps polling restart warnings on the error channel", async () => {
+    const abort = new AbortController();
+    const runtime = {
+      log: vi.fn(),
+      error: vi.fn(),
+      exit: vi.fn(),
+    };
+    const firstCycle = mockRunOnceWithStalledPollingRunner();
+    const secondCycle = mockRunOnceAndAbort(abort);
+
+    const monitor = monitorTelegramProvider(
+      withLegacyPolling({ token: "tok", abortSignal: abort.signal, runtime }),
+    );
+    await firstCycle.waitForTaskStart();
+
+    expect(emitUnhandledRejection(await makeTaggedPollingFetchError())).toBe(true);
+    await secondCycle.waitForRunStart();
+    await monitor;
+
+    expect(runtime.log).toHaveBeenCalledWith(
+      "[telegram][diag] marking transport dirty after polling network failure",
+    );
+    expect(runtime.error).toHaveBeenCalledWith(
+      expect.stringContaining("Restarting polling after unhandled network error"),
+    );
   });
 
   it("requires mention in groups by default", async () => {
@@ -889,10 +934,11 @@ describe("monitorTelegramProvider (grammY)", () => {
     });
 
     const webhookCall = latestMockCall(startTelegramWebhookSpy, "startTelegramWebhook") as [
-      { host?: string; setStatus?: unknown },
+      { host?: string; ownerAgentId?: string; setStatus?: unknown },
     ];
     const webhookOptions = webhookCall[0];
     expect(webhookOptions?.host).toBe("0.0.0.0");
+    expect(webhookOptions?.ownerAgentId).toBe("main");
     expect(webhookOptions?.setStatus).toBe(setStatus);
     expect(runSpy).not.toHaveBeenCalled();
   });
@@ -934,33 +980,6 @@ describe("monitorTelegramProvider (grammY)", () => {
     await monitor;
 
     expect(stop.mock.calls.length).toBeGreaterThanOrEqual(1);
-    expectRecoverableRetryState(2);
-    vi.useRealTimers();
-  });
-
-  it("uses configured Telegram polling stall threshold", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    const abort = new AbortController();
-    const firstCycle = mockRunOnceWithStalledPollingRunner();
-    const secondCycle = mockRunOnceAndAbort(abort);
-
-    const monitor = monitorTelegramProvider(
-      withLegacyPolling({
-        token: "tok",
-        abortSignal: abort.signal,
-        config: {
-          agents: { defaults: { maxConcurrent: 2 } },
-          channels: { telegram: { pollingStallThresholdMs: 30_000 } },
-        },
-      }),
-    );
-    await firstCycle.waitForRunStart();
-
-    vi.advanceTimersByTime(60_000);
-    await secondCycle.waitForRunStart();
-    await monitor;
-
-    expect(firstCycle.stop.mock.calls.length).toBeGreaterThanOrEqual(1);
     expectRecoverableRetryState(2);
     vi.useRealTimers();
   });

@@ -1,19 +1,28 @@
+// Memory Wiki plugin module implements apply behavior.
 import path from "node:path";
 import {
   replaceManagedMarkdownBlock,
   withTrailingNewline,
 } from "openclaw/plugin-sdk/memory-host-markdown";
-import { root as fsRoot } from "openclaw/plugin-sdk/security-runtime";
+import { readFiniteNumberParam } from "openclaw/plugin-sdk/param-readers";
+import { FsSafeError, root as fsRoot } from "openclaw/plugin-sdk/security-runtime";
+import {
+  asNonArrayRecord,
+  normalizeStringEntries,
+  uniqueStrings,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { compileMemoryWikiVault, type CompileMemoryWikiResult } from "./compile.js";
 import type { ResolvedMemoryWikiConfig } from "./config.js";
 import {
   parseWikiMarkdown,
   renderWikiMarkdown,
+  slugifyWikiPageStem,
   slugifyWikiSegment,
   normalizeSourceIds,
   normalizeWikiClaims,
   type WikiClaim,
 } from "./markdown.js";
+import { withMemoryWikiVaultMutation } from "./mutation-coordinator.js";
 import {
   readQueryableWikiPages,
   resolveQueryableWikiPageByLookup,
@@ -49,9 +58,9 @@ type UpdateMetadataMemoryWikiMutation = {
   status?: string;
 };
 
-export type ApplyMemoryWikiMutation =
-  | CreateSynthesisMemoryWikiMutation
-  | UpdateMetadataMemoryWikiMutation;
+type ApplyMemoryWikiMutation = CreateSynthesisMemoryWikiMutation | UpdateMetadataMemoryWikiMutation;
+
+type MemoryWikiMutationInputOp = ApplyMemoryWikiMutation["op"] | "synthesis" | "metadata";
 
 type ApplyMemoryWikiMutationResult = {
   changed: boolean;
@@ -61,9 +70,42 @@ type ApplyMemoryWikiMutationResult = {
   compile: CompileMemoryWikiResult;
 };
 
+function normalizeMutationConfidence(
+  params: Record<string, unknown>,
+  options: { allowNull: false },
+): number | undefined;
+function normalizeMutationConfidence(
+  params: Record<string, unknown>,
+  options: { allowNull: true },
+): number | null | undefined;
+function normalizeMutationConfidence(
+  params: Record<string, unknown>,
+  options: { allowNull: boolean },
+): number | null | undefined {
+  if (options.allowNull && params.confidence === null) {
+    return null;
+  }
+  return readFiniteNumberParam(params, "confidence", {
+    min: 0,
+    max: 1,
+  });
+}
+
+function normalizeMemoryWikiMutationOp(
+  op: MemoryWikiMutationInputOp,
+): ApplyMemoryWikiMutation["op"] {
+  if (op === "synthesis") {
+    return "create_synthesis";
+  }
+  if (op === "metadata") {
+    return "update_metadata";
+  }
+  return op;
+}
+
 export function normalizeMemoryWikiMutationInput(rawParams: unknown): ApplyMemoryWikiMutation {
-  const params = rawParams as {
-    op: ApplyMemoryWikiMutation["op"];
+  const params = asNonArrayRecord(rawParams) as {
+    op: MemoryWikiMutationInputOp;
     title?: string;
     body?: string;
     lookup?: string;
@@ -74,7 +116,8 @@ export function normalizeMemoryWikiMutationInput(rawParams: unknown): ApplyMemor
     confidence?: number | null;
     status?: string;
   };
-  if (params.op === "create_synthesis") {
+  const op = normalizeMemoryWikiMutationOp(params.op);
+  if (op === "create_synthesis") {
     if (!params.title?.trim()) {
       throw new Error("wiki mutation requires title for create_synthesis.");
     }
@@ -84,6 +127,9 @@ export function normalizeMemoryWikiMutationInput(rawParams: unknown): ApplyMemor
     if (!params.sourceIds || params.sourceIds.length === 0) {
       throw new Error("wiki mutation requires at least one sourceId for create_synthesis.");
     }
+    const confidence = normalizeMutationConfidence(params as Record<string, unknown>, {
+      allowNull: false,
+    });
     return {
       op: "create_synthesis",
       title: params.title,
@@ -92,13 +138,16 @@ export function normalizeMemoryWikiMutationInput(rawParams: unknown): ApplyMemor
       ...(Array.isArray(params.claims) ? { claims: normalizeWikiClaims(params.claims) } : {}),
       ...(params.contradictions ? { contradictions: params.contradictions } : {}),
       ...(params.questions ? { questions: params.questions } : {}),
-      ...(typeof params.confidence === "number" ? { confidence: params.confidence } : {}),
+      ...(typeof confidence === "number" ? { confidence } : {}),
       ...(params.status ? { status: params.status } : {}),
     };
   }
   if (!params.lookup?.trim()) {
     throw new Error("wiki mutation requires lookup for update_metadata.");
   }
+  const confidence = normalizeMutationConfidence(params as Record<string, unknown>, {
+    allowNull: true,
+  });
   return {
     op: "update_metadata",
     lookup: params.lookup,
@@ -106,7 +155,7 @@ export function normalizeMemoryWikiMutationInput(rawParams: unknown): ApplyMemor
     ...(Array.isArray(params.claims) ? { claims: normalizeWikiClaims(params.claims) } : {}),
     ...(params.contradictions ? { contradictions: params.contradictions } : {}),
     ...(params.questions ? { questions: params.questions } : {}),
-    ...(params.confidence !== undefined ? { confidence: params.confidence } : {}),
+    ...(confidence !== undefined ? { confidence } : {}),
     ...(params.status ? { status: params.status } : {}),
   };
 }
@@ -115,11 +164,7 @@ function normalizeUniqueStrings(values: string[] | undefined): string[] | undefi
   if (!values) {
     return undefined;
   }
-  const normalized = values
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .filter((value, index, all) => all.indexOf(value) === index);
-  return normalized;
+  return uniqueStrings(normalizeStringEntries(values));
 }
 
 function ensureHumanNotesBlock(body: string): string {
@@ -149,6 +194,27 @@ function buildSynthesisBody(params: {
   return ensureHumanNotesBlock(withGenerated);
 }
 
+type VaultRoot = Awaited<ReturnType<typeof fsRoot>>;
+
+function isMissingWikiPageError(error: unknown): boolean {
+  return error instanceof FsSafeError && error.code === "not-found";
+}
+
+async function readExistingWikiPage(root: VaultRoot, pagePath: string): Promise<string> {
+  try {
+    return await root.readText(pagePath);
+  } catch {
+    try {
+      return await root.readText(pagePath);
+    } catch (retryError) {
+      if (isMissingWikiPageError(retryError)) {
+        return "";
+      }
+      throw retryError;
+    }
+  }
+}
+
 async function writeWikiPage(params: {
   rootDir: string;
   relativePath: string;
@@ -162,7 +228,7 @@ async function writeWikiPage(params: {
       body: params.body,
     }),
   );
-  const existing = await root.readText(params.relativePath).catch(() => "");
+  const existing = await readExistingWikiPage(root, params.relativePath);
   if (existing === rendered) {
     return false;
   }
@@ -183,9 +249,10 @@ async function applyCreateSynthesisMutation(params: {
   mutation: CreateSynthesisMemoryWikiMutation;
 }): Promise<{ changed: boolean; pagePath: string; pageId: string }> {
   const slug = slugifyWikiSegment(params.mutation.title);
-  const pagePath = path.join("syntheses", `${slug}.md`).replace(/\\/g, "/");
+  const pageStem = slugifyWikiPageStem(params.mutation.title);
+  const pagePath = path.join("syntheses", `${pageStem}.md`).replace(/\\/g, "/");
   const root = await fsRoot(params.config.vault.path);
-  const existing = await root.readText(pagePath).catch(() => "");
+  const existing = await readExistingWikiPage(root, pagePath);
   const parsed = parseWikiMarkdown(existing);
   const pageId =
     (typeof parsed.frontmatter.id === "string" && parsed.frontmatter.id.trim()) ||
@@ -295,7 +362,7 @@ async function applyUpdateMetadataMutation(params: {
   };
 }
 
-export async function applyMemoryWikiMutation(params: {
+async function applyMemoryWikiMutationUnlocked(params: {
   config: ResolvedMemoryWikiConfig;
   mutation: ApplyMemoryWikiMutation;
 }): Promise<ApplyMemoryWikiMutationResult> {
@@ -318,4 +385,13 @@ export async function applyMemoryWikiMutation(params: {
     ...(result.pageId ? { pageId: result.pageId } : {}),
     compile,
   };
+}
+
+export async function applyMemoryWikiMutation(params: {
+  config: ResolvedMemoryWikiConfig;
+  mutation: ApplyMemoryWikiMutation;
+}): Promise<ApplyMemoryWikiMutationResult> {
+  return await withMemoryWikiVaultMutation(params.config.vault.path, () =>
+    applyMemoryWikiMutationUnlocked(params),
+  );
 }

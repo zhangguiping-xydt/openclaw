@@ -1,3 +1,4 @@
+// Tests origin routing helpers that preserve message provider, account, and target ids.
 import { describe, expect, it } from "vitest";
 import {
   resolveOriginAccountId,
@@ -21,6 +22,15 @@ describe("origin-routing helpers", () => {
     });
 
     expect(provider).toBe("workchat");
+  });
+
+  it("canonicalizes built-in aliases before comparing delivery routes", () => {
+    expect(
+      resolveOriginMessageProvider({
+        originatingChannel: "imsg",
+        provider: "imessage",
+      }),
+    ).toBe("imessage");
   });
 
   it("prefers originating destination over fallback destination", () => {

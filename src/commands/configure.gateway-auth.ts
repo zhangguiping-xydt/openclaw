@@ -1,5 +1,6 @@
+// Configure wizard model/auth selection and gateway auth config helpers.
+import { resolveMutableAgentEntry } from "../agents/agent-scope-config.js";
 import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
-import { resolveDefaultAgentWorkspaceDir } from "../agents/workspace.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import type { OpenClawConfig, GatewayAuthConfig } from "../config/config.js";
 import { isSecretRef, type SecretInput } from "../config/types.secrets.js";
@@ -10,11 +11,16 @@ import { applyAuthChoice, resolvePreferredProviderForAuthChoice } from "./auth-c
 import {
   applyModelAllowlist,
   applyModelFallbacksFromSelection,
-  applyPrimaryModel,
   promptDefaultModel,
   promptModelAllowlist,
 } from "./model-picker.js";
 import { loadStaticManifestCatalogRowsForList } from "./models/list.manifest-catalog.js";
+import {
+  applyAgentModelDefaults,
+  applyOnboardingPrimaryModel,
+  resolveOnboardingAgentTarget,
+} from "./onboard-agent-target.js";
+import type { OnboardingAgentTarget } from "./onboard-agent-target.js";
 import { promptCustomApiConfig } from "./onboard-custom.js";
 import { randomToken } from "./random-token.js";
 
@@ -110,6 +116,27 @@ function resolveProviderFromModelRef(model: string | undefined): string | undefi
   return slashIndex > 0 ? trimmed?.slice(0, slashIndex) : undefined;
 }
 
+function resolveCanonicalOpenAISelectionForLegacyCodexPrimary(
+  cfg: OpenClawConfig,
+  target: OnboardingAgentTarget,
+  selectedModels: readonly string[],
+): string | undefined {
+  const currentModel =
+    resolveMutableAgentEntry(cfg, target.agentId)?.model ?? cfg.agents?.defaults?.model;
+  const primary =
+    typeof currentModel === "string"
+      ? currentModel.trim()
+      : currentModel && typeof currentModel === "object" && typeof currentModel.primary === "string"
+        ? currentModel.primary.trim()
+        : undefined;
+  const modelId = primary?.startsWith("codex/") ? primary.slice("codex/".length).trim() : "";
+  if (!modelId) {
+    return undefined;
+  }
+  const canonical = `openai/${modelId}`;
+  return selectedModels.find((model) => model.trim() === canonical);
+}
+
 function resolveConfiguredProviderFromAuthChange(params: {
   before: OpenClawConfig;
   after: OpenClawConfig;
@@ -137,6 +164,7 @@ function resolveConfiguredProviderFromAuthChange(params: {
   );
 }
 
+/** Build gateway auth config, preserving Tailscale allowance and generating missing tokens. */
 export function buildGatewayAuthConfig(params: {
   existing?: GatewayAuthConfig;
   mode: GatewayAuthChoice;
@@ -177,18 +205,20 @@ export function buildGatewayAuthConfig(params: {
   return base;
 }
 
+/** Prompt for model provider credentials and explicit default model policy settings. */
 export async function promptAuthConfig(
   cfg: OpenClawConfig,
   runtime: RuntimeEnv,
   prompter: WizardPrompter,
+  target: OnboardingAgentTarget = resolveOnboardingAgentTarget(cfg),
 ): Promise<OpenClawConfig> {
   let next = cfg;
-  let authChoice: string = "skip";
+  let authChoice = "skip";
   let preferredProvider: string | undefined;
   while (true) {
     authChoice = await promptAuthChoiceGrouped({
       prompter,
-      store: ensureAuthProfileStore(undefined, {
+      store: ensureAuthProfileStore(target.agentDir, {
         allowKeychainPrompt: false,
       }),
       includeSkip: true,
@@ -204,7 +234,7 @@ export async function promptAuthConfig(
           });
 
     if (authChoice === "custom-api-key") {
-      const customResult = await promptCustomApiConfig({ prompter, runtime, config: next });
+      const customResult = await promptCustomApiConfig({ prompter, runtime, config: next, target });
       next = customResult.config;
       break;
     }
@@ -219,14 +249,16 @@ export async function promptAuthConfig(
         loadCatalog: true,
         browseCatalogOnDemand: true,
         preferredProvider,
-        workspaceDir: resolveDefaultAgentWorkspaceDir(),
+        agentId: target.agentId,
+        agentDir: target.agentDir,
+        workspaceDir: target.workspaceDir,
         runtime,
       });
       if (modelSelection.config) {
         next = modelSelection.config;
       }
       if (modelSelection.model) {
-        next = applyPrimaryModel(next, modelSelection.model);
+        next = applyOnboardingPrimaryModel(next, target, modelSelection.model);
         preferredProvider = resolveProviderFromModelRef(modelSelection.model) ?? preferredProvider;
       }
       break;
@@ -238,10 +270,24 @@ export async function promptAuthConfig(
       config: next,
       prompter,
       runtime,
-      setDefaultModel: true,
+      agentId: target.agentId,
+      agentDir: target.agentDir,
+      setDefaultModel: false,
       preserveExistingDefaultModel: true,
     });
     next = applied.config;
+    if (applied.agentModelOverride) {
+      const targeted = applyOnboardingPrimaryModel(next, target, applied.agentModelOverride);
+      next = {
+        ...targeted,
+        agents: {
+          ...targeted.agents,
+          ...(beforeAuthConfig.agents?.defaults === undefined
+            ? { defaults: undefined }
+            : { defaults: beforeAuthConfig.agents.defaults }),
+        },
+      };
+    }
     preferredProvider = resolveConfiguredProviderFromAuthChange({
       before: beforeAuthConfig,
       after: next,
@@ -257,32 +303,54 @@ export async function promptAuthConfig(
     const modelPrompt = await resolveProviderChoiceModelPrompt({
       authChoice,
       config: next,
-      workspaceDir: resolveDefaultAgentWorkspaceDir(),
+      workspaceDir: target.workspaceDir,
       env: process.env,
     });
     const promptProvider =
       modelPrompt?.provider ?? preferredProvider ?? resolveSingleConfiguredProvider(next);
+    const hasPromptProviderConfiguredModels = hasConfiguredProviderModels(next, promptProvider);
+    const hasPromptProviderStaticManifestRows = hasStaticManifestCatalogRows(next, promptProvider);
+    const shouldLoadModelCatalog =
+      modelPrompt?.loadCatalog ??
+      (hasPromptProviderConfiguredModels || hasPromptProviderStaticManifestRows);
+    const useProviderScopedCatalog = Boolean(
+      promptProvider &&
+      shouldLoadModelCatalog &&
+      (modelPrompt?.loadCatalog === true || hasPromptProviderConfiguredModels),
+    );
     const allowlistSelection = await promptModelAllowlist({
       config: next,
       prompter,
-      workspaceDir: resolveDefaultAgentWorkspaceDir(),
+      agentId: target.agentId,
+      agentDir: target.agentDir,
+      workspaceDir: target.workspaceDir,
       env: process.env,
       allowedKeys: modelPrompt?.allowedKeys,
       initialSelections: modelPrompt?.initialSelections,
       message: modelPrompt?.message,
       preferredProvider: promptProvider,
-      loadCatalog:
-        modelPrompt?.loadCatalog ??
-        (hasConfiguredProviderModels(next, promptProvider) ||
-          hasStaticManifestCatalogRows(next, promptProvider)),
+      providerScopedCatalog: useProviderScopedCatalog,
+      loadCatalog: shouldLoadModelCatalog,
     });
     if (allowlistSelection.models) {
-      next = applyModelFallbacksFromSelection(next, allowlistSelection.models, {
-        scopeKeys: allowlistSelection.scopeKeys,
-      });
-      next = applyModelAllowlist(next, allowlistSelection.models, {
-        scopeKeys: allowlistSelection.scopeKeys,
-      });
+      const selectedModels = allowlistSelection.models;
+      const canonicalPrimary = resolveCanonicalOpenAISelectionForLegacyCodexPrimary(
+        next,
+        target,
+        selectedModels,
+      );
+      if (canonicalPrimary) {
+        next = applyOnboardingPrimaryModel(next, target, canonicalPrimary);
+      }
+      next = applyAgentModelDefaults(next, target, (projected) =>
+        applyModelAllowlist(
+          applyModelFallbacksFromSelection(projected, selectedModels, {
+            scopeKeys: allowlistSelection.scopeKeys,
+          }),
+          selectedModels,
+          { scopeKeys: allowlistSelection.scopeKeys },
+        ),
+      );
     }
   }
 

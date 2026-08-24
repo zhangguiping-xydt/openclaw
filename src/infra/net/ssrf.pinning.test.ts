@@ -1,3 +1,5 @@
+// SSRF pinning tests cover DNS pinning behavior, blocked DNS results, hostname
+// allowlists, and IPv4/IPv6 address ordering.
 import { describe, expect, it, vi } from "vitest";
 import {
   createPinnedLookup,
@@ -27,7 +29,7 @@ describe("ssrf pinning", () => {
         if (err) {
           reject(err);
         } else {
-          resolve({ address: address, family });
+          resolve({ address, family });
         }
       });
     });
@@ -60,7 +62,7 @@ describe("ssrf pinning", () => {
           if (err) {
             reject(err);
           } else {
-            resolve({ address: address, family });
+            resolve({ address, family });
           }
         });
       });
@@ -70,7 +72,7 @@ describe("ssrf pinning", () => {
           if (err) {
             reject(err);
           } else {
-            resolve({ address: address, family });
+            resolve({ address, family });
           }
         });
       });
@@ -136,7 +138,7 @@ describe("ssrf pinning", () => {
         if (err) {
           reject(err);
         } else {
-          resolve({ address: address });
+          resolve({ address });
         }
       });
     });
@@ -260,5 +262,79 @@ describe("ssrf pinning", () => {
     expect(pinned.hostname).toBe("localhost");
     expect(pinned.addresses).toEqual(["127.0.0.1"]);
     expect(lookup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["IPv4 unspecified", "0.0.0.0", 4],
+    ["IPv4 unspecified range", "0.42.42.42", 4],
+    ["IPv6 unspecified", "::", 6],
+    ["IPv4-mapped IPv6 unspecified", "::ffff:0.0.0.0", 6],
+    ["NAT64-embedded IPv4 unspecified", "64:ff9b::0.0.0.0", 6],
+    ["local-use NAT64", "64:ff9b:1:808:808:808:a9fe:a9fe", 6],
+  ] as const)(
+    "rejects a trusted private hostname rebound to %s",
+    async (_name, address, family) => {
+      const lookup = vi.fn(async () => [{ address, family }]) as unknown as LookupFn;
+
+      await expect(
+        resolvePinnedHostnameWithPolicy("model.lan", {
+          lookupFn: lookup,
+          policy: { allowedHostnames: ["model.lan"] },
+        }),
+      ).rejects.toThrow(SsrFBlockedError);
+    },
+  );
+
+  it("does not allow explicit localhost trust to resolve through an unspecified address", async () => {
+    const lookup = vi.fn(async () => [{ address: "0.0.0.0", family: 4 }]) as unknown as LookupFn;
+
+    await expect(
+      resolvePinnedHostnameWithPolicy("localhost", {
+        lookupFn: lookup,
+        policy: { allowedHostnames: ["localhost"] },
+      }),
+    ).rejects.toThrow(SsrFBlockedError);
+  });
+
+  describe("asynchronous delivery contract", () => {
+    function createLookup() {
+      return createPinnedLookup({
+        hostname: "api.telegram.org",
+        addresses: ["149.154.167.220", "2001:67c:4e8:f004::9"],
+      });
+    }
+
+    async function flushLookupCallback(): Promise<void> {
+      await new Promise<void>((resolve) => {
+        process.nextTick(resolve);
+      });
+    }
+
+    it("defers callbacks without lookup options", async () => {
+      const callback = vi.fn();
+      createLookup()("api.telegram.org", callback);
+
+      expect(callback).not.toHaveBeenCalled();
+      await flushLookupCallback();
+      expect(callback).toHaveBeenCalledWith(null, "149.154.167.220", 4);
+    });
+
+    it("defers callbacks for all-address lookups", async () => {
+      const callback = vi.fn();
+      createLookup()("api.telegram.org", { all: true }, callback);
+
+      expect(callback).not.toHaveBeenCalled();
+      await flushLookupCallback();
+      expect(callback).toHaveBeenCalledWith(null, [{ address: "149.154.167.220", family: 4 }]);
+    });
+
+    it("defers callbacks for explicit address families", async () => {
+      const callback = vi.fn();
+      createLookup()("api.telegram.org", { family: 6 }, callback);
+
+      expect(callback).not.toHaveBeenCalled();
+      await flushLookupCallback();
+      expect(callback).toHaveBeenCalledWith(null, "2001:67c:4e8:f004::9", 6);
+    });
   });
 });

@@ -1,4 +1,6 @@
+// QA Lab tests cover suite.summary json plugin behavior.
 import { describe, expect, it } from "vitest";
+import { buildQaSuiteEvidenceSummary } from "./evidence-summary.js";
 import { buildQaSuiteSummaryJson } from "./suite.js";
 
 describe("buildQaSuiteSummaryJson", () => {
@@ -13,26 +15,68 @@ describe("buildQaSuiteSummaryJson", () => {
     startedAt: new Date("2026-04-11T00:00:00.000Z"),
     finishedAt: new Date("2026-04-11T00:05:00.000Z"),
     providerMode: "mock-openai" as const,
-    primaryModel: "openai/gpt-5.5",
-    alternateModel: "openai/gpt-5.5-alt",
+    primaryModel: "openai/gpt-5.6-luna",
+    alternateModel: "openai/gpt-5.6-luna-alt",
     fastMode: true,
     concurrency: 2,
   };
 
   it("records provider/model/mode so parity gates can verify labels", () => {
     const json = buildQaSuiteSummaryJson(baseParams);
+    expect(json.run.status).toBe("completed");
     expect(json.run.startedAt).toBe("2026-04-11T00:00:00.000Z");
     expect(json.run.finishedAt).toBe("2026-04-11T00:05:00.000Z");
     expect(json.run.providerMode).toBe("mock-openai");
-    expect(json.run.primaryModel).toBe("openai/gpt-5.5");
+    expect(json.run.primaryModel).toBe("openai/gpt-5.6-luna");
     expect(json.run.primaryProvider).toBe("openai");
-    expect(json.run.primaryModelName).toBe("gpt-5.5");
-    expect(json.run.alternateModel).toBe("openai/gpt-5.5-alt");
+    expect(json.run.primaryModelName).toBe("gpt-5.6-luna");
+    expect(json.run.alternateModel).toBe("openai/gpt-5.6-luna-alt");
     expect(json.run.alternateProvider).toBe("openai");
-    expect(json.run.alternateModelName).toBe("gpt-5.5-alt");
+    expect(json.run.alternateModelName).toBe("gpt-5.6-luna-alt");
     expect(json.run.fastMode).toBe(true);
     expect(json.run.concurrency).toBe(2);
+    expect(json.run.channelDriver).toBeNull();
+    expect(json.run.channel).toBeNull();
+    expect(json.run.channelCapabilityMatrixPath).toBeNull();
+    expect(json.run.channelDriverSmokePath).toBeNull();
     expect(json.run.scenarioIds).toBeNull();
+  });
+
+  it("distinguishes an in-progress artifact from terminal suite output", () => {
+    const json = buildQaSuiteSummaryJson({ ...baseParams, status: "running" });
+
+    expect(json.run.status).toBe("running");
+  });
+
+  it("records Crabline channel-driver metadata when selected", () => {
+    const json = buildQaSuiteSummaryJson({
+      ...baseParams,
+      channelDriver: "crabline",
+      channelDriverSelection: {
+        capabilityMatrixPath: "crabline-fake-provider-capabilities.json",
+        channel: "telegram",
+        channelDriver: "crabline",
+        smokeArtifactPath: "crabline-fake-provider-smoke.json",
+      },
+    });
+
+    expect(json.run.channelDriver).toBe("crabline");
+    expect(json.run.channel).toBe("telegram");
+    expect(json.run.channelCapabilityMatrixPath).toBe("crabline-fake-provider-capabilities.json");
+    expect(json.run.channelDriverSmokePath).toBe("crabline-fake-provider-smoke.json");
+  });
+
+  it("records realized non-Crabline channel metadata", () => {
+    const json = buildQaSuiteSummaryJson({
+      ...baseParams,
+      channel: "telegram",
+      channelDriver: "live",
+    });
+
+    expect(json.run.channelDriver).toBe("live");
+    expect(json.run.channel).toBe("telegram");
+    expect(json.run.channelCapabilityMatrixPath).toBeNull();
+    expect(json.run.channelDriverSmokePath).toBeNull();
   });
 
   it("includes scenarioIds in run metadata when provided", () => {
@@ -47,14 +91,14 @@ describe("buildQaSuiteSummaryJson", () => {
   it("records the runtime pair when the suite runs the runtime axis", () => {
     const json = buildQaSuiteSummaryJson({
       ...baseParams,
-      runtimePair: ["pi", "codex"],
+      runtimePair: ["openclaw", "codex"],
     });
 
-    expect(json.run.runtimePair).toEqual(["pi", "codex"]);
+    expect(json.run.runtimePair).toEqual(["openclaw", "codex"]);
   });
 
   it("treats an empty scenarioIds array as unspecified (no filter)", () => {
-    // A CLI path that omits --scenario passes an empty array to runQaSuite.
+    // A CLI path that omits --scenario passes an empty array to runQaFlowSuite.
     // The summary must encode that as null so downstream parity/report
     // tooling doesn't interpret a full run as an explicit empty selection.
     const json = buildQaSuiteSummaryJson({
@@ -67,12 +111,12 @@ describe("buildQaSuiteSummaryJson", () => {
   it("records an Anthropic baseline lane cleanly for parity runs", () => {
     const json = buildQaSuiteSummaryJson({
       ...baseParams,
-      primaryModel: "anthropic/claude-opus-4-7",
+      primaryModel: "anthropic/claude-opus-4-8",
       alternateModel: "anthropic/claude-sonnet-4-6",
     });
-    expect(json.run.primaryModel).toBe("anthropic/claude-opus-4-7");
+    expect(json.run.primaryModel).toBe("anthropic/claude-opus-4-8");
     expect(json.run.primaryProvider).toBe("anthropic");
-    expect(json.run.primaryModelName).toBe("claude-opus-4-7");
+    expect(json.run.primaryModelName).toBe("claude-opus-4-8");
     expect(json.run.alternateModel).toBe("anthropic/claude-sonnet-4-6");
     expect(json.run.alternateProvider).toBe("anthropic");
     expect(json.run.alternateModelName).toBe("claude-sonnet-4-6");
@@ -99,7 +143,54 @@ describe("buildQaSuiteSummaryJson", () => {
       total: 2,
       passed: 1,
       failed: 1,
+      skipped: 0,
     });
+  });
+
+  it("includes skipped scenarios in the canonical summary counts", () => {
+    const json = buildQaSuiteSummaryJson({
+      ...baseParams,
+      scenarios: [
+        ...baseParams.scenarios,
+        { name: "Scenario C", status: "skip" as const, steps: [] },
+        { name: "Scenario D", status: "skip" as const, steps: [] },
+      ],
+    });
+
+    expect(json.counts).toEqual({
+      total: 4,
+      passed: 1,
+      failed: 1,
+      skipped: 2,
+    });
+  });
+
+  it("preserves the evidence summary when provided", () => {
+    const evidence = buildQaSuiteEvidenceSummary({
+      artifactPaths: [{ kind: "summary", path: "qa-suite-summary.json" }],
+      scenarioDefinitions: [
+        {
+          id: "dm-chat-baseline",
+          title: "DM baseline conversation",
+          sourcePath: "qa/scenarios/channels/dm-chat-baseline.yaml",
+          surface: "dm",
+          coverage: {
+            primary: ["channels.dm"],
+          },
+        },
+      ],
+      channelId: "qa-channel",
+      generatedAt: "2026-04-11T00:05:00.000Z",
+      primaryModel: "mock-openai/gpt-5.6-luna",
+      providerMode: "mock-openai",
+      scenarioResults: [{ name: "DM baseline conversation", status: "pass" }],
+    });
+    const json = buildQaSuiteSummaryJson({
+      ...baseParams,
+      evidence,
+    });
+
+    expect(json.evidence).toEqual(evidence);
   });
 
   it("preserves scenario-level runtime parity payloads", () => {
@@ -112,10 +203,15 @@ describe("buildQaSuiteSummaryJson", () => {
           steps: [],
           runtimeParity: {
             scenarioId: "scenario-a",
+            runtimeParityUsage: {
+              expectation: "not-applicable" as const,
+              reason: "Local fixture only; no assistant turn runs.",
+            },
             drift: "none" as const,
             cells: {
-              pi: {
-                runtime: "pi" as const,
+              openclaw: {
+                runtime: "openclaw" as const,
+                status: "pass" as const,
                 transcriptBytes: "",
                 toolCalls: [],
                 finalText: "done",
@@ -125,6 +221,7 @@ describe("buildQaSuiteSummaryJson", () => {
               },
               codex: {
                 runtime: "codex" as const,
+                status: "pass" as const,
                 transcriptBytes: "",
                 toolCalls: [],
                 finalText: "done",
@@ -141,6 +238,14 @@ describe("buildQaSuiteSummaryJson", () => {
     expect(json.scenarios[0]).toMatchObject({
       runtimeParity: {
         scenarioId: "scenario-a",
+        cells: {
+          openclaw: { status: "pass" },
+          codex: { status: "pass" },
+        },
+        runtimeParityUsage: {
+          expectation: "not-applicable",
+          reason: "Local fixture only; no assistant turn runs.",
+        },
         drift: "none",
       },
     });
