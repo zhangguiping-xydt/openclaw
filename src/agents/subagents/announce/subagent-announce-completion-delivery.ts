@@ -25,7 +25,9 @@ import {
 import type { SubagentAnnounceDeliveryResult } from "./subagent-announce-dispatch.js";
 import { inferDeliveryTargetChatType } from "./subagent-announce-origin.js";
 
-export function isGatewayAgentRunPending(response: unknown): boolean {
+export function isGatewayAgentRunPending(
+  response: unknown,
+): response is { status: "accepted" | "in_flight" | "started" } {
   if (!response || typeof response !== "object") {
     return false;
   }
