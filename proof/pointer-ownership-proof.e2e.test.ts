@@ -357,9 +357,7 @@ async function readUiState(page: Page): Promise<UiState> {
       ownerPointerId,
       panelWidth: surface.getBoundingClientRect().width,
       persistedWidth,
-      reserveRight: document.documentElement.style.getPropertyValue(
-        "--oc-terminal-reserve-right",
-      ),
+      reserveRight: document.documentElement.style.getPropertyValue("--oc-terminal-reserve-right"),
       touchAction: getComputedStyle(resizer).touchAction,
       trace,
     };
@@ -422,7 +420,7 @@ async function screenshot(page: Page, name: string): Promise<void> {
 
 suite.define(() => {
   it("reopens for the next pointer while the original owner remains down", async () => {
-    expect(candidateSha).toBe("f622f22fce89d92f079a2c7e6961974ec35a61ce");
+    expect(candidateSha).toBe("3de75c864c9f30117b70a360c398963c186a9dec");
     expect(proofDir).not.toBe("");
     await fs.mkdir(proofDir, { recursive: true });
 
@@ -689,9 +687,7 @@ suite.define(() => {
         throw new Error("Reopened terminal resizer has no live Chromium geometry");
       }
       const nextPointerX = Math.round(reopenedBox.x + reopenedBox.width / 2);
-      const nextPointerY = Math.round(
-        reopenedBox.y + Math.min(230, reopenedBox.height * 0.45),
-      );
+      const nextPointerY = Math.round(reopenedBox.y + Math.min(230, reopenedBox.height * 0.45));
       const nextPointerMovedX = nextPointerX - nextPointerDelta;
 
       await page.mouse.move(nextPointerX, nextPointerY);
@@ -730,9 +726,7 @@ suite.define(() => {
       await page.waitForTimeout(900);
 
       await page.mouse.up();
-      await expect
-        .poll(async () => (await readUiState(page)).capturedByLatestPointer)
-        .toBe(false);
+      await expect.poll(async () => (await readUiState(page)).capturedByLatestPointer).toBe(false);
       await expect
         .poll(async () => (await readUiState(page)).persistedWidth)
         .toBe(expectedFinalWidth);
@@ -793,7 +787,8 @@ suite.define(() => {
       failure = error;
       const diagnostic: Record<string, unknown> = {
         candidateSha,
-        error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
+        error:
+          error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
       };
       try {
         diagnostic.layout = await readPersistedLayout(page);

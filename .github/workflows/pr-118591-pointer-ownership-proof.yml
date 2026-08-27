@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  CANDIDATE_SHA: f622f22fce89d92f079a2c7e6961974ec35a61ce
+  CANDIDATE_SHA: 3de75c864c9f30117b70a360c398963c186a9dec
   PROOF_DIR: .artifacts/control-ui-e2e/pr-118591-pointer-ownership
 
 jobs:
@@ -42,21 +42,23 @@ jobs:
           install-bun: "false"
           use-actions-cache: "true"
 
-      - name: Run focused dock ownership tests
+      - name: Run focused pointer ownership tests
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$PROOF_DIR"
           {
-            node scripts/run-vitest.mjs ui/src/components/dock-layout-controller.test.ts
-            node scripts/run-vitest.mjs ui/src/components/terminal/terminal-panel-resizer.test.ts
+            node scripts/run-vitest.mjs \
+              ui/src/components/resizable-divider.test.ts \
+              ui/src/components/browser/browser-panel-controller-annotation.test.ts \
+              ui/src/components/browser/browser-panel.test.ts
           } 2>&1 | tee "$PROOF_DIR/focused-tests.log"
 
       - name: Upload focused test output
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-118591-focused-tests-f622f22fc
+          name: pr-118591-focused-tests-3de75c864
           path: ${{ env.PROOF_DIR }}/focused-tests.log
           if-no-files-found: error
           retention-days: 30
@@ -141,15 +143,15 @@ jobs:
             echo
             echo "- Candidate: \`$CANDIDATE_SHA\`"
             echo "- Input: Chromium CDP touch-owner + mouse-foreign events"
-            echo "- Scenario: close during owner touch; reopen; next pointer resizes before old touch ends"
-            echo "- Artifact: \`pr-118591-pointer-ownership-f622f22fc\`"
+            echo "- Scenario: shared divider ignores a foreign pointer, then clears ownership on close/reopen"
+            echo "- Artifact: \`pr-118591-pointer-ownership-3de75c864\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload screenshots, recording, and evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-118591-pointer-ownership-f622f22fc
+          name: pr-118591-pointer-ownership-3de75c864
           path: ${{ env.PROOF_DIR }}
           if-no-files-found: error
           retention-days: 30
