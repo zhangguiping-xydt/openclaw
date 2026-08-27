@@ -13,7 +13,6 @@ import {
   type MainSessionRecoveryPendingTarget,
   type MainSessionRecoveryOwnerLease,
 } from "../../agents/main-session-recovery/main-session-recovery-store.js";
-import { loadPublishedGatewayReplyDispatchRuntime } from "../../agents/prepared-model-runtime.js";
 import { resolveScheduledToolPolicyContext } from "../../agents/scheduled-tool-policy.js";
 import { resolveIngressWorkspaceOverrideForSessionRun } from "../../agents/spawned-context.js";
 import { isExecutionIdentityCollectionEnabled } from "../../audit/audit-config.js";
@@ -212,10 +211,14 @@ export function startAgentRunExecution(params: {
       const ingressAgentId = params.resolvedSessionKey
         ? params.activeSessionAgentId
         : params.agentId;
-      const replyDispatchRuntime = await loadPublishedGatewayReplyDispatchRuntime({
-        agentId: params.activeSessionAgentId,
-        abortSignal: prepared.activeRunAbort.controller.signal,
-      });
+      // Resolve through the live Gateway context rather than this module's imports. Plugin
+      // loaders can host a second OpenClaw module graph; the context callback remains bound to
+      // the Gateway owner that published this generation.
+      const replyDispatchRuntime =
+        await params.context.loadPublishedGatewayReplyDispatchRuntime?.({
+          agentId: params.activeSessionAgentId,
+          abortSignal: prepared.activeRunAbort.controller.signal,
+        });
       if (!replyDispatchRuntime?.pluginGeneration) {
         throw new Error(
           `prepared reply dispatch runtime was not published for ${params.activeSessionAgentId}`,

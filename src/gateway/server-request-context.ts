@@ -54,6 +54,7 @@ type GatewayRequestContextParams = {
   listSessionPendingApprovals: GatewayRequestContext["listSessionPendingApprovals"];
   loadGatewayModelCatalog: GatewayRequestContext["loadGatewayModelCatalog"];
   loadGatewayModelCatalogSnapshot: GatewayRequestContext["loadGatewayModelCatalogSnapshot"];
+  loadPublishedGatewayReplyDispatchRuntime?: GatewayRequestContext["loadPublishedGatewayReplyDispatchRuntime"];
   readPreparedGatewayModelCatalog?: GatewayRequestContext["readPreparedGatewayModelCatalog"];
   readChatMetadata: GatewayRequestContext["readChatMetadata"];
   readChatStartupProjection?: GatewayRequestContext["readChatStartupProjection"];
@@ -209,6 +210,9 @@ export function createGatewayRequestContext(
     listSessionPendingApprovals: params.listSessionPendingApprovals,
     loadGatewayModelCatalog: params.loadGatewayModelCatalog,
     loadGatewayModelCatalogSnapshot: params.loadGatewayModelCatalogSnapshot,
+    ...(params.loadPublishedGatewayReplyDispatchRuntime
+      ? { loadPublishedGatewayReplyDispatchRuntime: params.loadPublishedGatewayReplyDispatchRuntime }
+      : {}),
     ...(params.readPreparedGatewayModelCatalog
       ? { readPreparedGatewayModelCatalog: params.readPreparedGatewayModelCatalog }
       : {}),
