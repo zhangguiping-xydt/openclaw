@@ -10,9 +10,94 @@ permissions:
 
 env:
   CANDIDATE_SHA: f9df0f55a5924586b977be6977de55a14a73688c
+  PRE_FIX_SHA: 162e8d13940461837403b3a1b54a08b62f571786
   PROOF_DIR: .artifacts/control-ui-e2e/pr-118591-pointer-ownership
 
 jobs:
+  pre-fix-regressions:
+    name: pre-fix focused regressions fail
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate tests
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Assert exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$CANDIDATE_SHA" ]]; then
+            echo "Expected $CANDIDATE_SHA, checked out $actual_sha" >&2
+            exit 1
+          fi
+
+      - name: Setup candidate Node and pnpm environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          use-actions-cache: "true"
+
+      - name: Restore pre-fix production files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 \
+            https://github.com/openclaw/openclaw.git \
+            "$PRE_FIX_SHA"
+          git checkout "$PRE_FIX_SHA" -- \
+            ui/src/components/resizable-divider.ts \
+            ui/src/components/browser/browser-panel-controller-input.ts \
+            ui/src/components/browser/browser-panel-controller.ts \
+            ui/src/components/browser/browser-panel-render.ts \
+            ui/src/components/browser/browser-panel.ts
+          test "$(git rev-parse FETCH_HEAD)" = "$PRE_FIX_SHA"
+          git diff --cached --name-only --diff-filter=M
+
+      - name: Prove focused regressions fail before the fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROOF_DIR/pre-fix"
+
+          if node scripts/run-vitest.mjs \
+            ui/src/components/resizable-divider.test.ts \
+            -t "ends only the owner gesture when pointer capture is lost" \
+            2>&1 | tee "$PROOF_DIR/pre-fix/resizable-divider.log"; then
+            echo "Resizable-divider regression unexpectedly passed before the fix" >&2
+            exit 1
+          fi
+
+          if node scripts/run-vitest.mjs \
+            ui/src/components/browser/browser-panel-controller-annotation.test.ts \
+            -t "keeps a stroke owned until its pointer ends or loses capture" \
+            2>&1 | tee "$PROOF_DIR/pre-fix/browser-annotation-owner.log"; then
+            echo "Annotation-owner regression unexpectedly passed before the fix" >&2
+            exit 1
+          fi
+
+          if node scripts/run-vitest.mjs \
+            ui/src/components/browser/browser-panel.test.ts \
+            -t "ends an active annotation gesture" \
+            2>&1 | tee "$PROOF_DIR/pre-fix/browser-panel-lifecycle.log"; then
+            echo "Browser-panel lifecycle regression unexpectedly passed before the fix" >&2
+            exit 1
+          fi
+
+      - name: Upload pre-fix failure output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-118591-pre-fix-regressions-f9df0f55a
+          path: ${{ env.PROOF_DIR }}/pre-fix
+          if-no-files-found: error
+          retention-days: 30
+
   focused-tests:
     name: exact-head focused UI tests
     runs-on: ubuntu-24.04
