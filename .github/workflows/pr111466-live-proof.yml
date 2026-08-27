@@ -378,14 +378,20 @@ jobs:
             if (!held) {
               releasedTokens.add(token);
               appendJson(actionPath, {
-                action: token === state.waveOne ? "release_wave_1_pending" : "release_wave_2_pending",
+                action:
+                  token === state.waveOne
+                    ? "release_wave_1_after_yield_pending"
+                    : "release_wave_2_after_yield_pending",
                 requestNumber,
               });
               return;
             }
             heldReplies.delete(token);
             appendJson(actionPath, {
-              action: token === state.waveOne ? "release_wave_1" : "release_wave_2",
+              action:
+                token === state.waveOne
+                  ? "release_wave_1_after_yield"
+                  : "release_wave_2_after_yield",
               requestNumber,
             });
             sendEvents(held.response, held.events);
@@ -436,6 +442,7 @@ jobs:
               ];
             } else if (callId === state.spawnOneCall) {
               route = "yield_wave_1";
+              releaseToken = state.waveOne;
               appendJson(actionPath, { action: route, requestNumber });
               events = [
                 created(responseId),
@@ -450,6 +457,7 @@ jobs:
               ];
             } else if (callId === state.spawnTwoCall) {
               route = "yield_wave_2";
+              releaseToken = state.waveTwo;
               appendJson(actionPath, { action: route, requestNumber });
               events = [
                 created(responseId),
@@ -464,7 +472,6 @@ jobs:
               ];
             } else if (callId === state.yieldOneCall || callId === state.yieldTwoCall) {
               route = "yield_followup_empty";
-              releaseToken = callId === state.yieldOneCall ? state.waveOne : state.waveTwo;
               events = [created(responseId), completed(responseId)];
             } else if (
               state.waveTwo &&
@@ -617,8 +624,8 @@ jobs:
                     appendJson(actionPath, {
                       action:
                         outcome.holdToken === state.waveOne
-                          ? "release_wave_1_after_arrival"
-                          : "release_wave_2_after_arrival",
+                          ? "release_wave_1_after_yield_and_arrival"
+                          : "release_wave_2_after_yield_and_arrival",
                       requestNumber,
                     });
                     sendEvents(response, outcome.events);
@@ -627,8 +634,8 @@ jobs:
                   heldReplies.set(outcome.holdToken, { response, events: outcome.events });
                   return;
                 }
-                if (outcome.releaseToken) releaseHeldReply(outcome.releaseToken);
                 sendEvents(response, outcome.events);
+                if (outcome.releaseToken) releaseHeldReply(outcome.releaseToken);
               } catch (error) {
                 appendJson(actionPath, {
                   action: "provider_error",
@@ -794,10 +801,10 @@ jobs:
             .map((entry) => entry.action)
             .filter((name) =>
               [
-                "release_wave_1",
-                "release_wave_1_after_arrival",
-                "release_wave_2",
-                "release_wave_2_after_arrival",
+                "release_wave_1_after_yield",
+                "release_wave_1_after_yield_and_arrival",
+                "release_wave_2_after_yield",
+                "release_wave_2_after_yield_and_arrival",
               ].includes(name),
             );
           const nativeSpawnContracts = actions
