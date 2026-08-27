@@ -1,0 +1,186 @@
+name: PR 129825 Doctor exact-head proof
+
+on:
+  push:
+    branches:
+      - proof/pr-129825-1c79363
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: 1c79363d3ad936d2fa53634f107395231b13e046
+  PRE_FIX_SHA: 5d722708bc32cc70294f793dcc43a1ec3e61165d
+  PROOF_DIR: .artifacts/doctor-proof/pr-129825
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NO_COLOR: "1"
+
+jobs:
+  pre-fix-live:
+    name: pre-fix Doctor shows false disabled-scope conflict
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pre-fix head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.PRE_FIX_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Assert pre-fix head
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$PRE_FIX_SHA" ]]; then
+            echo "Expected $PRE_FIX_SHA, checked out $actual_sha" >&2
+            exit 1
+          fi
+
+      - name: Setup pre-fix Node and pnpm environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          cache-mode: restore
+
+      - name: Build pre-fix production CLI
+        run: |
+          pnpm build
+          pnpm ui:build
+
+      - name: Prove the false disabled-scope conflict is user-visible
+        shell: bash
+        run: |
+          set -euo pipefail
+          state_dir="$RUNNER_TEMP/pre-fix-disabled-scope"
+          log_dir="$PROOF_DIR/pre-fix"
+          mkdir -p "$state_dir" "$log_dir"
+          printf '%s\n' '{"messages":{"ackReactionScope":"none"},"channels":{"whatsapp":{"ackReaction":{"emoji":"👀","direct":false,"group":"never"}}}}' > "$state_dir/openclaw.json"
+          OPENCLAW_STATE_DIR="$state_dir" \
+            pnpm openclaw doctor --fix --non-interactive --yes --no-workspace-suggestions \
+            2>&1 | tee "$log_dir/disabled-scope.log"
+          grep -F \
+            'channels.whatsapp.ackReaction requested the "off" scope, but the final messages.ackReactionScope is "none"' \
+            "$log_dir/disabled-scope.log"
+
+      - name: Upload pre-fix live output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-129825-pre-fix-doctor-5d722708b
+          path: ${{ env.PROOF_DIR }}/pre-fix
+          if-no-files-found: error
+          retention-days: 30
+
+  exact-head-live:
+    name: exact-head built Doctor migration proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Assert exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$CANDIDATE_SHA" ]]; then
+            echo "Expected $CANDIDATE_SHA, checked out $actual_sha" >&2
+            exit 1
+          fi
+
+      - name: Setup candidate Node and pnpm environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          cache-mode: restore
+
+      - name: Build exact-head production CLI
+        run: |
+          pnpm build
+          pnpm ui:build
+
+      - name: Run exact-head Doctor scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_dir="$PROOF_DIR/exact-head"
+          mkdir -p "$log_dir"
+
+          unrepresentable_state="$RUNNER_TEMP/exact-unrepresentable"
+          mkdir -p "$unrepresentable_state"
+          printf '%s\n' '{"channels":{"whatsapp":{"ackReaction":{"emoji":"👀","direct":true,"group":"mentions"}}}}' > "$unrepresentable_state/openclaw.json"
+          OPENCLAW_STATE_DIR="$unrepresentable_state" \
+            pnpm openclaw doctor --fix --non-interactive --yes --no-workspace-suggestions \
+            2>&1 | tee "$log_dir/unrepresentable.log"
+          grep -F \
+            'channels.whatsapp.ackReaction acknowledged direct messages plus mentioned groups' \
+            "$log_dir/unrepresentable.log"
+          grep -F \
+            'The default "group-mentions" scope now applies and stops acknowledging direct messages.' \
+            "$log_dir/unrepresentable.log"
+
+          conflict_state="$RUNNER_TEMP/exact-representable-conflict"
+          mkdir -p "$conflict_state"
+          printf '%s\n' '{"channels":{"whatsapp":{"ackReaction":{"emoji":"👀","direct":false,"group":"always"},"accounts":{"work":{"ackReaction":{"emoji":"👀","direct":true,"group":"never"}}}}}}' > "$conflict_state/openclaw.json"
+          OPENCLAW_STATE_DIR="$conflict_state" \
+            pnpm openclaw doctor --fix --non-interactive --yes --no-workspace-suggestions \
+            2>&1 | tee "$log_dir/representable-conflict.log"
+          grep -F \
+            'channels.whatsapp.accounts.work.ackReaction requested the "direct" scope, but the final messages.ackReactionScope is "group-all"' \
+            "$log_dir/representable-conflict.log"
+
+          equivalent_state="$RUNNER_TEMP/exact-equivalent-disabled"
+          mkdir -p "$equivalent_state"
+          printf '%s\n' '{"messages":{"ackReactionScope":"none"},"channels":{"whatsapp":{"ackReaction":{"emoji":"👀","direct":false,"group":"never"}}}}' > "$equivalent_state/openclaw.json"
+          OPENCLAW_STATE_DIR="$equivalent_state" \
+            pnpm openclaw doctor --fix --non-interactive --yes --no-workspace-suggestions \
+            2>&1 | tee "$log_dir/equivalent-disabled.log"
+          if grep -F \
+            'channels.whatsapp.ackReaction requested the "off" scope' \
+            "$log_dir/equivalent-disabled.log"; then
+            echo 'Equivalent "off" and "none" scopes produced a false conflict.' >&2
+            exit 1
+          fi
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const config = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            if (config.messages?.ackReactionScope !== "none") {
+              throw new Error("Doctor changed the canonical none scope");
+            }
+            if (config.channels?.whatsapp?.ackReaction !== undefined) {
+              throw new Error("Doctor retained the retired root ackReaction block");
+            }
+          ' "$equivalent_state/openclaw.json"
+
+      - name: Publish exact-head proof summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## PR #129825 exact-head Doctor proof"
+            echo
+            echo "- Candidate: \`$CANDIDATE_SHA\`"
+            echo "- Runtime: built production CLI via \`pnpm openclaw doctor --fix\`"
+            echo "- Verified: unrepresentable direct-plus-mentioned-groups diagnostic"
+            echo "- Verified: representable root/account scope-conflict diagnostic"
+            echo "- Verified: equivalent \`off\`/\`none\` scopes remain quiet and preserve \`none\`"
+            echo "- Artifact: \`pr-129825-exact-head-doctor-1c79363d3\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload exact-head live output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-129825-exact-head-doctor-1c79363d3
+          path: ${{ env.PROOF_DIR }}/exact-head
+          if-no-files-found: error
+          retention-days: 30
