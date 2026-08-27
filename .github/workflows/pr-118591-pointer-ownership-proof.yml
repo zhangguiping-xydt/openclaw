@@ -41,7 +41,7 @@ jobs:
         with:
           node-version: "24.x"
           install-bun: "false"
-          use-actions-cache: "true"
+          cache-mode: restore
 
       - name: Restore pre-fix production files
         shell: bash
@@ -125,7 +125,7 @@ jobs:
         with:
           node-version: "24.x"
           install-bun: "false"
-          use-actions-cache: "true"
+          cache-mode: restore
 
       - name: Run focused pointer ownership tests
         shell: bash
@@ -187,7 +187,7 @@ jobs:
         with:
           node-version: "24.x"
           install-bun: "false"
-          use-actions-cache: "true"
+          cache-mode: restore
 
       - name: Install candidate-pinned Chromium
         run: node --import tsx scripts/ensure-playwright-chromium.mts
@@ -238,5 +238,65 @@ jobs:
         with:
           name: pr-118591-pointer-ownership-f9df0f55a
           path: ${{ env.PROOF_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+  upstream-browser-extension-retry:
+    name: exact-head browser extension retry
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Assert exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$CANDIDATE_SHA" ]]; then
+            echo "Expected $CANDIDATE_SHA, checked out $actual_sha" >&2
+            exit 1
+          fi
+
+      - name: Setup candidate Node and pnpm environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          cache-mode: restore
+
+      - name: Install exact CI Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --import tsx scripts/run-with-env.mts \
+            PLAYWRIGHT_BROWSERS_PATH=.artifacts/playwright-browsers \
+            -- node --import tsx scripts/ensure-playwright-chromium.mts \
+            --require-playwright-chromium
+
+      - name: Retry the unrelated upstream failure
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROOF_DIR/upstream-retry"
+          node --import tsx scripts/run-with-env.mts \
+            PLAYWRIGHT_BROWSERS_PATH=.artifacts/playwright-browsers \
+            OPENCLAW_BROWSER_EXTENSION_E2E=1 \
+            OPENCLAW_E2E_WORKERS=1 \
+            -- node scripts/run-vitest.mjs \
+            extensions/browser/chrome-extension/bootstrap.chromium.test.ts \
+            2>&1 | tee "$PROOF_DIR/upstream-retry/browser-extension.log"
+
+      - name: Upload retry output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-118591-browser-extension-retry-f9df0f55a
+          path: ${{ env.PROOF_DIR }}/upstream-retry
           if-no-files-found: error
           retention-days: 30
