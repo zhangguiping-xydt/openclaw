@@ -61,9 +61,17 @@ jobs:
           OPENCLAW_STATE_DIR="$state_dir" \
             pnpm openclaw doctor --fix --non-interactive --yes --no-workspace-suggestions \
             2>&1 | tee "$log_dir/disabled-scope.log"
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const path = process.argv[1];
+            const output = fs.readFileSync(path, "utf8")
+              .replace(/\u001b\[[0-9;]*m/gu, "")
+              .replace(/[\s│◇├└─╮╯╰]+/gu, " ");
+            fs.writeFileSync(`${path}.normalized.txt`, `${output}\n`);
+          ' "$log_dir/disabled-scope.log"
           grep -F \
             'channels.whatsapp.ackReaction requested the "off" scope, but the final messages.ackReactionScope is "none"' \
-            "$log_dir/disabled-scope.log"
+            "$log_dir/disabled-scope.log.normalized.txt"
 
       - name: Upload pre-fix live output
         if: always()
@@ -121,12 +129,20 @@ jobs:
           OPENCLAW_STATE_DIR="$unrepresentable_state" \
             pnpm openclaw doctor --fix --non-interactive --yes --no-workspace-suggestions \
             2>&1 | tee "$log_dir/unrepresentable.log"
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const path = process.argv[1];
+            const output = fs.readFileSync(path, "utf8")
+              .replace(/\u001b\[[0-9;]*m/gu, "")
+              .replace(/[\s│◇├└─╮╯╰]+/gu, " ");
+            fs.writeFileSync(`${path}.normalized.txt`, `${output}\n`);
+          ' "$log_dir/unrepresentable.log"
           grep -F \
             'channels.whatsapp.ackReaction acknowledged direct messages plus mentioned groups' \
-            "$log_dir/unrepresentable.log"
+            "$log_dir/unrepresentable.log.normalized.txt"
           grep -F \
             'The default "group-mentions" scope now applies and stops acknowledging direct messages.' \
-            "$log_dir/unrepresentable.log"
+            "$log_dir/unrepresentable.log.normalized.txt"
 
           conflict_state="$RUNNER_TEMP/exact-representable-conflict"
           mkdir -p "$conflict_state"
@@ -134,9 +150,17 @@ jobs:
           OPENCLAW_STATE_DIR="$conflict_state" \
             pnpm openclaw doctor --fix --non-interactive --yes --no-workspace-suggestions \
             2>&1 | tee "$log_dir/representable-conflict.log"
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const path = process.argv[1];
+            const output = fs.readFileSync(path, "utf8")
+              .replace(/\u001b\[[0-9;]*m/gu, "")
+              .replace(/[\s│◇├└─╮╯╰]+/gu, " ");
+            fs.writeFileSync(`${path}.normalized.txt`, `${output}\n`);
+          ' "$log_dir/representable-conflict.log"
           grep -F \
             'channels.whatsapp.accounts.work.ackReaction requested the "direct" scope, but the final messages.ackReactionScope is "group-all"' \
-            "$log_dir/representable-conflict.log"
+            "$log_dir/representable-conflict.log.normalized.txt"
 
           equivalent_state="$RUNNER_TEMP/exact-equivalent-disabled"
           mkdir -p "$equivalent_state"
@@ -144,9 +168,17 @@ jobs:
           OPENCLAW_STATE_DIR="$equivalent_state" \
             pnpm openclaw doctor --fix --non-interactive --yes --no-workspace-suggestions \
             2>&1 | tee "$log_dir/equivalent-disabled.log"
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const path = process.argv[1];
+            const output = fs.readFileSync(path, "utf8")
+              .replace(/\u001b\[[0-9;]*m/gu, "")
+              .replace(/[\s│◇├└─╮╯╰]+/gu, " ");
+            fs.writeFileSync(`${path}.normalized.txt`, `${output}\n`);
+          ' "$log_dir/equivalent-disabled.log"
           if grep -F \
             'channels.whatsapp.ackReaction requested the "off" scope' \
-            "$log_dir/equivalent-disabled.log"; then
+            "$log_dir/equivalent-disabled.log.normalized.txt"; then
             echo 'Equivalent "off" and "none" scopes produced a false conflict.' >&2
             exit 1
           fi
