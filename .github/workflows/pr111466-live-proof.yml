@@ -167,11 +167,30 @@ jobs:
           const proofDir = process.env.PROOF_DIR;
           const actionPath = proofDir + "/provider-actions.jsonl";
           const requestPath = proofDir + "/provider-requests.jsonl";
+          // Codex 0.150.1 defaults to V1 multi-agent and keeps deferred tools registered
+          // even when the model request omits tool metadata. Prefer a live advertised
+          // contract below when one exists; otherwise use the inspected pinned contract.
+          const pinnedSpawnTool = {
+            name: "spawn_agent",
+            namespace: "multi_agent_v1",
+            parameters: {
+              properties: {
+                agent_type: {},
+                fork_context: {},
+                items: {},
+                message: {},
+                model: {},
+                reasoning_effort: {},
+                service_tier: {},
+              },
+            },
+            source: "codex-0.150.1-default-v1-contract",
+          };
           const state = {
             waveOne: null,
             waveTwo: null,
             parent: null,
-            spawnTool: null,
+            spawnTool: pinnedSpawnTool,
             searchCall: "call_search_spawn_agent",
             spawnOneCall: "call_spawn_wave_1",
             yieldOneCall: "call_yield_wave_1",
