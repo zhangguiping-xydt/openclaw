@@ -490,10 +490,11 @@ export async function sendSubagentAnnounceDirectly(params: {
     const hasCompletionSideEffect = Boolean(
       directAnnounceResult && hasCommittedOutboundDeliveryEvidence(directAnnounceResult),
     );
-    const hasYieldedSessionSpawnContinuation = Boolean(
+    const hasYieldedContinuation = Boolean(
       directAnnounceResult &&
       directAnnounceResult.meta?.yielded === true &&
-      hasAcceptedSessionSpawnEvidence(directAnnounceResult.acceptedSessionSpawns),
+      (directAnnounceResult.runtimeContinuationStarted === true ||
+        hasAcceptedSessionSpawnEvidence(directAnnounceResult.acceptedSessionSpawns)),
     );
     const hasVisibleRequiredCompletionReply =
       hasMessagingToolDelivery ||
@@ -577,7 +578,7 @@ export async function sendSubagentAnnounceDirectly(params: {
       hasIntentionalSilentCompletionReply && !isSubagentCompletion;
     if (
       !hasVisibleCompletionReply &&
-      ((params.requireVisibleReply && !hasYieldedSessionSpawnContinuation) ||
+      ((params.requireVisibleReply && !hasYieldedContinuation) ||
         (params.expectsCompletionMessage &&
           !shouldDeliverAgentFinal &&
           !requiresMessageToolDelivery &&

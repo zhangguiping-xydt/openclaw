@@ -241,6 +241,17 @@ describe("terminal resolution", () => {
     ).toEqual({ viewId: "view-latest" });
   });
 
+  it("preserves runtime-owned continuation evidence for delivery", () => {
+    expect(
+      copyAttemptDeliveryState({
+        runtimeContinuationStarted: true,
+        messagingToolSentTexts: [],
+        messagingToolSentMediaUrls: [],
+        messagingToolSentTargets: [],
+      } as never),
+    ).toMatchObject({ runtimeContinuationStarted: true });
+  });
+
   it("retries a required empty reply even when deliberate silence is enabled", async () => {
     const activateInternalPrompt = vi.fn();
     const input = makeTerminalInput({
