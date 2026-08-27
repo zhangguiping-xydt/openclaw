@@ -86,7 +86,9 @@ export function createGatewayInstanceRuntime(
     operatorRoleActor: { kind: "system" },
     scopes: [WRITE_SCOPE],
   });
+  const assertAgentDispatchAvailable = () => assertDispatchAvailable("agent");
   const recoveryAgentTurns = createInternalAgentTurnFacade({
+    assertContextCurrent: assertAgentDispatchAvailable,
     client: recoveryClient,
     getContext: options.getContext,
     getMethodRegistry: options.getMethodRegistry,
@@ -133,6 +135,7 @@ export function createGatewayInstanceRuntime(
       );
       const agentTurns = needsDedicatedPrincipal
         ? createInternalAgentTurnFacade({
+            assertContextCurrent: assertAgentDispatchAvailable,
             client: createSyntheticPluginRuntimeClient({
               operatorRoleActor: { kind: "system" },
               allowModelOverride:
