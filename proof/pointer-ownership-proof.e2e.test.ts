@@ -420,7 +420,7 @@ async function screenshot(page: Page, name: string): Promise<void> {
 
 suite.define(() => {
   it("reopens for the next pointer while the original owner remains down", async () => {
-    expect(candidateSha).toBe("f9df0f55a5924586b977be6977de55a14a73688c");
+    expect(candidateSha).toBe("37ed7c0ec34ec549facb0a7126f998699e887ac9");
     expect(proofDir).not.toBe("");
     await fs.mkdir(proofDir, { recursive: true });
 
