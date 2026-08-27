@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 env:
-  CANDIDATE_SHA: 37ed7c0ec34ec549facb0a7126f998699e887ac9
-  PRE_FIX_SHA: 162e8d13940461837403b3a1b54a08b62f571786
+  CANDIDATE_SHA: d2cc864d0e506a0993d61bf9f053bebc772d3258
+  PRE_FIX_SHA: 42112dd86ec3010cb14011d7514c82063b12974a
   PROOF_DIR: .artifacts/control-ui-e2e/pr-118591-pointer-ownership
 
 jobs:
@@ -93,7 +93,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-118591-pre-fix-regressions-37ed7c0ec
+          name: pr-118591-pre-fix-regressions-d2cc864d0
           path: ${{ env.PROOF_DIR }}/pre-fix
           if-no-files-found: error
           retention-days: 30
@@ -143,7 +143,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-118591-focused-tests-37ed7c0ec
+          name: pr-118591-focused-tests-d2cc864d0
           path: ${{ env.PROOF_DIR }}/focused-tests.log
           if-no-files-found: error
           retention-days: 30
@@ -229,14 +229,14 @@ jobs:
             echo "- Candidate: \`$CANDIDATE_SHA\`"
             echo "- Input: Chromium CDP touch-owner + mouse-foreign events"
             echo "- Scenario: shared divider ignores a foreign pointer, then clears ownership on close/reopen"
-            echo "- Artifact: \`pr-118591-pointer-ownership-37ed7c0ec\`"
+            echo "- Artifact: \`pr-118591-pointer-ownership-d2cc864d0\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload screenshots, recording, and evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-118591-pointer-ownership-37ed7c0ec
+          name: pr-118591-pointer-ownership-d2cc864d0
           path: ${{ env.PROOF_DIR }}
           if-no-files-found: error
           retention-days: 30
@@ -296,7 +296,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-118591-browser-extension-retry-37ed7c0ec
+          name: pr-118591-browser-extension-retry-d2cc864d0
           path: ${{ env.PROOF_DIR }}/upstream-retry
           if-no-files-found: error
           retention-days: 30
