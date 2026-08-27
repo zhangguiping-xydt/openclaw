@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  CANDIDATE_SHA: 3de75c864c9f30117b70a360c398963c186a9dec
+  CANDIDATE_SHA: f9df0f55a5924586b977be6977de55a14a73688c
   PROOF_DIR: .artifacts/control-ui-e2e/pr-118591-pointer-ownership
 
 jobs:
@@ -58,7 +58,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-118591-focused-tests-3de75c864
+          name: pr-118591-focused-tests-f9df0f55a
           path: ${{ env.PROOF_DIR }}/focused-tests.log
           if-no-files-found: error
           retention-days: 30
@@ -144,14 +144,14 @@ jobs:
             echo "- Candidate: \`$CANDIDATE_SHA\`"
             echo "- Input: Chromium CDP touch-owner + mouse-foreign events"
             echo "- Scenario: shared divider ignores a foreign pointer, then clears ownership on close/reopen"
-            echo "- Artifact: \`pr-118591-pointer-ownership-3de75c864\`"
+            echo "- Artifact: \`pr-118591-pointer-ownership-f9df0f55a\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload screenshots, recording, and evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-118591-pointer-ownership-3de75c864
+          name: pr-118591-pointer-ownership-f9df0f55a
           path: ${{ env.PROOF_DIR }}
           if-no-files-found: error
           retention-days: 30
