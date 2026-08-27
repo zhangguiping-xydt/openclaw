@@ -171,11 +171,15 @@ jobs:
             waveOne: null,
             waveTwo: null,
             parent: null,
+            spawnTool: null,
+            searchCall: "call_search_spawn_agent",
             spawnOneCall: "call_spawn_wave_1",
             yieldOneCall: "call_yield_wave_1",
             spawnTwoCall: "call_spawn_wave_2",
             yieldTwoCall: "call_yield_wave_2",
           };
+          const heldReplies = new Map();
+          const releasedTokens = new Set();
           let requestNumber = 0;
 
           function appendJson(path, value) {
@@ -212,6 +216,74 @@ jobs:
               if (found) return found;
             }
             return null;
+          }
+
+          function toolSpecs(body) {
+            const specs = [];
+            if (Array.isArray(body.tools)) specs.push(...body.tools);
+            const input = Array.isArray(body.input) ? body.input : [];
+            for (const item of input) {
+              if (item?.type === "tool_search_output" && Array.isArray(item.tools)) {
+                specs.push(...item.tools);
+              }
+            }
+            return specs;
+          }
+
+          function findSpawnTool(body) {
+            for (const spec of toolSpecs(body)) {
+              if (spec?.type === "function" && spec.name === "spawn_agent") {
+                return {
+                  name: spec.name,
+                  namespace: null,
+                  parameters: spec.parameters ?? {},
+                  source: "function",
+                };
+              }
+              if (spec?.type !== "namespace" || !Array.isArray(spec.tools)) continue;
+              const child = spec.tools.find(
+                (tool) => tool?.type === "function" && tool.name === "spawn_agent",
+              );
+              if (child) {
+                return {
+                  name: child.name,
+                  namespace: spec.name,
+                  parameters: child.parameters ?? {},
+                  source: "namespace",
+                };
+              }
+            }
+            return null;
+          }
+
+          function summarizedTools(body) {
+            return toolSpecs(body)
+              .slice(0, 30)
+              .map((spec) => ({
+                type: typeof spec?.type === "string" ? spec.type : "unknown",
+                name: typeof spec?.name === "string" ? spec.name : null,
+                children: Array.isArray(spec?.tools)
+                  ? spec.tools
+                      .slice(0, 30)
+                      .map((tool) => (typeof tool?.name === "string" ? tool.name : "unknown"))
+                  : [],
+              }));
+          }
+
+          function spawnArguments(spawnTool, taskName, message) {
+            const properties = spawnTool?.parameters?.properties;
+            const args = { message };
+            if (properties && Object.hasOwn(properties, "task_name")) args.task_name = taskName;
+            return args;
+          }
+
+          function spawnToolSummary(spawnTool) {
+            return {
+              name: spawnTool.name,
+              namespace: spawnTool.namespace,
+              source: spawnTool.source,
+              argumentNames: Object.keys(spawnTool.parameters?.properties ?? {}).sort(),
+            };
           }
 
           function completed(id) {
@@ -257,6 +329,18 @@ jobs:
             return { type: "response.output_item.done", item };
           }
 
+          function toolSearchCall(callId) {
+            return {
+              type: "response.output_item.done",
+              item: {
+                type: "tool_search_call",
+                call_id: callId,
+                execution: "client",
+                arguments: { query: "spawn agent", limit: 1 },
+              },
+            };
+          }
+
           function sendEvents(response, events) {
             response.writeHead(200, {
               "content-type": "text/event-stream; charset=utf-8",
@@ -270,6 +354,24 @@ jobs:
             response.end();
           }
 
+          function releaseHeldReply(token) {
+            const held = heldReplies.get(token);
+            if (!held) {
+              releasedTokens.add(token);
+              appendJson(actionPath, {
+                action: token === state.waveOne ? "release_wave_1_pending" : "release_wave_2_pending",
+                requestNumber,
+              });
+              return;
+            }
+            heldReplies.delete(token);
+            appendJson(actionPath, {
+              action: token === state.waveOne ? "release_wave_1" : "release_wave_2",
+              requestNumber,
+            });
+            sendEvents(held.response, held.events);
+          }
+
           function chooseResponse(body) {
             requestNumber += 1;
             const responseId = "resp_" + requestNumber;
@@ -281,10 +383,39 @@ jobs:
                 ? latest.type
                 : "unknown";
             const callId = findCallId(latest);
+            const advertisedSpawnTool = findSpawnTool(body);
+            if (advertisedSpawnTool) state.spawnTool = advertisedSpawnTool;
             let route = "unexpected";
             let events;
+            let holdToken = null;
+            let releaseToken = null;
 
-            if (callId === state.spawnOneCall) {
+            if (callId === state.searchCall && state.waveOne) {
+              if (!state.spawnTool) {
+                throw new Error("tool_search did not return an advertised spawn_agent contract");
+              }
+              route = "spawn_wave_1";
+              appendJson(actionPath, {
+                action: route,
+                requestNumber,
+                spawnTool: spawnToolSummary(state.spawnTool),
+              });
+              events = [
+                created(responseId),
+                functionCall(
+                  responseId,
+                  state.spawnOneCall,
+                  state.spawnTool.name,
+                  spawnArguments(
+                    state.spawnTool,
+                    "wave_one",
+                    "Reply exactly " + state.waveOne + " and nothing else.",
+                  ),
+                  state.spawnTool.namespace,
+                ),
+                completed(responseId),
+              ];
+            } else if (callId === state.spawnOneCall) {
               route = "yield_wave_1";
               appendJson(actionPath, { action: route, requestNumber });
               events = [
@@ -314,6 +445,7 @@ jobs:
               ];
             } else if (callId === state.yieldOneCall || callId === state.yieldTwoCall) {
               route = "yield_followup_empty";
+              releaseToken = callId === state.yieldOneCall ? state.waveOne : state.waveTwo;
               events = [created(responseId), completed(responseId)];
             } else if (
               state.waveTwo &&
@@ -330,13 +462,25 @@ jobs:
               latestText.includes(state.waveOne)
             ) {
               route = "spawn_wave_2";
-              appendJson(actionPath, { action: route, requestNumber });
+              if (!state.spawnTool) throw new Error("spawn_agent contract was not retained");
+              appendJson(actionPath, {
+                action: route,
+                requestNumber,
+                spawnTool: spawnToolSummary(state.spawnTool),
+              });
               events = [
                 created(responseId),
-                functionCall(responseId, state.spawnTwoCall, "spawn_agent", {
-                  task_name: "wave_two",
-                  message: "Reply exactly " + state.waveTwo + " and nothing else.",
-                }),
+                functionCall(
+                  responseId,
+                  state.spawnTwoCall,
+                  state.spawnTool.name,
+                  spawnArguments(
+                    state.spawnTool,
+                    "wave_two",
+                    "Reply exactly " + state.waveTwo + " and nothing else.",
+                  ),
+                  state.spawnTool.namespace,
+                ),
                 completed(responseId),
               ];
             } else if (latestText.includes("Sequential native bridge probe.")) {
@@ -349,22 +493,40 @@ jobs:
               state.waveOne = waveOne;
               state.waveTwo = waveTwo;
               state.parent = parent;
-              route = "spawn_wave_1";
-              appendJson(actionPath, {
-                action: route,
-                parent,
-                requestNumber,
-                waveOne,
-                waveTwo,
-              });
-              events = [
-                created(responseId),
-                functionCall(responseId, state.spawnOneCall, "spawn_agent", {
-                  task_name: "wave_one",
-                  message: "Reply exactly " + state.waveOne + " and nothing else.",
-                }),
-                completed(responseId),
-              ];
+              if (state.spawnTool) {
+                route = "spawn_wave_1";
+                appendJson(actionPath, {
+                  action: route,
+                  parent,
+                  requestNumber,
+                  spawnTool: spawnToolSummary(state.spawnTool),
+                  waveOne,
+                  waveTwo,
+                });
+                events = [
+                  created(responseId),
+                  functionCall(
+                    responseId,
+                    state.spawnOneCall,
+                    state.spawnTool.name,
+                    spawnArguments(
+                      state.spawnTool,
+                      "wave_one",
+                      "Reply exactly " + state.waveOne + " and nothing else.",
+                    ),
+                    state.spawnTool.namespace,
+                  ),
+                  completed(responseId),
+                ];
+              } else if (
+                toolSpecs(body).some((tool) => tool?.type === "tool_search")
+              ) {
+                route = "search_spawn_tool";
+                appendJson(actionPath, { action: route, requestNumber });
+                events = [created(responseId), toolSearchCall(state.searchCall), completed(responseId)];
+              } else {
+                throw new Error("Responses request advertised neither spawn_agent nor tool_search");
+              }
             } else {
               const exactToken =
                 latestText.match(
@@ -377,14 +539,25 @@ jobs:
                   assistant(responseId, exactToken),
                   completed(responseId),
                 ];
+                if (exactToken === state.waveOne || exactToken === state.waveTwo) {
+                  route = exactToken === state.waveOne ? "hold_wave_1" : "hold_wave_2";
+                  holdToken = exactToken;
+                  appendJson(actionPath, { action: route, requestNumber });
+                }
               }
             }
 
             appendJson(requestPath, {
+              advertisedTools: summarizedTools(body),
               callId: callId ?? null,
               latestType,
+              outputPreview:
+                latestType.endsWith("_output")
+                  ? collectStrings(latest).join("\n").slice(0, 1_000)
+                  : null,
               requestNumber,
               route,
+              spawnTool: state.spawnTool ? spawnToolSummary(state.spawnTool) : null,
             });
             if (!events) {
               appendJson(actionPath, {
@@ -394,7 +567,7 @@ jobs:
               });
               throw new Error("unexpected Responses request " + requestNumber);
             }
-            return events;
+            return { events, holdToken, releaseToken };
           }
 
           const server = http.createServer((request, response) => {
@@ -416,7 +589,27 @@ jobs:
             });
             request.on("end", () => {
               try {
-                sendEvents(response, chooseResponse(JSON.parse(raw)));
+                const outcome = chooseResponse(JSON.parse(raw));
+                if (outcome.holdToken) {
+                  if (heldReplies.has(outcome.holdToken)) {
+                    throw new Error("duplicate held child reply for " + outcome.holdToken);
+                  }
+                  if (releasedTokens.delete(outcome.holdToken)) {
+                    appendJson(actionPath, {
+                      action:
+                        outcome.holdToken === state.waveOne
+                          ? "release_wave_1_after_arrival"
+                          : "release_wave_2_after_arrival",
+                      requestNumber,
+                    });
+                    sendEvents(response, outcome.events);
+                    return;
+                  }
+                  heldReplies.set(outcome.holdToken, { response, events: outcome.events });
+                  return;
+                }
+                if (outcome.releaseToken) releaseHeldReply(outcome.releaseToken);
+                sendEvents(response, outcome.events);
               } catch (error) {
                 appendJson(actionPath, {
                   action: "provider_error",
@@ -575,6 +768,22 @@ jobs:
           const unexpected = actions.filter((entry) =>
             ["unexpected", "provider_error"].includes(entry.action),
           );
+          const heldChildReplies = actions
+            .map((entry) => entry.action)
+            .filter((name) => ["hold_wave_1", "hold_wave_2"].includes(name));
+          const releasedChildReplies = actions
+            .map((entry) => entry.action)
+            .filter((name) =>
+              [
+                "release_wave_1",
+                "release_wave_1_after_arrival",
+                "release_wave_2",
+                "release_wave_2_after_arrival",
+              ].includes(name),
+            );
+          const nativeSpawnContracts = actions
+            .filter((entry) => ["spawn_wave_1", "spawn_wave_2"].includes(entry.action))
+            .map((entry) => entry.spawnTool ?? null);
           const codexVersion = existsSync(proofDir + "/codex-version.txt")
             ? readFileSync(proofDir + "/codex-version.txt", "utf8").trim()
             : "";
@@ -583,6 +792,12 @@ jobs:
             Number(process.env.TEST_STATUS) === 0 &&
             orderMatches &&
             finalEntries.length === 1 &&
+            JSON.stringify(heldChildReplies) ===
+              JSON.stringify(["hold_wave_1", "hold_wave_2"]) &&
+            releasedChildReplies.some((name) => name.startsWith("release_wave_1")) &&
+            releasedChildReplies.some((name) => name.startsWith("release_wave_2")) &&
+            nativeSpawnContracts.length === 2 &&
+            nativeSpawnContracts.every((contract) => contract?.name === "spawn_agent") &&
             unexpected.length === 0 &&
             codexVersion.includes("0.150.1");
           const verdict = {
@@ -595,6 +810,9 @@ jobs:
             externalProviderLiveProof: false,
             inheritedCredentialsAvailableToPrCode: false,
             orderedNativeActions: orderedNames,
+            nativeSpawnContracts,
+            heldChildReplies,
+            releasedChildReplies,
             exactlyOneFinalParentResponse: finalEntries.length === 1,
             finalParentResponse: finalEntries[0]?.finalReply ?? null,
             testExitCode: Number(process.env.TEST_STATUS),
