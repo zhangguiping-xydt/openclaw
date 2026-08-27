@@ -138,7 +138,7 @@ jobs:
           safe_path="$pnpm_home:$PATH"
           provider_url="http://127.0.0.1:$PROVIDER_PORT/v1"
           dummy_key="openclaw-pr130563-localhost-proof"
-          codex_bin="$PWD/extensions/codex/node_modules/.bin/codex"
+          codex_bin="$PWD/node_modules/.bin/codex"
           mkdir -p "$proof_dir" "$proof_home" "$proof_tmp" "$cache_home"
 
           provider_pid=""
@@ -618,18 +618,79 @@ jobs:
             exit 1
           fi
 
+      - name: Finalize redacted native proof diagnostics
+        if: always()
+        shell: bash
+        working-directory: openclaw
+        env:
+          PROOF_STEP_OUTCOME: ${{ steps.native-proof.outcome }}
+        run: |
+          set -euo pipefail
+          proof_dir="$RUNNER_TEMP/pr130563-native-proof"
+          proof_home="$proof_dir/home"
+          proof_tmp="$proof_dir/tmp"
+          mkdir -p "$proof_dir" "$proof_home" "$proof_tmp"
+
+          env -i \
+            HOME="$proof_home" \
+            PATH="$PATH" \
+            CI=1 \
+            PROOF_DIR="$proof_dir" \
+            PROOF_STEP_OUTCOME="$PROOF_STEP_OUTCOME" \
+            EXPECTED_HEAD="$EXPECTED_HEAD" \
+            TOOLING_SHA="$GITHUB_SHA" \
+            node --input-type=module <<'NODE'
+          import { existsSync, readFileSync, writeFileSync } from "node:fs";
+
+          const proofDir = process.env.PROOF_DIR;
+          const patterns = [
+            [/Bearer\s+[A-Za-z0-9._-]+/giu, "Bearer [REDACTED]"],
+            [/(?:github_pat_|gh[opsu]_|ghr_)[A-Za-z0-9_]+/gu, "[REDACTED_GITHUB_TOKEN]"],
+            [/\bsk-[A-Za-z0-9_-]{12,}\b/gu, "[REDACTED_API_KEY]"],
+          ];
+          for (const name of ["install", "provider", "test"]) {
+            const rawPath = `${proofDir}/${name}.raw.log`;
+            let text = existsSync(rawPath) ? readFileSync(rawPath, "utf8") : "";
+            for (const [pattern, replacement] of patterns) {
+              text = text.replace(pattern, replacement);
+            }
+            writeFileSync(`${proofDir}/${name}.redacted.log`, text, "utf8");
+          }
+
+          const verdictPath = `${proofDir}/verdict.json`;
+          if (!existsSync(verdictPath)) {
+            const codexVersionPath = `${proofDir}/codex-version.txt`;
+            const codexVersion = existsSync(codexVersionPath)
+              ? readFileSync(codexVersionPath, "utf8").trim()
+              : "";
+            const verdict = {
+              ok: false,
+              validationSha: process.env.EXPECTED_HEAD,
+              toolingSha: process.env.TOOLING_SHA,
+              codexVersion,
+              runtime: "real OpenClaw Gateway plus managed Codex app-server",
+              providerBoundary: "deterministic localhost Responses API",
+              externalProviderLiveProof: false,
+              inheritedCredentialsAvailableToPrCode: false,
+              proofStepOutcome: process.env.PROOF_STEP_OUTCOME,
+              diagnosticsOnly: true,
+            };
+            writeFileSync(verdictPath, JSON.stringify(verdict, null, 2) + "\n", "utf8");
+          }
+          NODE
+
       - name: Upload redacted native proof artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: pr130563-native-runtime-proof
           path: |
-            \${{ runner.temp }}/pr130563-native-proof/install.redacted.log
-            \${{ runner.temp }}/pr130563-native-proof/provider.redacted.log
-            \${{ runner.temp }}/pr130563-native-proof/test.redacted.log
-            \${{ runner.temp }}/pr130563-native-proof/provider-actions.jsonl
-            \${{ runner.temp }}/pr130563-native-proof/provider-requests.jsonl
-            \${{ runner.temp }}/pr130563-native-proof/codex-version.txt
-            \${{ runner.temp }}/pr130563-native-proof/verdict.json
+            ${{ runner.temp }}/pr130563-native-proof/install.redacted.log
+            ${{ runner.temp }}/pr130563-native-proof/provider.redacted.log
+            ${{ runner.temp }}/pr130563-native-proof/test.redacted.log
+            ${{ runner.temp }}/pr130563-native-proof/provider-actions.jsonl
+            ${{ runner.temp }}/pr130563-native-proof/provider-requests.jsonl
+            ${{ runner.temp }}/pr130563-native-proof/codex-version.txt
+            ${{ runner.temp }}/pr130563-native-proof/verdict.json
           if-no-files-found: warn
           retention-days: 30
