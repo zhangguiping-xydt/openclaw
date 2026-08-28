@@ -190,6 +190,10 @@ jobs:
             waveOne: null,
             waveTwo: null,
             parent: null,
+            waveOneReleased: false,
+            waveTwoStarted: false,
+            waveTwoReleased: false,
+            parentFinalSent: false,
             spawnTool: pinnedSpawnTool,
             searchCall: "call_search_spawn_agent",
             spawnOneCall: "call_spawn_wave_1",
@@ -387,6 +391,8 @@ jobs:
               return;
             }
             heldReplies.delete(token);
+            if (token === state.waveOne) state.waveOneReleased = true;
+            if (token === state.waveTwo) state.waveTwoReleased = true;
             appendJson(actionPath, {
               action:
                 token === state.waveOne
@@ -474,20 +480,23 @@ jobs:
               route = "yield_followup_empty";
               events = [created(responseId), completed(responseId)];
             } else if (
-              state.waveTwo &&
-              latestText.includes("Message Type: FINAL_ANSWER") &&
-              latestText.includes(state.waveTwo)
+              state.waveTwoReleased &&
+              state.waveTwoStarted &&
+              !state.parentFinalSent &&
+              !callId
             ) {
               route = "parent_final";
+              state.parentFinalSent = true;
               const finalReply = state.parent + " " + state.waveOne + " " + state.waveTwo;
               appendJson(actionPath, { action: route, finalReply, requestNumber });
               events = [created(responseId), assistant(responseId, finalReply), completed(responseId)];
             } else if (
-              state.waveOne &&
-              latestText.includes("Message Type: FINAL_ANSWER") &&
-              latestText.includes(state.waveOne)
+              state.waveOneReleased &&
+              !state.waveTwoStarted &&
+              !callId
             ) {
               route = "spawn_wave_2";
+              state.waveTwoStarted = true;
               if (!state.spawnTool) throw new Error("spawn_agent contract was not retained");
               appendJson(actionPath, {
                 action: route,
@@ -509,7 +518,7 @@ jobs:
                 ),
                 completed(responseId),
               ];
-            } else if (latestText.includes("Sequential native bridge probe.")) {
+            } else if (!state.waveOne && latestText.includes("Sequential native bridge probe.")) {
               const waveOne = latestText.match(/CODEX-NATIVE-WAVE-1-[A-Z0-9]{6}/u)?.[0];
               const waveTwo = latestText.match(/CODEX-NATIVE-WAVE-2-[A-Z0-9]{6}/u)?.[0];
               const parent = latestText.match(/CODEX-NATIVE-PARENT-[A-Z0-9]{6}/u)?.[0];
@@ -621,6 +630,8 @@ jobs:
                     throw new Error("duplicate held child reply for " + outcome.holdToken);
                   }
                   if (releasedTokens.delete(outcome.holdToken)) {
+                    if (outcome.holdToken === state.waveOne) state.waveOneReleased = true;
+                    if (outcome.holdToken === state.waveTwo) state.waveTwoReleased = true;
                     appendJson(actionPath, {
                       action:
                         outcome.holdToken === state.waveOne
