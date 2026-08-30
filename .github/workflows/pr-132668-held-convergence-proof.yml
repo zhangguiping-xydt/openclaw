@@ -97,6 +97,15 @@ jobs:
             "$RUNNER_TEMP/package/openclaw-current.tgz"
           "$RUNNER_TEMP/openclaw-prefix/bin/openclaw" --version
 
+      - name: Save exact-head package
+        if: steps.package_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ${{ runner.temp }}/package/openclaw-current.tgz
+            ${{ runner.temp }}/package/codex-current.tgz
+          key: pr-132668-package-v2-${{ inputs.source_sha }}
+
       - name: Interrupt held plugin convergence and start a replacement
         id: proof
         env:
@@ -252,11 +261,11 @@ jobs:
             HOME="$proof_home" \
             OPENCLAW_STATE_DIR="$state_dir" \
             OPENCLAW_CONFIG_PATH="$config_path" \
-            NPM_CONFIG_REGISTRY="https://registry.npmjs.org/" \
-            npm_config_registry="https://registry.npmjs.org/" \
+            NPM_CONFIG_REGISTRY="$registry_url" \
+            npm_config_registry="$registry_url" \
             NPM_CONFIG_AUDIT=false \
             NPM_CONFIG_FUND=false \
-            "$openclaw_bin" plugins install npm:@openclaw/codex \
+            "$openclaw_bin" plugins install npm:@openclaw/codex@2026.8.1 \
               --force --accept-capabilities >"$seed_install_log" 2>&1
           installed_plugin_path="$(find "$state_dir" -type d \
             -path '*/node_modules/@openclaw/codex' -print -quit)"
