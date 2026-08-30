@@ -6,7 +6,7 @@ on:
       target_sha:
         description: Exact contributor head to verify
         required: true
-        default: 0d562ac6f49da6995f75ff3195613e361be3af55
+        default: 868855bcd2eb006840c841ed449ee00a6944560b
         type: string
       expected_result:
         description: Expected focused-test result
@@ -47,7 +47,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXPECTED_SHA" = "0d562ac6f49da6995f75ff3195613e361be3af55"
+          test "$EXPECTED_SHA" = "868855bcd2eb006840c841ed449ee00a6944560b"
           git init source
           git -C source remote add origin https://github.com/zhangguiping-xydt/openclaw.git
           git -C source fetch --depth=1 origin "$EXPECTED_SHA"
@@ -129,7 +129,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXPECTED_SHA" = "0d562ac6f49da6995f75ff3195613e361be3af55"
+          test "$EXPECTED_SHA" = "868855bcd2eb006840c841ed449ee00a6944560b"
           git init source
           git -C source remote add origin https://github.com/zhangguiping-xydt/openclaw.git
           git -C source fetch --depth=1 origin "$EXPECTED_SHA"
