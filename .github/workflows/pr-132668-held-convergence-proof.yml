@@ -51,8 +51,10 @@ jobs:
         id: package_cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          path: ${{ runner.temp }}/package/openclaw-current.tgz
-          key: pr-132668-package-${{ inputs.source_sha }}
+          path: |
+            ${{ runner.temp }}/package/openclaw-current.tgz
+            ${{ runner.temp }}/package/codex-current.tgz
+          key: pr-132668-package-v2-${{ inputs.source_sha }}
 
       - name: Install and package the exact head
         env:
@@ -67,8 +69,29 @@ jobs:
               --allow-unreleased-changelog \
               --output-dir "$RUNNER_TEMP/package" \
               --output-name openclaw-current.tgz
+            node scripts/lib/plugin-npm-runtime-build.mjs extensions/codex
+            node scripts/lib/plugin-npm-package-manifest.mjs --run extensions/codex -- \
+              npm pack --json --ignore-scripts --pack-destination "$RUNNER_TEMP/package"
+            mapfile -t codex_archives < <(
+              find "$RUNNER_TEMP/package" -maxdepth 1 -type f \
+                -name 'openclaw-codex-*.tgz' -print
+            )
+            test "${#codex_archives[@]}" -eq 1
+            mv "${codex_archives[0]}" "$RUNNER_TEMP/package/codex-current.tgz"
           fi
           test -s "$RUNNER_TEMP/package/openclaw-current.tgz"
+          test -s "$RUNNER_TEMP/package/codex-current.tgz"
+          tar -xOf "$RUNNER_TEMP/package/codex-current.tgz" package/package.json \
+            | node -e '
+                let input = "";
+                process.stdin.on("data", (chunk) => { input += chunk; });
+                process.stdin.on("end", () => {
+                  const pkg = JSON.parse(input);
+                  if (pkg.name !== "@openclaw/codex" || pkg.version !== "2026.8.1") {
+                    throw new Error(`unexpected Codex artifact ${pkg.name}@${pkg.version}`);
+                  }
+                });
+              '
           mkdir -p "$RUNNER_TEMP/openclaw-prefix"
           npm install --global --prefix "$RUNNER_TEMP/openclaw-prefix" \
             "$RUNNER_TEMP/package/openclaw-current.tgz"
@@ -87,9 +110,12 @@ jobs:
           state_dir="$proof_root/state"
           config_path="$state_dir/openclaw.json"
           registry_port_file="$proof_root/registry-port"
+          registry_backend_port_file="$proof_root/registry-backend-port"
           registry_request_file="$proof_root/registry-request"
           registry_hold_file="$proof_root/registry-hold"
           registry_log="$GITHUB_WORKSPACE/pr-132668-registry.log"
+          registry_backend_log="$GITHUB_WORKSPACE/pr-132668-registry-backend.log"
+          seed_install_log="$GITHUB_WORKSPACE/pr-132668-seed-install.log"
           gateway1_log="$GITHUB_WORKSPACE/pr-132668-gateway1.log"
           gateway2_log="$GITHUB_WORKSPACE/pr-132668-gateway2.log"
           trace="$GITHUB_WORKSPACE/pr-132668-held-convergence-trace.txt"
@@ -110,6 +136,10 @@ jobs:
             if test -n "${registry_pid:-}" && kill -0 "$registry_pid" 2>/dev/null; then
               kill -TERM "$registry_pid" 2>/dev/null || true
             fi
+            if test -n "${registry_backend_pid:-}" && \
+              kill -0 "$registry_backend_pid" 2>/dev/null; then
+              kill -TERM "$registry_backend_pid" 2>/dev/null || true
+            fi
           }
           trap cleanup EXIT
 
@@ -121,7 +151,7 @@ jobs:
               "auth": { "mode": "token", "token": "pr-132668-proof-only" }
             },
             "plugins": {
-              "entries": { "brave": { "enabled": true } }
+              "entries": { "codex": { "enabled": true } }
             }
           }
           JSON
@@ -130,25 +160,50 @@ jobs:
           import fs from "node:fs";
           import http from "node:http";
 
-          const [portFile, requestFile, holdFile, logFile] = process.argv.slice(2);
+          const [portFile, requestFile, holdFile, logFile, upstreamRegistry] =
+            process.argv.slice(2);
           const append = (line) => fs.appendFileSync(logFile, `${line}\n`);
           const sockets = new Set();
           const server = http.createServer((request, response) => {
+            void handleRequest(request, response).catch((error) => {
+              append(`proxy error ${String(error)}`);
+              if (!response.headersSent) {
+                response.writeHead(502, { "content-type": "text/plain" });
+                response.end("registry proxy failed");
+                return;
+              }
+              response.destroy(error instanceof Error ? error : new Error(String(error)));
+            });
+          });
+          async function handleRequest(request, response) {
             append(`${request.method} ${request.url}`);
             const requestPath = request.url?.split("?", 1)[0] ?? "";
             let decodedPath = requestPath;
             try {
               decodedPath = decodeURIComponent(requestPath);
             } catch {}
-            if (decodedPath === "/@openclaw/brave-plugin" && fs.existsSync(holdFile)) {
-              fs.writeFileSync(requestFile, "GET /@openclaw%2Fbrave-plugin\n");
+            if (decodedPath === "/@openclaw/codex" && fs.existsSync(holdFile)) {
+              fs.writeFileSync(requestFile, "GET /@openclaw%2Fcodex\n");
               request.once("close", () => append("held metadata request closed"));
               response.once("close", () => append("held metadata response closed"));
               return;
             }
-            response.writeHead(404, { "content-type": "application/json" });
-            response.end(JSON.stringify({ error: "not found" }));
-          });
+            const upstreamUrl = new URL(request.url ?? "/", upstreamRegistry);
+            const upstream = await fetch(upstreamUrl, {
+              method: request.method,
+              redirect: "manual",
+              signal: AbortSignal.timeout(120_000),
+            });
+            const body = Buffer.from(await upstream.arrayBuffer());
+            const headers = { "content-length": String(body.length) };
+            for (const name of ["content-type", "location"]) {
+              const value = upstream.headers.get(name);
+              if (value) headers[name] = value;
+            }
+            append(`forwarded ${request.method} ${request.url} ${upstream.status}`);
+            response.writeHead(upstream.status, headers);
+            response.end(body);
+          }
           server.on("connection", (socket) => {
             sockets.add(socket);
             socket.once("close", () => sockets.delete(socket));
@@ -166,9 +221,24 @@ jobs:
           });
           NODE
 
+          env OPENCLAW_NPM_REGISTRY_UPSTREAM="https://registry.npmjs.org/" \
+            node "$GITHUB_WORKSPACE/scripts/e2e/lib/plugins/npm-registry-server.mjs" \
+              "$registry_backend_port_file" \
+              "@openclaw/codex" "2026.8.1" \
+              "$RUNNER_TEMP/package/codex-current.tgz" \
+              >"$registry_backend_log" 2>&1 &
+          registry_backend_pid=$!
+          for _ in $(seq 1 100); do
+            test -s "$registry_backend_port_file" && break
+            sleep 0.1
+          done
+          test -s "$registry_backend_port_file"
+          registry_backend_port="$(tr -d '\r\n' <"$registry_backend_port_file")"
+          registry_backend_url="http://127.0.0.1:$registry_backend_port/"
+
           node "$proof_root/hold-registry.mjs" \
             "$registry_port_file" "$registry_request_file" "$registry_hold_file" \
-            "$registry_log" &
+            "$registry_log" "$registry_backend_url" &
           registry_pid=$!
           for _ in $(seq 1 100); do
             test -s "$registry_port_file" && break
@@ -177,6 +247,50 @@ jobs:
           test -s "$registry_port_file"
           registry_port="$(tr -d '\r\n' <"$registry_port_file")"
           registry_url="http://127.0.0.1:$registry_port/"
+
+          env \
+            HOME="$proof_home" \
+            OPENCLAW_STATE_DIR="$state_dir" \
+            OPENCLAW_CONFIG_PATH="$config_path" \
+            NPM_CONFIG_REGISTRY="https://registry.npmjs.org/" \
+            npm_config_registry="https://registry.npmjs.org/" \
+            NPM_CONFIG_AUDIT=false \
+            NPM_CONFIG_FUND=false \
+            "$openclaw_bin" plugins install npm:@openclaw/codex \
+              --force --accept-capabilities >"$seed_install_log" 2>&1
+          installed_plugin_path="$(find "$state_dir" -type d \
+            -path '*/node_modules/@openclaw/codex' -print -quit)"
+          test -n "$installed_plugin_path"
+          case "$installed_plugin_path" in
+            "$state_dir"/*) ;;
+            *) echo "installed plugin escaped the proof state root" >&2; exit 1 ;;
+          esac
+          test -f "$installed_plugin_path/package.json"
+          node --input-type=module - "$lease_db" <<'NODE'
+          import { DatabaseSync } from "node:sqlite";
+          const databasePath = process.argv[2];
+          const db = new DatabaseSync(databasePath);
+          const stateKey = "plugins.installedIndex";
+          const row = db.prepare(
+            "SELECT value_json FROM config_machine_state WHERE state_key = ?",
+          ).get(stateKey);
+          if (!row || typeof row.value_json !== "string") {
+            throw new Error("installed plugin index was not persisted");
+          }
+          const persisted = JSON.parse(row.value_json);
+          const record = persisted?.index?.installRecords?.codex;
+          if (!record || record.source !== "npm") {
+            throw new Error("codex npm install record is missing");
+          }
+          record.version = "2026.1.1";
+          record.resolvedVersion = "2026.1.1";
+          const now = Date.now();
+          persisted.revision = Math.max(now, Number(persisted.revision ?? 0) + 1);
+          db.prepare(
+            "UPDATE config_machine_state SET value_json = ?, updated_at_ms = ? WHERE state_key = ?",
+          ).run(JSON.stringify(persisted), now, stateKey);
+          db.close();
+          NODE
 
           rm -f "$registry_request_file"
           touch "$registry_hold_file"
@@ -217,6 +331,8 @@ jobs:
             OPENCLAW_CONFIG_PATH="$config_path" \
             NPM_CONFIG_REGISTRY="$registry_url" \
             npm_config_registry="$registry_url" \
+            NPM_CONFIG_AUDIT=false \
+            NPM_CONFIG_FUND=false \
             "$openclaw_bin" gateway run \
               --port "$gateway_port" --bind loopback --verbose \
               >"$gateway1_log" 2>&1 &
@@ -273,8 +389,8 @@ jobs:
             HOME="$proof_home" \
             OPENCLAW_STATE_DIR="$state_dir" \
             OPENCLAW_CONFIG_PATH="$config_path" \
-            NPM_CONFIG_REGISTRY="https://registry.npmjs.org/" \
-            npm_config_registry="https://registry.npmjs.org/" \
+            NPM_CONFIG_REGISTRY="$registry_url" \
+            npm_config_registry="$registry_url" \
             NPM_CONFIG_AUDIT=false \
             NPM_CONFIG_FUND=false \
             "$openclaw_bin" gateway run \
@@ -298,6 +414,11 @@ jobs:
           test "$gateway2_ready_http" = "200"
           lease_at_ready="$(lease_count)"
           test "$lease_at_ready" = "0"
+          replacement_plugin_version="$(
+            node -e 'process.stdout.write(require(process.argv[1]).version)' \
+              "$installed_plugin_path/package.json"
+          )"
+          test "$replacement_plugin_version" = "2026.8.1"
 
           gateway2_original_pid="$gateway2_pid"
           kill -TERM "$gateway2_pid"
@@ -328,6 +449,7 @@ jobs:
             echo "gateway2_pid_differs=true"
             echo "gateway2_ready_http=$gateway2_ready_http"
             echo "gateway2_ready=true"
+            echo "replacement_plugin=@openclaw/codex@$replacement_plugin_version"
             echo "lease_count_at_ready=$lease_at_ready"
             echo "gateway2_shutdown=\"$shutdown_line\""
             echo "final_lease_count=$final_lease_count"
@@ -341,6 +463,8 @@ jobs:
           path: |
             pr-132668-held-convergence-trace.txt
             pr-132668-registry.log
+            pr-132668-registry-backend.log
+            pr-132668-seed-install.log
             pr-132668-gateway1.log
             pr-132668-gateway2.log
           if-no-files-found: warn
