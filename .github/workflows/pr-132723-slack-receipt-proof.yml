@@ -6,7 +6,7 @@ on:
       target_sha:
         description: Exact contributor head to verify
         required: true
-        default: 598e4d8005c32becfe04c61c6bc4d5731eb65b5b
+        default: 598e4d8005c20c8004c329f68d75f192d93e7d19
         type: string
       expected_result:
         description: Expected focused-test result
@@ -47,7 +47,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXPECTED_SHA" = "598e4d8005c32becfe04c61c6bc4d5731eb65b5b"
+          test "$EXPECTED_SHA" = "598e4d8005c20c8004c329f68d75f192d93e7d19"
           git init source
           git -C source remote add origin https://github.com/zhangguiping-xydt/openclaw.git
           git -C source fetch --depth=1 origin "$EXPECTED_SHA"
@@ -70,6 +70,7 @@ jobs:
 
       - name: Run focused restart-replay regression
         env:
+          EXPECTED_SHA: ${{ inputs.target_sha }}
           EXPECTED_RESULT: ${{ inputs.expected_result }}
         shell: bash
         working-directory: source
@@ -90,10 +91,10 @@ jobs:
           else
             test "$test_status" -eq 0
           fi
-          TEST_STATUS="$test_status" EXPECTED_RESULT="$EXPECTED_RESULT" node -e '
+          TEST_STATUS="$test_status" EXPECTED_RESULT="$EXPECTED_RESULT" EXPECTED_SHA="$EXPECTED_SHA" node -e '
             const fs = require("node:fs");
             const path = require("node:path");
-            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, "pr-132723-slack-receipt-proof", "evidence", "focused-verdict.json"), JSON.stringify({ exactHead: process.env.GITHUB_SHA, expectedResult: process.env.EXPECTED_RESULT, testStatus: Number(process.env.TEST_STATUS) }, null, 2) + "\n");
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, "pr-132723-slack-receipt-proof", "evidence", "focused-verdict.json"), JSON.stringify({ exactHead: process.env.EXPECTED_SHA, expectedResult: process.env.EXPECTED_RESULT, testStatus: Number(process.env.TEST_STATUS) }, null, 2) + "\n");
           '
 
       - name: Upload focused evidence
