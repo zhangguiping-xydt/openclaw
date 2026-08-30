@@ -6,7 +6,7 @@ on:
       target_sha:
         description: Exact contributor head to verify
         required: true
-        default: 51f65b441a38fc09209693901774353452c76c17
+        default: 51f65b441a3140c668867ddad11d3d12c492f1a6
         type: string
 
 permissions:
@@ -39,7 +39,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXPECTED_SHA" = "51f65b441a38fc09209693901774353452c76c17"
+          test "$EXPECTED_SHA" = "51f65b441a3140c668867ddad11d3d12c492f1a6"
           git init source
           git -C source remote add origin https://github.com/zhangguiping-xydt/openclaw.git
           git -C source fetch --depth=1 origin "$EXPECTED_SHA"
@@ -115,7 +115,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXACT_HEAD_SHA" = "51f65b441a38fc09209693901774353452c76c17"
+          test "$EXACT_HEAD_SHA" = "51f65b441a3140c668867ddad11d3d12c492f1a6"
           git init source
           git -C source remote add upstream https://github.com/openclaw/openclaw.git
           git -C source fetch --depth=1 upstream "$PRE_FIX_SHA"
@@ -209,7 +209,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXPECTED_SHA" = "51f65b441a38fc09209693901774353452c76c17"
+          test "$EXPECTED_SHA" = "51f65b441a3140c668867ddad11d3d12c492f1a6"
           git init source
           git -C source remote add origin https://github.com/zhangguiping-xydt/openclaw.git
           git -C source fetch --depth=1 origin "$EXPECTED_SHA"
