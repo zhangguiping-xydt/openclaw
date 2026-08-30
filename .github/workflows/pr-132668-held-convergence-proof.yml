@@ -90,7 +90,6 @@ jobs:
           registry_request_file="$proof_root/registry-request"
           registry_hold_file="$proof_root/registry-hold"
           registry_log="$GITHUB_WORKSPACE/pr-132668-registry.log"
-          seed_install_log="$GITHUB_WORKSPACE/pr-132668-seed-install.log"
           gateway1_log="$GITHUB_WORKSPACE/pr-132668-gateway1.log"
           gateway2_log="$GITHUB_WORKSPACE/pr-132668-gateway2.log"
           trace="$GITHUB_WORKSPACE/pr-132668-held-convergence-trace.txt"
@@ -122,7 +121,7 @@ jobs:
               "auth": { "mode": "token", "token": "pr-132668-proof-only" }
             },
             "plugins": {
-              "entries": { "codex": { "enabled": true } }
+              "entries": { "brave": { "enabled": true } }
             }
           }
           JSON
@@ -141,8 +140,8 @@ jobs:
             try {
               decodedPath = decodeURIComponent(requestPath);
             } catch {}
-            if (decodedPath === "/@openclaw/codex" && fs.existsSync(holdFile)) {
-              fs.writeFileSync(requestFile, "GET /@openclaw%2Fcodex\n");
+            if (decodedPath === "/@openclaw/brave-plugin" && fs.existsSync(holdFile)) {
+              fs.writeFileSync(requestFile, "GET /@openclaw%2Fbrave-plugin\n");
               request.once("close", () => append("held metadata request closed"));
               response.once("close", () => append("held metadata response closed"));
               return;
@@ -179,49 +178,6 @@ jobs:
           registry_port="$(tr -d '\r\n' <"$registry_port_file")"
           registry_url="http://127.0.0.1:$registry_port/"
 
-          env \
-            HOME="$proof_home" \
-            OPENCLAW_STATE_DIR="$state_dir" \
-            OPENCLAW_CONFIG_PATH="$config_path" \
-            NPM_CONFIG_REGISTRY="https://registry.npmjs.org/" \
-            npm_config_registry="https://registry.npmjs.org/" \
-            NPM_CONFIG_AUDIT=false \
-            NPM_CONFIG_FUND=false \
-            "$openclaw_bin" plugins install npm:@openclaw/codex \
-              --force --accept-capabilities >"$seed_install_log" 2>&1
-          installed_plugin_path="$(find "$state_dir" -type d \
-            -path '*/node_modules/@openclaw/codex' -print -quit)"
-          test -n "$installed_plugin_path"
-          case "$installed_plugin_path" in
-            "$state_dir"/*) ;;
-            *) echo "installed plugin escaped the proof state root" >&2; exit 1 ;;
-          esac
-          test -f "$installed_plugin_path/package.json"
-          node --input-type=module - "$lease_db" <<'NODE'
-          import { DatabaseSync } from "node:sqlite";
-          const databasePath = process.argv[2];
-          const db = new DatabaseSync(databasePath);
-          const stateKey = "plugins.installedIndex";
-          const row = db.prepare(
-            "SELECT value_json FROM config_machine_state WHERE state_key = ?",
-          ).get(stateKey);
-          if (!row || typeof row.value_json !== "string") {
-            throw new Error("installed plugin index was not persisted");
-          }
-          const persisted = JSON.parse(row.value_json);
-          const record = persisted?.index?.installRecords?.codex;
-          if (!record || record.source !== "npm") {
-            throw new Error("codex npm install record is missing");
-          }
-          record.version = "2026.1.1";
-          record.resolvedVersion = "2026.1.1";
-          const now = Date.now();
-          persisted.revision = Math.max(now, Number(persisted.revision ?? 0) + 1);
-          db.prepare(
-            "UPDATE config_machine_state SET value_json = ?, updated_at_ms = ? WHERE state_key = ?",
-          ).run(JSON.stringify(persisted), now, stateKey);
-          db.close();
-          NODE
           rm -f "$registry_request_file"
           touch "$registry_hold_file"
 
@@ -385,7 +341,6 @@ jobs:
           path: |
             pr-132668-held-convergence-trace.txt
             pr-132668-registry.log
-            pr-132668-seed-install.log
             pr-132668-gateway1.log
             pr-132668-gateway2.log
           if-no-files-found: warn
