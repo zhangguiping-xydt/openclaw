@@ -50,6 +50,10 @@ type TaskDeliveryLedger = {
 
 type SubagentLedger = {
   runId?: unknown;
+  execution?: {
+    status?: unknown;
+  };
+  completion?: unknown;
   delivery?: TaskDeliveryLedger;
 };
 
@@ -602,13 +606,15 @@ async function waitForTask(
   timeoutMs: number,
 ): Promise<TaskSummary> {
   const deadline = Date.now() + timeoutMs;
+  let tasks: TaskSummary[] = [];
   while (Date.now() < deadline) {
     const result = (await gateway.call(
       "tasks.list",
       { agentId: "qa", limit: 100 },
       { timeoutMs: 10_000 },
     )) as { tasks?: TaskSummary[] };
-    const task = (result.tasks ?? []).find(
+    tasks = result.tasks ?? [];
+    const task = tasks.find(
       (candidate) => candidate.title === CHILD_TASK_TITLE && predicate(candidate),
     );
     if (task) {
@@ -618,7 +624,9 @@ async function waitForTask(
       setTimeout(resolve, 100);
     });
   }
-  throw new Error(`timed out waiting for ${CHILD_TASK_TITLE} task state`);
+  throw new Error(
+    `timed out waiting for ${CHILD_TASK_TITLE} task state; tasks=${JSON.stringify(tasks)}`,
+  );
 }
 
 describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
@@ -698,22 +706,47 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
           "parent_high_usage_empty_response",
         );
         proxy.releaseChild();
-        const pendingTask = await waitForTask(
-          gateway,
-          (task) => task.status === "completed" && task.deliveryStatus === "pending",
-          30_000,
-        );
+        let pendingTask: TaskSummary;
+        let pendingLedger: SubagentLedger;
+        try {
+          pendingLedger = await waitForSubagentLedger(
+            gateway,
+            childRunId,
+            (ledger) =>
+              ledger.execution?.status === "terminal" &&
+              collectText(ledger.completion).includes(CHILD_MARKER) &&
+              ledger.delivery?.status === "pending" &&
+              ledger.delivery.disposition === "retryable" &&
+              typeof ledger.delivery.lastError === "string" &&
+              ledger.delivery.lastError.includes("completion_handoff_pending"),
+            30_000,
+          );
+          pendingTask = await waitForTask(
+            gateway,
+            (task) =>
+              task.runId === childRunId &&
+              (task.status === "running" || task.status === "completed") &&
+              task.deliveryStatus !== "delivered",
+            30_000,
+          );
+        } catch (error) {
+          const diagnostic = {
+            schema: "openclaw.pr132704.ephemeral-gateway-diagnostic.v1",
+            exactHead: process.env.EXPECTED_SHA ?? process.env.GITHUB_SHA ?? "local",
+            childRunId,
+            ledger: readSubagentLedger(gateway, childRunId),
+            providerEvents: proxy.events,
+            gatewayLogs: gateway.logs().split("\n").slice(-400),
+          };
+          await writeVerdict("recovery-success-pending-diagnostic", diagnostic);
+          throw new Error(
+            `${error instanceof Error ? error.message : String(error)}; diagnostics=${JSON.stringify(diagnostic)}`,
+            { cause: error },
+          );
+        }
         expect(requireTaskRunId(pendingTask)).toBe(childRunId);
-        const pendingLedger = await waitForSubagentLedger(
-          gateway,
-          childRunId,
-          (ledger) =>
-            ledger.delivery?.status === "pending" &&
-            ledger.delivery.disposition === "retryable" &&
-            typeof ledger.delivery.lastError === "string" &&
-            ledger.delivery.lastError.includes("completion_handoff_pending"),
-          30_000,
-        );
+        expect(["running", "completed"]).toContain(pendingTask.status);
+        expect(pendingTask.deliveryStatus).not.toBe("delivered");
         const beforeSuccessor = state
           .getSnapshot()
           .messages.slice(outboundStart)
