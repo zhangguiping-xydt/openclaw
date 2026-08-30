@@ -92,6 +92,19 @@ jobs:
                   }
                 });
               '
+          mkdir -p "$RUNNER_TEMP/package/codex-stale/package"
+          tar -xzf "$RUNNER_TEMP/package/codex-current.tgz" \
+            -C "$RUNNER_TEMP/package/codex-stale"
+          node -e '
+            const fs = require("node:fs");
+            const manifestPath = process.argv[1];
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+            manifest.version = "2026.1.1";
+            fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+          ' "$RUNNER_TEMP/package/codex-stale/package/package.json"
+          tar -czf "$RUNNER_TEMP/package/codex-stale.tgz" \
+            -C "$RUNNER_TEMP/package/codex-stale" package
+          test -s "$RUNNER_TEMP/package/codex-stale.tgz"
           mkdir -p "$RUNNER_TEMP/openclaw-prefix"
           npm install --global --prefix "$RUNNER_TEMP/openclaw-prefix" \
             "$RUNNER_TEMP/package/openclaw-current.tgz"
@@ -235,6 +248,8 @@ jobs:
           env OPENCLAW_NPM_REGISTRY_UPSTREAM="https://registry.npmjs.org/" \
             node "$GITHUB_WORKSPACE/scripts/e2e/lib/plugins/npm-registry-server.mjs" \
               "$registry_backend_port_file" \
+              "@openclaw/codex" "2026.1.1" \
+              "$RUNNER_TEMP/package/codex-stale.tgz" \
               "@openclaw/codex" "2026.8.1" \
               "$RUNNER_TEMP/package/codex-current.tgz" \
               >"$registry_backend_log" 2>&1 &
@@ -267,7 +282,7 @@ jobs:
             npm_config_registry="$registry_url" \
             NPM_CONFIG_AUDIT=false \
             NPM_CONFIG_FUND=false \
-            "$openclaw_bin" plugins install npm:@openclaw/codex@2026.8.1 \
+            "$openclaw_bin" plugins install npm:@openclaw/codex@2026.1.1 \
               --force --accept-capabilities >"$seed_install_log" 2>&1
           installed_plugin_path="$(find "$state_dir" -type d \
             -path '*/node_modules/@openclaw/codex' -print -quit)"
@@ -282,32 +297,7 @@ jobs:
               "$installed_plugin_path/package.json"
           )"
           printf 'seed_plugin_version=%s\n' "$seed_plugin_version" >>"$trace"
-          test "$seed_plugin_version" = "2026.8.1"
-          node --input-type=module - "$lease_db" <<'NODE'
-          import { DatabaseSync } from "node:sqlite";
-          const databasePath = process.argv[2];
-          const db = new DatabaseSync(databasePath);
-          const stateKey = "plugins.installedIndex";
-          const row = db.prepare(
-            "SELECT value_json FROM config_machine_state WHERE state_key = ?",
-          ).get(stateKey);
-          if (!row || typeof row.value_json !== "string") {
-            throw new Error("installed plugin index was not persisted");
-          }
-          const persisted = JSON.parse(row.value_json);
-          const record = persisted?.index?.installRecords?.codex;
-          if (!record || record.source !== "npm") {
-            throw new Error("codex npm install record is missing");
-          }
-          record.version = "2026.1.1";
-          record.resolvedVersion = "2026.1.1";
-          const now = Date.now();
-          persisted.revision = Math.max(now, Number(persisted.revision ?? 0) + 1);
-          db.prepare(
-            "UPDATE config_machine_state SET value_json = ?, updated_at_ms = ? WHERE state_key = ?",
-          ).run(JSON.stringify(persisted), now, stateKey);
-          db.close();
-          NODE
+          test "$seed_plugin_version" = "2026.1.1"
 
           rm -f "$registry_request_file"
           touch "$registry_hold_file"
