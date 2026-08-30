@@ -331,22 +331,44 @@ async function startRecoveryProviderProxy(params: {
       if (isCompaction) {
         record("timeout_compaction_request_started");
         compactionStarted.resolve();
-        await compactionRelease.promise;
-        if (params.failRecovery) {
-          record("timeout_compaction_failed");
-          response.writeHead(500, { "content-type": "application/json" });
-          response.end(
-            JSON.stringify({
-              error: { type: "server_error", message: "QA injected recovery failure" },
-            }),
-          );
+        if (!params.failRecovery) {
+          response.writeHead(200, {
+            "content-type": "text/event-stream",
+            "cache-control": "no-store",
+          });
+          response.write(": transport-keepalive\n\n");
+          // The proof deliberately holds compaction open while the child completes.
+          // Comments keep the HTTP body alive without creating model events.
+          const transportKeepalive = setInterval(() => {
+            if (!response.destroyed && !response.writableEnded) {
+              response.write(": transport-keepalive\n\n");
+            }
+          }, 1_000);
+          transportKeepalive.unref();
+          try {
+            await compactionRelease.promise;
+          } finally {
+            clearInterval(transportKeepalive);
+          }
+          if (response.destroyed) {
+            record("timeout_compaction_discarded_after_close");
+            return;
+          }
+          const upstream = await fetchUpstream();
+          recoverySucceeded = true;
+          record("timeout_compaction_released");
+          response.end(upstream.body);
           compactionSettled.resolve();
           return;
         }
-        const upstream = await fetchUpstream();
-        recoverySucceeded = true;
-        record("timeout_compaction_released");
-        copyResponse(upstream.upstream, upstream.body, response);
+        await compactionRelease.promise;
+        record("timeout_compaction_failed");
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            error: { type: "server_error", message: "QA injected recovery failure" },
+          }),
+        );
         compactionSettled.resolve();
         return;
       }
