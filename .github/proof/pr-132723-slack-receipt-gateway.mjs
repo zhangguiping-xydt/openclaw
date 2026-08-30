@@ -88,7 +88,7 @@ async function reservePort() {
 async function waitFor(predicate, label, timeoutMs = EVENT_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const result = predicate();
+    const result = await predicate();
     if (result) {
       return result;
     }
@@ -129,10 +129,25 @@ function attachLogStream(stream, run, streamName, records) {
   stream.on("end", () => flush(true));
 }
 
+function projectReceiptRecord(record) {
+  if (record?.message !== RECEIPT_MESSAGE) {
+    return null;
+  }
+  const metadata = Object.entries(record)
+    .filter(([key]) => /^\d+$/u.test(key))
+    .map(([, value]) => value)
+    .find(
+      (value) =>
+        value && typeof value === "object" && !Array.isArray(value) && value.provider === "slack",
+    );
+  return metadata ? { ...metadata, message: record.message } : { message: record.message };
+}
+
 function receiptRecords(records) {
   return records
-    .map((record) => record.json)
-    .filter((record) => record?.message === RECEIPT_MESSAGE);
+    .map((record) => ("json" in record ? record.json : record))
+    .map(projectReceiptRecord)
+    .filter((record) => record !== null);
 }
 
 function receiptCount(records, messageTs) {
@@ -141,6 +156,23 @@ function receiptCount(records, messageTs) {
 
 function logCount(records, fragment) {
   return records.filter((record) => record.line.includes(fragment)).length;
+}
+
+async function readJsonLogRecords(file) {
+  let raw;
+  try {
+    raw = await fs.readFile(file, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  return raw
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map(parseJsonLine)
+    .filter((record) => record !== null);
 }
 
 async function stopGateway(child) {
@@ -238,6 +270,7 @@ const stateDir = path.join(proofRoot, "state");
 const workspaceDir = path.join(proofRoot, "workspace");
 const tmpDir = path.join(proofRoot, "tmp");
 const configPath = path.join(proofRoot, "openclaw.json");
+const gatewayLogPath = path.join(proofRoot, "gateway.jsonl");
 await Promise.all(
   [homeDir, stateDir, workspaceDir, tmpDir].map((dir) => fs.mkdir(dir, { recursive: true })),
 );
@@ -354,7 +387,7 @@ try {
   gatewayPort = await reservePort();
   const mockBaseUrl = `http://127.0.0.1:${mockServerPort}`;
   const config = {
-    logging: { level: "debug", consoleStyle: "json" },
+    logging: { level: "debug", consoleStyle: "json", file: gatewayLogPath },
     plugins: {
       allow: ["slack"],
       entries: { slack: { enabled: true } },
@@ -441,6 +474,7 @@ try {
         "--bind",
         "loopback",
         "--allow-unconfigured",
+        "--verbose",
       ],
       {
         cwd: sourceRoot,
@@ -504,7 +538,10 @@ try {
     eventId: "EvDropRunOne",
     event: dropEvent("message", "drop-run-one"),
   });
-  await waitFor(() => receiptCount(gatewayLogs, DROP_TS) === 1, "first drop receipt");
+  await waitFor(
+    async () => receiptCount(await readJsonLogRecords(gatewayLogPath), DROP_TS) === 1,
+    "first drop receipt",
+  );
   await sendSlackEvent({
     gatewayPort,
     signingSecret,
@@ -515,7 +552,10 @@ try {
     () => slackRequests.filter((request) => request.method === "chat.postEphemeral").length === 1,
     "sender-visible denial",
   );
-  await waitFor(() => receiptCount(gatewayLogs, VISIBLE_TS) === 1, "visible-drop receipt");
+  await waitFor(
+    async () => receiptCount(await readJsonLogRecords(gatewayLogPath), VISIBLE_TS) === 1,
+    "visible-drop receipt",
+  );
   await stopGateway(activeGateway);
   activeGateway = null;
 
@@ -538,15 +578,19 @@ try {
     eventId: "EvSentinelRunTwo",
     event: sentinelEvent("sentinel-run-two"),
   });
-  await waitFor(() => receiptCount(gatewayLogs, SENTINEL_TS) === 1, "post-replay sentinel receipt");
+  await waitFor(
+    async () => receiptCount(await readJsonLogRecords(gatewayLogPath), SENTINEL_TS) === 1,
+    "post-replay sentinel receipt",
+  );
   await sleep(500);
   await stopGateway(activeGateway);
   activeGateway = null;
 
-  const receipts = receiptRecords(gatewayLogs);
-  const dropReceipts = receiptCount(gatewayLogs, DROP_TS);
-  const visibleReceipts = receiptCount(gatewayLogs, VISIBLE_TS);
-  const sentinelReceipts = receiptCount(gatewayLogs, SENTINEL_TS);
+  const persistedGatewayLogs = await readJsonLogRecords(gatewayLogPath);
+  const receipts = receiptRecords(persistedGatewayLogs);
+  const dropReceipts = receiptCount(persistedGatewayLogs, DROP_TS);
+  const visibleReceipts = receiptCount(persistedGatewayLogs, VISIBLE_TS);
+  const sentinelReceipts = receiptCount(persistedGatewayLogs, SENTINEL_TS);
   const dmDisabledGateExecutions = logCount(gatewayLogs, "slack: drop dm (dms disabled)");
   const ephemeralCalls = slackRequests.filter(
     (request) => request.method === "chat.postEphemeral",
