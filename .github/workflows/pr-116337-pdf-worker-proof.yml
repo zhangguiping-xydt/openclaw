@@ -6,7 +6,7 @@ on:
       source_sha:
         description: Exact contributor head to build and prove
         required: true
-        default: 0ec692afaee5ac42e8c0f66e5afcb35eff5ce3ee
+        default: 34fbb37b2adb46e74e98ec4a7d19484ee2905c67
         type: string
 
 permissions:
@@ -39,10 +39,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXPECTED_SHA" = "0ec692afaee5ac42e8c0f66e5afcb35eff5ce3ee"
+          test "$EXPECTED_SHA" = "34fbb37b2adb46e74e98ec4a7d19484ee2905c67"
           git init source
           git -C source remote add origin https://github.com/zhangguiping-xydt/openclaw.git
-          git -C source fetch --depth=1 origin verify/pr-116337-0ec692a
+          git -C source fetch --depth=1 origin verify/pr-116337-34fbb37
           git -C source checkout --detach FETCH_HEAD
           actual_sha="$(git -C source rev-parse HEAD)"
           echo "Validation SHA: $actual_sha"
