@@ -140,6 +140,7 @@ jobs:
           seed_install_log="$GITHUB_WORKSPACE/pr-132668-seed-install.log"
           gateway1_log="$GITHUB_WORKSPACE/pr-132668-gateway1.log"
           gateway2_log="$GITHUB_WORKSPACE/pr-132668-gateway2.log"
+          gateway3_log="$GITHUB_WORKSPACE/pr-132668-gateway3.log"
           trace="$GITHUB_WORKSPACE/pr-132668-held-convergence-trace.txt"
           lease_db="$state_dir/state/openclaw.sqlite"
           gateway_port=19789
@@ -156,6 +157,11 @@ jobs:
               kill -TERM "$gateway2_pid" 2>/dev/null || true
               sleep 1
               kill -KILL "$gateway2_pid" 2>/dev/null || true
+            fi
+            if test -n "${gateway3_pid:-}" && kill -0 "$gateway3_pid" 2>/dev/null; then
+              kill -TERM "$gateway3_pid" 2>/dev/null || true
+              sleep 1
+              kill -KILL "$gateway3_pid" 2>/dev/null || true
             fi
             if test -n "${registry_pid:-}" && kill -0 "$registry_pid" 2>/dev/null; then
               kill -TERM "$registry_pid" 2>/dev/null || true
@@ -410,22 +416,35 @@ jobs:
               --port "$gateway_port" --bind loopback --verbose \
               >"$gateway2_log" 2>&1 &
           gateway2_pid=$!
+          gateway2_original_pid="$gateway2_pid"
           test "$gateway2_pid" -ne "$gateway1_original_pid"
 
           gateway2_ready_http=000
+          gateway2_restart_required=false
           for _ in $(seq 1 1200); do
             gateway2_ready_http="$(curl --silent --output /dev/null --write-out '%{http_code}' \
               --max-time 2 "http://127.0.0.1:$gateway_port/readyz" || true)"
-            test "$gateway2_ready_http" = "200" && break
-            if ! kill -0 "$gateway2_pid" 2>/dev/null; then
-              echo "Gateway 2 exited before readiness" >&2
-              sed -n '1,300p' "$gateway2_log" >&2
+            if test "$gateway2_ready_http" = "200"; then
+              echo "Gateway 2 unexpectedly reported ready before the migration restart" >&2
               exit 1
+            fi
+            if ! kill -0 "$gateway2_pid" 2>/dev/null; then
+              set +e
+              wait "$gateway2_pid"
+              gateway2_exit_code=$?
+              set -e
+              gateway2_pid=""
+              gateway2_restart_required=true
+              break
             fi
             sleep 0.25
           done
-          printf 'gateway2_ready_http=%s\n' "$gateway2_ready_http" >>"$trace"
-          test "$gateway2_ready_http" = "200"
+          printf 'gateway2_ready_http=%s\ngateway2_exit_code=%s\n' \
+            "$gateway2_ready_http" "${gateway2_exit_code:-still-running}" >>"$trace"
+          test "$gateway2_restart_required" = "true"
+          grep -Fq \
+            "OpenClaw plugin migration inputs changed during startup convergence; refusing to report the gateway ready." \
+            "$gateway2_log"
           replacement_plugin_version="$(
             node -e 'process.stdout.write(require(process.argv[1]).version)' \
               "$installed_plugin_path/package.json"
@@ -433,8 +452,47 @@ jobs:
           printf 'replacement_plugin_version=%s\n' \
             "$replacement_plugin_version" >>"$trace"
           test "$replacement_plugin_version" = "2026.8.1"
-          kill -0 "$gateway2_pid"
-          printf 'gateway2_running_after_ready=true\n' >>"$trace"
+
+          for _ in $(seq 1 200); do
+            test "$(lease_count 2>/dev/null || true)" = "0" && break
+            sleep 0.1
+          done
+          lease_after_convergence_restart="$(lease_count)"
+          printf 'lease_count_after_convergence_restart=%s\n' \
+            "$lease_after_convergence_restart" >>"$trace"
+          test "$lease_after_convergence_restart" = "0"
+
+          setsid env \
+            HOME="$proof_home" \
+            OPENCLAW_STATE_DIR="$state_dir" \
+            OPENCLAW_CONFIG_PATH="$config_path" \
+            NPM_CONFIG_REGISTRY="$registry_url" \
+            npm_config_registry="$registry_url" \
+            NPM_CONFIG_AUDIT=false \
+            NPM_CONFIG_FUND=false \
+            "$openclaw_bin" gateway run \
+              --port "$gateway_port" --bind loopback --verbose \
+              >"$gateway3_log" 2>&1 &
+          gateway3_pid=$!
+          test "$gateway3_pid" -ne "$gateway1_original_pid"
+          test "$gateway3_pid" -ne "$gateway2_original_pid"
+
+          gateway3_ready_http=000
+          for _ in $(seq 1 1200); do
+            gateway3_ready_http="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --max-time 2 "http://127.0.0.1:$gateway_port/readyz" || true)"
+            test "$gateway3_ready_http" = "200" && break
+            if ! kill -0 "$gateway3_pid" 2>/dev/null; then
+              echo "Final replacement Gateway exited before readiness" >&2
+              sed -n '1,300p' "$gateway3_log" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          printf 'gateway3_ready_http=%s\n' "$gateway3_ready_http" >>"$trace"
+          test "$gateway3_ready_http" = "200"
+          kill -0 "$gateway3_pid"
+          printf 'gateway3_running_after_ready=true\n' >>"$trace"
           registry_request="$(tr -d '\r\n' <"$registry_request_file")"
 
           {
@@ -450,10 +508,18 @@ jobs:
             echo "lease_count_after_exit=$lease_after_exit"
             echo "lease_count_before_replacement=$lease_after_exit"
             echo "gateway2_pid_differs=true"
-            echo "gateway2_ready_http=$gateway2_ready_http"
-            echo "gateway2_ready=true"
+            echo "gateway2_role=completed-plugin-convergence"
+            echo "gateway2_ready_http_before_restart=$gateway2_ready_http"
+            echo "gateway2_restart_required=true"
+            echo "gateway2_exit_code=$gateway2_exit_code"
             echo "replacement_plugin=@openclaw/codex@$replacement_plugin_version"
-            echo "gateway2_running_after_ready=true"
+            echo "lease_count_after_convergence_restart=$lease_after_convergence_restart"
+            echo "gateway3_pid_differs=true"
+            echo "gateway3_role=final-replacement"
+            echo "gateway3_ready_http=$gateway3_ready_http"
+            echo "gateway3_ready=true"
+            echo "gateway3_running_after_ready=true"
+            echo "same_state_and_port=true"
           } | tee "$trace"
 
       - name: Upload redacted proof logs
@@ -468,5 +534,6 @@ jobs:
             pr-132668-seed-install.log
             pr-132668-gateway1.log
             pr-132668-gateway2.log
+            pr-132668-gateway3.log
           if-no-files-found: warn
           retention-days: 14
