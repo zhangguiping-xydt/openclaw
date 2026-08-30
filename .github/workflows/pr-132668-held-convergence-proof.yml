@@ -76,10 +76,14 @@ jobs:
           config_path="$state_dir/openclaw.json"
           registry_port_file="$proof_root/registry-port"
           registry_request_file="$proof_root/registry-request"
-          registry_log="$proof_root/registry.log"
-          gateway1_log="$proof_root/gateway1.log"
-          gateway2_log="$proof_root/gateway2.log"
-          trace="$proof_root/trace.txt"
+          registry_hold_file="$proof_root/registry-hold"
+          registry_log="$GITHUB_WORKSPACE/pr-132668-registry.log"
+          seed_install_log="$GITHUB_WORKSPACE/pr-132668-seed-install.log"
+          gateway1_log="$GITHUB_WORKSPACE/pr-132668-gateway1.log"
+          gateway2_log="$GITHUB_WORKSPACE/pr-132668-gateway2.log"
+          trace="$GITHUB_WORKSPACE/pr-132668-held-convergence-trace.txt"
+          plugin_package_dir="$proof_root/held-plugin"
+          plugin_tarball="$proof_root/proof-held-plugin-1.0.0.tgz"
           lease_db="$state_dir/state/openclaw.sqlite"
           gateway_port=19789
           openclaw_bin="$RUNNER_TEMP/openclaw-prefix/bin/openclaw"
@@ -108,24 +112,103 @@ jobs:
               "auth": { "mode": "token", "token": "pr-132668-proof-only" }
             },
             "plugins": {
-              "entries": { "acpx": { "enabled": true } }
+              "entries": { "held-plugin": { "enabled": true } }
             }
           }
           JSON
 
+          mkdir -p "$plugin_package_dir"
+          cat >"$plugin_package_dir/package.json" <<'JSON'
+          {
+            "name": "@proof/held-plugin",
+            "version": "1.0.0",
+            "description": "Secretless plugin-convergence proof fixture",
+            "type": "module",
+            "main": "index.js",
+            "openclaw": { "extensions": ["./index.js"] }
+          }
+          JSON
+          cat >"$plugin_package_dir/openclaw.plugin.json" <<'JSON'
+          {
+            "id": "held-plugin",
+            "name": "Held Convergence Proof",
+            "description": "No-op plugin used to hold startup package repair.",
+            "configSchema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {}
+            }
+          }
+          JSON
+          cat >"$plugin_package_dir/index.js" <<'JS'
+          export default {
+            id: "held-plugin",
+            name: "Held Convergence Proof",
+            register() {},
+          };
+          JS
+          npm pack "$plugin_package_dir" --pack-destination "$proof_root" >/dev/null
+          test -s "$plugin_tarball"
+
           cat >"$proof_root/hold-registry.mjs" <<'NODE'
+          import crypto from "node:crypto";
           import fs from "node:fs";
           import http from "node:http";
 
-          const [portFile, requestFile, logFile] = process.argv.slice(2);
+          const [portFile, requestFile, holdFile, logFile, tarballFile] = process.argv.slice(2);
           const append = (line) => fs.appendFileSync(logFile, `${line}\n`);
+          const tarball = fs.readFileSync(tarballFile);
+          const integrity = `sha512-${crypto.createHash("sha512").update(tarball).digest("base64")}`;
+          const shasum = crypto.createHash("sha1").update(tarball).digest("hex");
           const sockets = new Set();
           const server = http.createServer((request, response) => {
             append(`${request.method} ${request.url}`);
-            if (request.url?.toLowerCase().startsWith("/@openclaw%2facpx")) {
-              fs.writeFileSync(requestFile, "GET /@openclaw%2Facpx\n");
-              request.once("close", () => append("held request closed"));
-              response.once("close", () => append("held response closed"));
+            const requestPath = request.url?.split("?", 1)[0] ?? "";
+            let decodedPath = requestPath;
+            try {
+              decodedPath = decodeURIComponent(requestPath);
+            } catch {}
+            if (decodedPath === "/@proof/held-plugin" && fs.existsSync(holdFile)) {
+              fs.writeFileSync(requestFile, "GET /@proof%2Fheld-plugin\n");
+              request.once("close", () => append("held metadata request closed"));
+              response.once("close", () => append("held metadata response closed"));
+              return;
+            }
+            if (decodedPath === "/@proof/held-plugin") {
+              const address = server.address();
+              if (!address || typeof address === "string") {
+                response.writeHead(500).end();
+                return;
+              }
+              const packageMetadata = {
+                name: "@proof/held-plugin",
+                "dist-tags": { latest: "1.0.0" },
+                versions: {
+                  "1.0.0": {
+                    name: "@proof/held-plugin",
+                    version: "1.0.0",
+                    description: "Secretless plugin-convergence proof fixture",
+                    type: "module",
+                    main: "index.js",
+                    openclaw: { extensions: ["./index.js"] },
+                    dist: {
+                      tarball: `http://127.0.0.1:${address.port}/proof-held-plugin-1.0.0.tgz`,
+                      integrity,
+                      shasum,
+                    },
+                  },
+                },
+              };
+              response.writeHead(200, { "content-type": "application/json" });
+              response.end(JSON.stringify(packageMetadata));
+              return;
+            }
+            if (decodedPath === "/proof-held-plugin-1.0.0.tgz") {
+              response.writeHead(200, {
+                "content-type": "application/octet-stream",
+                "content-length": String(tarball.length),
+              });
+              response.end(tarball);
               return;
             }
             response.writeHead(404, { "content-type": "application/json" });
@@ -149,7 +232,8 @@ jobs:
           NODE
 
           node "$proof_root/hold-registry.mjs" \
-            "$registry_port_file" "$registry_request_file" "$registry_log" &
+            "$registry_port_file" "$registry_request_file" "$registry_hold_file" \
+            "$registry_log" "$plugin_tarball" &
           registry_pid=$!
           for _ in $(seq 1 100); do
             test -s "$registry_port_file" && break
@@ -157,6 +241,29 @@ jobs:
           done
           test -s "$registry_port_file"
           registry_port="$(tr -d '\r\n' <"$registry_port_file")"
+          registry_url="http://127.0.0.1:$registry_port/"
+
+          env \
+            HOME="$proof_home" \
+            OPENCLAW_STATE_DIR="$state_dir" \
+            OPENCLAW_CONFIG_PATH="$config_path" \
+            NPM_CONFIG_REGISTRY="$registry_url" \
+            npm_config_registry="$registry_url" \
+            NPM_CONFIG_AUDIT=false \
+            NPM_CONFIG_FUND=false \
+            "$openclaw_bin" plugins install npm:@proof/held-plugin \
+              --force --accept-capabilities >"$seed_install_log" 2>&1
+          installed_plugin_path="$(find "$state_dir" -type d \
+            -path '*/node_modules/@proof/held-plugin' -print -quit)"
+          test -n "$installed_plugin_path"
+          case "$installed_plugin_path" in
+            "$state_dir"/*) ;;
+            *) echo "refusing to remove non-proof plugin path" >&2; exit 1 ;;
+          esac
+          rm -rf -- "$installed_plugin_path"
+          test ! -e "$installed_plugin_path"
+          rm -f "$registry_request_file"
+          touch "$registry_hold_file"
 
           lease_count() {
             node --input-type=module - "$lease_db" <<'NODE'
@@ -188,7 +295,6 @@ jobs:
             done
           }
 
-          registry_url="http://127.0.0.1:$registry_port/"
           setsid env \
             HOME="$proof_home" \
             OPENCLAW_STATE_DIR="$state_dir" \
@@ -245,12 +351,16 @@ jobs:
           done <"$proof_root/gateway1-descendants"
           test "$surviving_descendants" -eq 0
 
+          rm -f "$registry_hold_file"
+
           setsid env \
             HOME="$proof_home" \
             OPENCLAW_STATE_DIR="$state_dir" \
             OPENCLAW_CONFIG_PATH="$config_path" \
-            NPM_CONFIG_REGISTRY="https://registry.npmjs.org/" \
-            npm_config_registry="https://registry.npmjs.org/" \
+            NPM_CONFIG_REGISTRY="$registry_url" \
+            npm_config_registry="$registry_url" \
+            NPM_CONFIG_AUDIT=false \
+            NPM_CONFIG_FUND=false \
             "$openclaw_bin" gateway run \
               --port "$gateway_port" --bind loopback --verbose \
               >"$gateway2_log" 2>&1 &
@@ -307,11 +417,6 @@ jobs:
             echo "final_lease_count=$final_lease_count"
           } | tee "$trace"
 
-          cp "$trace" "$GITHUB_WORKSPACE/pr-132668-held-convergence-trace.txt"
-          cp "$registry_log" "$GITHUB_WORKSPACE/pr-132668-registry.log"
-          cp "$gateway1_log" "$GITHUB_WORKSPACE/pr-132668-gateway1.log"
-          cp "$gateway2_log" "$GITHUB_WORKSPACE/pr-132668-gateway2.log"
-
       - name: Upload redacted proof logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -320,6 +425,7 @@ jobs:
           path: |
             pr-132668-held-convergence-trace.txt
             pr-132668-registry.log
+            pr-132668-seed-install.log
             pr-132668-gateway1.log
             pr-132668-gateway2.log
           if-no-files-found: warn
