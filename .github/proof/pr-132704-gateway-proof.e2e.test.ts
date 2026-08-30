@@ -46,6 +46,8 @@ type TaskDeliveryLedger = {
   status?: unknown;
   disposition?: unknown;
   lastError?: unknown;
+  deliveredAt?: unknown;
+  steeringInjectedAt?: unknown;
 };
 
 type SubagentLedger = {
@@ -802,7 +804,10 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
         });
         const deliveredTask = await waitForTask(
           gateway,
-          (task) => task.status === "completed" && task.deliveryStatus === "delivered",
+          (task) =>
+            task.runId === childRunId &&
+            task.status === "completed" &&
+            task.deliveryStatus === "delivered",
           30_000,
         );
         const deliveredLedger = await waitForSubagentLedger(
@@ -810,7 +815,8 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
           childRunId,
           (ledger) =>
             ledger.delivery?.status === "delivered" &&
-            ledger.delivery.disposition === "delivered" &&
+            typeof ledger.delivery.deliveredAt === "number" &&
+            typeof ledger.delivery.steeringInjectedAt === "number" &&
             (ledger.delivery.lastError === null || ledger.delivery.lastError === undefined),
           30_000,
         );
