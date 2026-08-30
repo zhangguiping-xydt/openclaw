@@ -783,20 +783,6 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
         proxy.releaseCompaction();
         await proxy.waitForCompactionSettled();
         await proxy.waitForSuccessor();
-        const deliveredTask = await waitForTask(
-          gateway,
-          (task) => task.status === "completed" && task.deliveryStatus === "delivered",
-          30_000,
-        );
-        const deliveredLedger = await waitForSubagentLedger(
-          gateway,
-          childRunId,
-          (ledger) =>
-            ledger.delivery?.status === "delivered" &&
-            ledger.delivery.disposition === "delivered" &&
-            (ledger.delivery.lastError === null || ledger.delivery.lastError === undefined),
-          30_000,
-        );
         const beforeSuccessorReply = state
           .getSnapshot()
           .messages.slice(outboundStart)
@@ -814,6 +800,20 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
           textIncludes: CHILD_MARKER,
           timeoutMs: 90_000,
         });
+        const deliveredTask = await waitForTask(
+          gateway,
+          (task) => task.status === "completed" && task.deliveryStatus === "delivered",
+          30_000,
+        );
+        const deliveredLedger = await waitForSubagentLedger(
+          gateway,
+          childRunId,
+          (ledger) =>
+            ledger.delivery?.status === "delivered" &&
+            ledger.delivery.disposition === "delivered" &&
+            (ledger.delivery.lastError === null || ledger.delivery.lastError === undefined),
+          30_000,
+        );
         const matchingOutbound = state
           .getSnapshot()
           .messages.slice(outboundStart)
