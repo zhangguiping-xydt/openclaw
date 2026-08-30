@@ -138,7 +138,7 @@ jobs:
           pre_fix_status=$?
           set -e
           test "$pre_fix_status" -ne 0
-          rg -q "completion_handoff_pending" "$evidence/pre-fix-regression.log"
+          grep -q "completion_handoff_pending" "$evidence/pre-fix-regression.log"
           rm "$test_file"
           git checkout --detach "$EXPECTED_SHA"
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
