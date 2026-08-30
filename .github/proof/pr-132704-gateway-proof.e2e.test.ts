@@ -13,9 +13,12 @@ import {
   startQaMockOpenAiServer,
 } from "../../../../extensions/qa-lab/api.js";
 
-const MODEL_REF = "mock-openai/gpt-5.6-luna:cloud";
-const CHILD_MODEL_REF = "mock-openai/gpt-5.6-luna";
+const MODEL_REF = "mock-openai/gpt-5.6-luna";
+const CHILD_PROVIDER_ID = "mock-openai-child";
+const CHILD_MODEL_REF = `${CHILD_PROVIDER_ID}/gpt-5.6-luna`;
 const CHILD_MODEL_ID = "gpt-5.6-luna";
+const PARENT_PROVIDER_TIMEOUT_SECONDS = 5;
+const CHILD_PROVIDER_TIMEOUT_SECONDS = 60;
 const REQUESTER_PROMPT =
   "Subagent terminal reply QA check: visible. Spawn one native worker, then finish the parent turn without waiting. Do not use ACP.";
 const CHILD_MARKER = "QA-SUBAGENT-TERMINAL-VISIBLE-OK";
@@ -85,6 +88,29 @@ async function readRequestBody(request: IncomingMessage): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+async function waitForProviderPhase(
+  phase: string,
+  promise: Promise<void>,
+  events: ProviderEvent[],
+  timeoutMs = 60_000,
+): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`timed out waiting for ${phase}; events=${JSON.stringify(events)}`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 function rewriteParentSpawnResponse(body: Buffer): Buffer {
   const spawnArguments = JSON.stringify({
     task: "Subagent terminal reply QA worker: visible.",
@@ -138,9 +164,9 @@ function rewriteParentSpawnResponse(body: Buffer): Buffer {
 
 function configureGatewayModels(config: OpenClawConfig): OpenClawConfig {
   const provider = config.models?.providers?.["mock-openai"];
-  const parentModel = provider?.models.find((model) => model.id === "gpt-5.6-luna:cloud");
-  if (!provider || !parentModel) {
-    throw new Error("mock-openai cloud model config is missing");
+  const childModel = provider?.models.find((model) => model.id === CHILD_MODEL_ID);
+  if (!provider || !childModel) {
+    throw new Error("mock-openai model config is missing");
   }
   const modelPolicyAllow = config.agents?.defaults?.modelPolicy?.allow ?? [];
   return {
@@ -170,10 +196,12 @@ function configureGatewayModels(config: OpenClawConfig): OpenClawConfig {
         ...config.models?.providers,
         "mock-openai": {
           ...provider,
-          models: [
-            ...provider.models.filter((model) => model.id !== CHILD_MODEL_ID),
-            { ...parentModel, id: CHILD_MODEL_ID, name: CHILD_MODEL_ID },
-          ],
+          timeoutSeconds: PARENT_PROVIDER_TIMEOUT_SECONDS,
+        },
+        [CHILD_PROVIDER_ID]: {
+          ...provider,
+          timeoutSeconds: CHILD_PROVIDER_TIMEOUT_SECONDS,
+          models: [{ ...childModel }],
         },
       },
     },
@@ -250,7 +278,9 @@ async function startRecoveryProviderProxy(params: {
         isModelRequest && !isChild && !isCompaction && allText.includes(REQUESTER_PROMPT);
       const requesterRequestIndex = isRequesterRequest ? requesterRequestCount++ : -1;
       const isParentInitial = requesterRequestIndex === 0;
-      const isParentToolContinuation = requesterRequestIndex === 1;
+      // One quiet provider request is retried before timeout recovery begins.
+      // Hold every pre-recovery continuation so the retry cannot settle the parent.
+      const isParentToolContinuation = requesterRequestIndex >= 1 && !recoverySucceeded;
       const fetchUpstream = async () => {
         const upstream = await fetch(`${params.upstreamBaseUrl}${request.url ?? "/"}`, {
           method: request.method,
@@ -351,9 +381,12 @@ async function startRecoveryProviderProxy(params: {
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     events,
-    waitForCompaction: () => compactionStarted.promise,
-    waitForCompactionSettled: () => compactionSettled.promise,
-    waitForSuccessor: () => successorStarted.promise,
+    waitForCompaction: () =>
+      waitForProviderPhase("timeout compaction request", compactionStarted.promise, events),
+    waitForCompactionSettled: () =>
+      waitForProviderPhase("timeout compaction settlement", compactionSettled.promise, events),
+    waitForSuccessor: () =>
+      waitForProviderPhase("recovered successor request", successorStarted.promise, events),
     releaseChild: () => childRelease.resolve(),
     releaseCompaction: () => compactionRelease.resolve(),
     releaseSuccessor: () => successorRelease.resolve(),

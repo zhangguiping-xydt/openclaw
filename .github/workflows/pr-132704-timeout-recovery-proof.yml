@@ -179,7 +179,7 @@ jobs:
           env -i HOME="$proof_root/home" PATH="$safe_path" CI=1 TMPDIR="$proof_root/tmp" \
             XDG_CACHE_HOME="$proof_root/cache" COREPACK_HOME="$proof_root/cache/corepack" \
             PNPM_HOME="$proof_root/pnpm-home" PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=false \
-            pnpm_config_verify_deps_before_run=false pnpm build
+            pnpm_config_verify_deps_before_run=false OPENCLAW_BUILD_PRIVATE_QA=1 pnpm build
 
       - name: Run ephemeral Gateway and QA channel proof
         env:
