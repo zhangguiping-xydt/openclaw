@@ -6,7 +6,7 @@ on:
       target_sha:
         description: Exact contributor head to verify
         required: true
-        default: 51f65b441a3140c668867ddad11d3d12c492f1a6
+        default: 9a35c434505b5dc2834a940aa987c79622b4e2c5
         type: string
 
 permissions:
@@ -39,7 +39,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXPECTED_SHA" = "51f65b441a3140c668867ddad11d3d12c492f1a6"
+          test "$EXPECTED_SHA" = "9a35c434505b5dc2834a940aa987c79622b4e2c5"
           git init source
           git -C source remote add origin https://github.com/zhangguiping-xydt/openclaw.git
           git -C source fetch --depth=1 origin "$EXPECTED_SHA"
@@ -70,14 +70,16 @@ jobs:
           proof_root="$RUNNER_TEMP/pr-132723-slack-receipt-proof"
           evidence="$proof_root/evidence"
           safe_path="$proof_root/pnpm-home:$PATH"
-          env -i HOME="$proof_root/home" PATH="$safe_path" CI=1 TMPDIR="$proof_root/tmp" XDG_CACHE_HOME="$proof_root/cache" COREPACK_HOME="$proof_root/cache/corepack" PNPM_HOME="$proof_root/pnpm-home" PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=false pnpm_config_verify_deps_before_run=false node scripts/run-vitest.mjs extensions/slack/src/monitor/message-handler/prepare.test.ts extensions/slack/src/monitor/message-handler.test.ts >"$evidence/focused-test.log" 2>&1
+          env -i HOME="$proof_root/home" PATH="$safe_path" CI=1 TMPDIR="$proof_root/tmp" XDG_CACHE_HOME="$proof_root/cache" COREPACK_HOME="$proof_root/cache/corepack" PNPM_HOME="$proof_root/pnpm-home" PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=false pnpm_config_verify_deps_before_run=false node scripts/run-vitest.mjs extensions/slack/src/monitor/message-handler/prepare.test.ts extensions/slack/src/monitor/message-handler.test.ts extensions/slack/src/monitor/provider.auth-test-token.test.ts >"$evidence/focused-test.log" 2>&1
           cat "$evidence/focused-test.log"
           grep -q "records a bounded receipt when message preparation has no content" extensions/slack/src/monitor/message-handler/prepare.test.ts
+          grep -q "keeps self-message loop prevention out of rejection receipts" extensions/slack/src/monitor/message-handler/prepare.test.ts
           grep -q "allows app_mention retry" extensions/slack/src/monitor/message-handler/prepare.test.ts
+          grep -q "quietly drops a self-authored DM at the monitor boundary" extensions/slack/src/monitor/provider.auth-test-token.test.ts
           EXPECTED_SHA="$EXPECTED_SHA" node -e '
             const fs = require("node:fs");
             const path = require("node:path");
-            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, "pr-132723-slack-receipt-proof", "evidence", "focused-verdict.json"), JSON.stringify({ schema: "openclaw.pr132723.focused-regression.v2", exactHead: process.env.EXPECTED_SHA, expectedResult: "green", testStatus: 0, files: ["extensions/slack/src/monitor/message-handler/prepare.test.ts", "extensions/slack/src/monitor/message-handler.test.ts"] }, null, 2) + "\n");
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, "pr-132723-slack-receipt-proof", "evidence", "focused-verdict.json"), JSON.stringify({ schema: "openclaw.pr132723.focused-regression.v3", exactHead: process.env.EXPECTED_SHA, expectedResult: "green", testStatus: 0, files: ["extensions/slack/src/monitor/message-handler/prepare.test.ts", "extensions/slack/src/monitor/message-handler.test.ts", "extensions/slack/src/monitor/provider.auth-test-token.test.ts"] }, null, 2) + "\n");
           '
 
       - name: Hash focused evidence
@@ -115,7 +117,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXACT_HEAD_SHA" = "51f65b441a3140c668867ddad11d3d12c492f1a6"
+          test "$EXACT_HEAD_SHA" = "9a35c434505b5dc2834a940aa987c79622b4e2c5"
           git init source
           git -C source remote add upstream https://github.com/openclaw/openclaw.git
           git -C source fetch --depth=1 upstream "$PRE_FIX_SHA"
@@ -209,7 +211,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXPECTED_SHA" = "51f65b441a3140c668867ddad11d3d12c492f1a6"
+          test "$EXPECTED_SHA" = "9a35c434505b5dc2834a940aa987c79622b4e2c5"
           git init source
           git -C source remote add origin https://github.com/zhangguiping-xydt/openclaw.git
           git -C source fetch --depth=1 origin "$EXPECTED_SHA"

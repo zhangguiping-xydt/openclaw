@@ -15,14 +15,17 @@ const BOT_ID = "BMOCK12345";
 const DROP_CHANNEL_ID = "DDROP12345";
 const VISIBLE_CHANNEL_ID = "CVISIBLE12";
 const SENTINEL_CHANNEL_ID = "DSENTINEL1";
+const SELF_CHANNEL_ID = "DSELF12345";
 const TWIN_CHANNEL_ID = "CTWIN12345";
 const DROP_TS = "1710000000.000100";
 const VISIBLE_TS = "1710000000.000200";
 const SENTINEL_TS = "1710000000.000300";
+const SELF_TS = "1710000000.000350";
 const TWIN_TS = "1710000000.000400";
 const DROP_BODY_MARKER = "DROP_BODY_MARKER";
 const VISIBLE_BODY_MARKER = "VISIBLE_BODY_MARKER";
 const SENTINEL_BODY_MARKER = "SENTINEL_BODY_MARKER";
+const SELF_BODY_MARKER = "SELF_BODY_MARKER";
 const TWIN_BODY_MARKER = "TWIN_BODY_MARKER";
 const STARTUP_TIMEOUT_MS = 60_000;
 const EVENT_TIMEOUT_MS = 30_000;
@@ -587,6 +590,18 @@ try {
     event_ts: SENTINEL_TS,
     client_msg_id: eventId,
   });
+  const selfEvent = (eventId) => ({
+    type: "message",
+    subtype: "bot_message",
+    channel: SELF_CHANNEL_ID,
+    channel_type: "im",
+    user: BOT_USER_ID,
+    bot_id: BOT_ID,
+    text: SELF_BODY_MARKER,
+    ts: SELF_TS,
+    event_ts: SELF_TS,
+    client_msg_id: eventId,
+  });
   const twinEvent = (type, eventId) => ({
     type,
     channel: TWIN_CHANNEL_ID,
@@ -648,6 +663,17 @@ try {
   await sendSlackEvent({
     gatewayPort,
     signingSecret,
+    eventId: "EvSelfRunTwo",
+    event: selfEvent("self-run-two"),
+  });
+  await waitFor(
+    () => slackRequests.filter((request) => request.method === "auth.test").length === 8,
+    "self-message monitor handling",
+  );
+  assert(modelRequests.length === 0, "self-message loop prevention reached the model");
+  await sendSlackEvent({
+    gatewayPort,
+    signingSecret,
     eventId: "EvTwinMessageRunTwo",
     event: twinEvent("message", "twin-message-run-two"),
   });
@@ -679,6 +705,7 @@ try {
   const dropReceipts = receiptCount(persistedGatewayLogs, DROP_TS);
   const visibleReceipts = receiptCount(persistedGatewayLogs, VISIBLE_TS);
   const sentinelReceipts = receiptCount(persistedGatewayLogs, SENTINEL_TS);
+  const selfReceipts = receiptCount(persistedGatewayLogs, SELF_TS);
   const twinReceiptRecords = receipts.filter((receipt) => receipt.messageTs === TWIN_TS);
   const twinReceipts = twinReceiptRecords.length;
   const channelPolicyGateExecutions = logCount(
@@ -699,6 +726,7 @@ try {
   assert(dropReceipts === 2, `expected two event-attempt receipts, observed ${dropReceipts}`);
   assert(visibleReceipts === 1, `expected one visible-drop receipt, observed ${visibleReceipts}`);
   assert(sentinelReceipts === 1, `expected one sentinel receipt, observed ${sentinelReceipts}`);
+  assert(selfReceipts === 0, `expected no self-message receipt, observed ${selfReceipts}`);
   assert(
     twinReceipts === 1,
     `expected one rejected twin-attempt receipt, observed ${twinReceipts}`,
@@ -719,8 +747,8 @@ try {
   assert(ephemeralCalls === 1, `expected one sender-visible denial, observed ${ephemeralCalls}`);
   assert(messageCalls === 1, `expected one successful twin reply, observed ${messageCalls}`);
   assert(
-    authTestCalls === 9,
-    `expected auth.test for two starts and seven authorized events, observed ${authTestCalls}`,
+    authTestCalls === 10,
+    `expected auth.test for two starts and eight authorized events, observed ${authTestCalls}`,
   );
   assert(
     modelRequests.length === 1,
@@ -731,6 +759,7 @@ try {
     DROP_BODY_MARKER,
     VISIBLE_BODY_MARKER,
     SENTINEL_BODY_MARKER,
+    SELF_BODY_MARKER,
     TWIN_BODY_MARKER,
     botToken,
     signingSecret,
@@ -768,6 +797,12 @@ try {
     orderingSentinel: {
       operatorReceipts: sentinelReceipts,
       confirmsReplayQueueDrainedBeforeVerdict: true,
+    },
+    quietSelfMessageLoopPrevention: {
+      logicalKeyDigest: sha256(JSON.stringify(["default", TEAM_ID, SELF_CHANNEL_ID, SELF_TS])),
+      gatewayDeliveries: 1,
+      operatorReceipts: selfReceipts,
+      agentModelRequestsBeforeTwin: 0,
     },
     rejectedThenDispatchedTwin: {
       logicalKeyDigest: sha256(JSON.stringify(["default", TEAM_ID, TWIN_CHANNEL_ID, TWIN_TS])),
@@ -812,6 +847,7 @@ try {
       .replaceAll(DROP_BODY_MARKER, "[redacted-message-body]")
       .replaceAll(VISIBLE_BODY_MARKER, "[redacted-message-body]")
       .replaceAll(SENTINEL_BODY_MARKER, "[redacted-message-body]")
+      .replaceAll(SELF_BODY_MARKER, "[redacted-message-body]")
       .replaceAll(TWIN_BODY_MARKER, "[redacted-message-body]"),
   };
   throw error;
