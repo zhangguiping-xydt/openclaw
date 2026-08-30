@@ -295,11 +295,13 @@ async function main() {
   };
 
   const resolverUrl = pathToFileURL(
-    path.join(sourceRoot, "dist/plugins/document-extractors.runtime.js"),
+    path.join(sourceRoot, "src/plugins/document-extractors.runtime.ts"),
   ).href;
   const resolver = await capture(
     process.execPath,
     [
+      "--import",
+      "tsx",
       "--input-type=module",
       "--eval",
       "const m=await import(process.argv[1]); const value=m.resolvePluginDocumentExtractors().map(({id,pluginId,mimeTypes})=>({id,pluginId,mimeTypes})); process.stdout.write(JSON.stringify(value));",
