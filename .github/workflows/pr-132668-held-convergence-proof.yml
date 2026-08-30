@@ -445,9 +445,16 @@ jobs:
           grep -Fq \
             "OpenClaw plugin migration inputs changed during startup convergence; refusing to report the gateway ready." \
             "$gateway2_log"
+          replacement_plugin_path="$(find "$state_dir" -type d \
+            -path '*/node_modules/@openclaw/codex' -print -quit)"
+          test -n "$replacement_plugin_path"
+          case "$replacement_plugin_path" in
+            "$state_dir"/*) ;;
+            *) echo "replacement plugin escaped the proof state root" >&2; exit 1 ;;
+          esac
           replacement_plugin_version="$(
             node -e 'process.stdout.write(require(process.argv[1]).version)' \
-              "$installed_plugin_path/package.json"
+              "$replacement_plugin_path/package.json"
           )"
           printf 'replacement_plugin_version=%s\n' \
             "$replacement_plugin_version" >>"$trace"
