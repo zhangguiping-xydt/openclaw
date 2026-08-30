@@ -19,6 +19,7 @@ const CHILD_MODEL_REF = `${CHILD_PROVIDER_ID}/gpt-5.6-luna`;
 const CHILD_MODEL_ID = "gpt-5.6-luna";
 const PARENT_PROVIDER_TIMEOUT_SECONDS = 5;
 const CHILD_PROVIDER_TIMEOUT_SECONDS = 60;
+const PARENT_CONTEXT_TOKENS = 100_000;
 const HIGH_PROMPT_TOKENS = 96_000;
 const SPAWN_PROMPT =
   "Subagent terminal reply QA check: visible. Spawn one native worker, then finish the parent turn without waiting. Do not use ACP.";
@@ -197,6 +198,11 @@ function configureGatewayModels(config: OpenClawConfig): OpenClawConfig {
         "mock-openai": {
           ...provider,
           timeoutSeconds: PARENT_PROVIDER_TIMEOUT_SECONDS,
+          models: provider.models.map((model) =>
+            model.id === CHILD_MODEL_ID
+              ? { ...model, contextTokens: PARENT_CONTEXT_TOKENS }
+              : model,
+          ),
         },
         [CHILD_PROVIDER_ID]: {
           ...provider,
@@ -423,7 +429,7 @@ async function startRecoveryProviderProxy(params: {
     baseUrl: `http://127.0.0.1:${address.port}`,
     events,
     waitForCompaction: () =>
-      waitForProviderPhase("timeout compaction request", compactionStarted.promise, events),
+      waitForProviderPhase("timeout compaction request", compactionStarted.promise, events, 20_000),
     waitForChild: () => waitForProviderPhase("child request", childStarted.promise, events),
     waitForCompactionSettled: () =>
       waitForProviderPhase("timeout compaction settlement", compactionSettled.promise, events),
@@ -553,6 +559,30 @@ async function writeVerdict(name: string, verdict: unknown): Promise<void> {
   );
 }
 
+async function waitForCompactionWithDiagnostics(
+  name: string,
+  proxy: Awaited<ReturnType<typeof startRecoveryProviderProxy>>,
+  gateway: Awaited<ReturnType<ReturnType<typeof createQaGatewayChild>["start"]>>,
+): Promise<void> {
+  try {
+    await proxy.waitForCompaction();
+  } catch (error) {
+    const diagnostic = {
+      schema: "openclaw.pr132704.ephemeral-gateway-diagnostic.v1",
+      exactHead: process.env.EXPECTED_SHA ?? process.env.GITHUB_SHA ?? "local",
+      parentContextTokens: PARENT_CONTEXT_TOKENS,
+      highPromptTokens: HIGH_PROMPT_TOKENS,
+      providerEvents: proxy.events,
+      gatewayLogs: gateway.logs().split("\n").slice(-400),
+    };
+    await writeVerdict(`${name}-diagnostic`, diagnostic);
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}; gatewayLogs=${JSON.stringify(diagnostic.gatewayLogs)}`,
+      { cause: error },
+    );
+  }
+}
+
 async function waitForTask(
   gateway: Awaited<ReturnType<ReturnType<typeof createQaGatewayChild>["start"]>>,
   predicate: (task: TaskSummary) => boolean,
@@ -650,7 +680,7 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
           message: RECOVERY_PROMPT,
         });
 
-        await proxy.waitForCompaction();
+        await waitForCompactionWithDiagnostics("recovery-success", proxy, gateway);
         expect(proxy.events.map((event) => event.phase)).toContain(
           "parent_high_usage_empty_response",
         );
@@ -814,7 +844,7 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
           message: RECOVERY_PROMPT,
         });
 
-        await proxy.waitForCompaction();
+        await waitForCompactionWithDiagnostics("recovery-failure", proxy, gateway);
         expect(proxy.events.map((event) => event.phase)).toContain(
           "parent_high_usage_empty_response",
         );
