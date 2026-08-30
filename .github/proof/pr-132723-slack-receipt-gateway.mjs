@@ -616,8 +616,8 @@ try {
   );
   assert(ephemeralCalls === 1, `expected one sender-visible denial, observed ${ephemeralCalls}`);
   assert(
-    authTestCalls === 2,
-    `expected auth.test once per Gateway start, observed ${authTestCalls}`,
+    authTestCalls === 7,
+    `expected auth.test for two starts and five authorized events, observed ${authTestCalls}`,
   );
   assert(
     modelRequests.length === 0,
