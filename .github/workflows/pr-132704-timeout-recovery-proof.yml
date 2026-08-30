@@ -6,7 +6,7 @@ on:
       target_sha:
         description: Exact contributor head to verify
         required: true
-        default: c05971711b0c9117ec8b84b367da3bbc807480b5
+        default: 72440d8e8d6e8e26967bc9adac29b1e3a045c79f
         type: string
       before_sha:
         description: Parent head expected to fail the new delivery regression
@@ -45,11 +45,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$EXPECTED_SHA" = "c05971711b0c9117ec8b84b367da3bbc807480b5"
+          test "$EXPECTED_SHA" = "72440d8e8d6e8e26967bc9adac29b1e3a045c79f"
           test "$BEFORE_SHA" = "74f2e74750dfa251e22d2b0510c6445a45b90013"
           git init source
           git -C source remote add origin https://github.com/zhangguiping-xydt/openclaw.git
-          git -C source fetch --depth=8 origin verify/pr-132704-c059717
+          git -C source fetch --depth=8 origin verify/pr-132704-72440d8
           git -C source checkout --detach "$EXPECTED_SHA"
           actual_sha="$(git -C source rev-parse HEAD)"
           echo "Validation SHA: $actual_sha"
@@ -207,7 +207,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pr-132704-timeout-recovery-c059717-${{ github.run_id }}
+          name: pr-132704-timeout-recovery-72440d8-${{ github.run_id }}
           path: ${{ runner.temp }}/pr-132704-timeout-recovery-proof/evidence
           if-no-files-found: warn
           retention-days: 14
