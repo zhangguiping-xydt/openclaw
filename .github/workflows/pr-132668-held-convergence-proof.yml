@@ -132,6 +132,8 @@ jobs:
           gateway_port=19789
           openclaw_bin="$RUNNER_TEMP/openclaw-prefix/bin/openclaw"
           mkdir -p "$proof_home" "$state_dir"
+          : >"$trace"
+          printf 'head=%s\nnode=%s\n' "$EXPECTED_SHA" "$(node --version)" >>"$trace"
 
           cleanup() {
             if test -n "${gateway1_pid:-}" && kill -0 "$gateway1_pid" 2>/dev/null; then
@@ -275,6 +277,12 @@ jobs:
             *) echo "installed plugin escaped the proof state root" >&2; exit 1 ;;
           esac
           test -f "$installed_plugin_path/package.json"
+          seed_plugin_version="$(
+            node -e 'process.stdout.write(require(process.argv[1]).version)' \
+              "$installed_plugin_path/package.json"
+          )"
+          printf 'seed_plugin_version=%s\n' "$seed_plugin_version" >>"$trace"
+          test "$seed_plugin_version" = "2026.8.1"
           node --input-type=module - "$lease_db" <<'NODE'
           import { DatabaseSync } from "node:sqlite";
           const databasePath = process.argv[2];
@@ -361,10 +369,13 @@ jobs:
             sleep 0.25
           done
           test -s "$registry_request_file"
-          test "$(lease_count)" = "1"
+          lease_before_signal="$(lease_count)"
+          printf 'lease_count_before_signal=%s\n' "$lease_before_signal" >>"$trace"
+          test "$lease_before_signal" = "1"
 
           ready_before="$(curl --silent --output /dev/null --write-out '%{http_code}' \
             --max-time 2 "http://127.0.0.1:$gateway_port/readyz" || true)"
+          printf 'ready_http_before_signal=%s\n' "$ready_before" >>"$trace"
           test "$ready_before" = "000"
           collect_descendants "$gateway1_pid" >"$proof_root/gateway1-descendants"
           pstree -ap "$gateway1_pid" >"$proof_root/gateway1-tree-before.txt" || true
@@ -375,6 +386,7 @@ jobs:
           gateway1_exit_code=$?
           set -e
           gateway1_pid=""
+          printf 'gateway1_exit_code=%s\n' "$gateway1_exit_code" >>"$trace"
           test "$gateway1_exit_code" -eq 143
 
           for _ in $(seq 1 200); do
@@ -382,6 +394,7 @@ jobs:
             sleep 0.1
           done
           lease_after_exit="$(lease_count)"
+          printf 'lease_count_after_exit=%s\n' "$lease_after_exit" >>"$trace"
           test "$lease_after_exit" = "0"
 
           surviving_descendants=0
@@ -390,6 +403,7 @@ jobs:
               surviving_descendants=$((surviving_descendants + 1))
             fi
           done <"$proof_root/gateway1-descendants"
+          printf 'surviving_gateway1_descendants=%s\n' "$surviving_descendants" >>"$trace"
           test "$surviving_descendants" -eq 0
 
           rm -f "$registry_hold_file"
@@ -420,16 +434,17 @@ jobs:
             fi
             sleep 0.25
           done
+          printf 'gateway2_ready_http=%s\n' "$gateway2_ready_http" >>"$trace"
           test "$gateway2_ready_http" = "200"
-          lease_at_ready="$(lease_count)"
-          test "$lease_at_ready" = "0"
           replacement_plugin_version="$(
             node -e 'process.stdout.write(require(process.argv[1]).version)' \
               "$installed_plugin_path/package.json"
           )"
+          printf 'replacement_plugin_version=%s\n' \
+            "$replacement_plugin_version" >>"$trace"
           test "$replacement_plugin_version" = "2026.8.1"
           kill -0 "$gateway2_pid"
-          final_lease_count="$lease_at_ready"
+          printf 'gateway2_running_after_ready=true\n' >>"$trace"
           registry_request="$(tr -d '\r\n' <"$registry_request_file")"
 
           {
@@ -443,13 +458,12 @@ jobs:
             echo "gateway1_exit_code=$gateway1_exit_code"
             echo "npm_process_tree_after_exit=none"
             echo "lease_count_after_exit=$lease_after_exit"
+            echo "lease_count_before_replacement=$lease_after_exit"
             echo "gateway2_pid_differs=true"
             echo "gateway2_ready_http=$gateway2_ready_http"
             echo "gateway2_ready=true"
             echo "replacement_plugin=@openclaw/codex@$replacement_plugin_version"
-            echo "lease_count_at_ready=$lease_at_ready"
             echo "gateway2_running_after_ready=true"
-            echo "final_lease_count=$final_lease_count"
           } | tee "$trace"
 
       - name: Upload redacted proof logs
