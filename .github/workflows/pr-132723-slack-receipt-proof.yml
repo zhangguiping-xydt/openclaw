@@ -63,7 +63,7 @@ jobs:
           mkdir -p "$proof_root/home" "$proof_root/tmp" "$proof_root/cache/corepack" "$proof_root/pnpm-home" "$proof_root/evidence"
           safe_path="$proof_root/pnpm-home:$PATH"
           package_manager="$(env -i HOME="$proof_root/home" PATH="$safe_path" CI=1 node -e 'const p=require("./package.json"); process.stdout.write(p.packageManager || "")')"
-          test "$package_manager" = "pnpm@12.1.0+sha512.d9b8276d97f6ec86e49815877f91ee9f63cee61f2063b304e43b6dab8fa07ce8a9afd46d2facd39f921e6a9d06b3c75a81349c7b888c2d22886bae0229901037"
+          test "$package_manager" = "pnpm@11.22.0+sha512.1ff870c4c6133dfd88fb2afc46dd13d47f09c9794b438c6fdb47ca98caf3bc16381ee0be93a091b8e3824cf01f889f46d7d9e20910fb0be1ab0fb5baa80dd621"
           env -i HOME="$proof_root/home" PATH="$safe_path" CI=1 COREPACK_HOME="$proof_root/cache/corepack" PNPM_HOME="$proof_root/pnpm-home" corepack enable --install-directory "$proof_root/pnpm-home"
           env -i HOME="$proof_root/home" PATH="$safe_path" CI=1 COREPACK_HOME="$proof_root/cache/corepack" PNPM_HOME="$proof_root/pnpm-home" corepack prepare "$package_manager" --activate
           env -i HOME="$proof_root/home" PATH="$safe_path" CI=1 TMPDIR="$proof_root/tmp" XDG_CACHE_HOME="$proof_root/cache" COREPACK_HOME="$proof_root/cache/corepack" PNPM_HOME="$proof_root/pnpm-home" PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=false pnpm_config_verify_deps_before_run=false pnpm install --frozen-lockfile --prefer-offline
