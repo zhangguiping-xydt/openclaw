@@ -399,10 +399,23 @@ async function startRecoveryProviderProxy(params: {
             .map((event) => `data: ${JSON.stringify(event)}\n\n`)
             .join(""),
         );
-        await new Promise<void>((resolve) => {
-          request.once("aborted", resolve);
-          response.once("close", resolve);
-        });
+        // Refresh only the guarded HTTP body's transport deadline. SSE comments are
+        // ignored by the Responses event parser, so the model-event idle watchdog
+        // remains silent and owns the timeout classification exercised by this PR.
+        const transportKeepalive = setInterval(() => {
+          if (!response.destroyed && !response.writableEnded) {
+            response.write(": transport-keepalive\n\n");
+          }
+        }, 1_000);
+        transportKeepalive.unref();
+        try {
+          await new Promise<void>((resolve) => {
+            request.once("aborted", resolve);
+            response.once("close", resolve);
+          });
+        } finally {
+          clearInterval(transportKeepalive);
+        }
         record("parent_recovery_client_timed_out");
         return;
       }
