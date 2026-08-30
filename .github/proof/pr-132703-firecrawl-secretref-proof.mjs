@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -12,9 +13,10 @@ const evidenceDir = path.join(
   "pr-132703-firecrawl-proof",
   "evidence",
 );
-const gatewayToken = "pr-132703-proof-gateway-token";
-const searchCredential = "proof-search-credential";
-const fetchCredential = "proof-fetch-credential";
+const proofNonce = randomUUID();
+const gatewayToken = `gateway-${proofNonce}`;
+const searchCredential = `search-${proofNonce}`;
+const fetchCredential = `fetch-${proofNonce}`;
 
 function assert(condition, message) {
   if (!condition) {
@@ -54,18 +56,19 @@ async function startFirecrawlFixture() {
         authorization: request.headers.authorization,
         body,
       });
-      const payload = request.url === "/v2/search"
-        ? { success: true, data: { web: [] } }
-        : {
-            success: true,
-            data: {
-              markdown: "# Exact-head Firecrawl proof",
-              metadata: {
-                sourceURL: "https://example.com/pr-132703-proof",
-                statusCode: 200,
+      const payload =
+        request.url === "/v2/search"
+          ? { success: true, data: { web: [] } }
+          : {
+              success: true,
+              data: {
+                markdown: "# Exact-head Firecrawl proof",
+                metadata: {
+                  sourceURL: "https://example.com/pr-132703-proof",
+                  statusCode: 200,
+                },
               },
-            },
-          };
+            };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(payload));
     });
@@ -127,9 +130,7 @@ async function waitForGateway(port, child, readLogs) {
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error(
-    `Gateway readiness timed out: ${String(lastError)}\n${redact(readLogs())}`,
-  );
+  throw new Error(`Gateway readiness timed out: ${String(lastError)}\n${redact(readLogs())}`);
 }
 
 async function invokeTool(port, name, args) {
@@ -142,7 +143,10 @@ async function invokeTool(port, name, args) {
     body: JSON.stringify({ name, args, sessionKey: "main" }),
   });
   const payload = await response.json();
-  assert(response.status === 200, `${name} returned HTTP ${response.status}: ${JSON.stringify(payload)}`);
+  assert(
+    response.status === 200,
+    `${name} returned HTTP ${response.status}: ${JSON.stringify(payload)}`,
+  );
   assert(payload?.ok === true, `${name} did not return ok=true: ${JSON.stringify(payload)}`);
   return { status: response.status, ok: payload.ok };
 }
@@ -234,9 +238,26 @@ async function runScenario(params) {
   gateway.stderr.on("data", appendLog);
 
   try {
+    const trackedFixtures = [
+      ...new Set([params.searchFixture, params.fetchFixture].filter(Boolean)),
+    ];
+    const initialRequestCounts = new Map(
+      trackedFixtures.map((fixture) => [fixture, fixture.requests.length]),
+    );
     await waitForGateway(port, gateway, () => logs);
     const invocation = await invokeTool(port, params.tool, params.args);
     const fixture = params.expectedFixture;
+    for (const trackedFixture of trackedFixtures) {
+      const expectedDelta = trackedFixture === fixture ? 1 : 0;
+      const actualDelta =
+        trackedFixture.requests.length - (initialRequestCounts.get(trackedFixture) ?? 0);
+      assert(
+        actualDelta === expectedDelta,
+        `${params.id} sent ${actualDelta} request(s) to ${
+          trackedFixture === fixture ? "the expected" : "an unexpected"
+        } fixture`,
+      );
+    }
     const request = fixture.requests.at(-1);
     assert(request, `${params.id} did not reach its Firecrawl fixture`);
     assert(request.method === "POST", `${params.id} used ${request.method}, expected POST`);
@@ -244,6 +265,35 @@ async function runScenario(params) {
     assert(
       request.authorization === `Bearer ${params.expectedCredential}`,
       `${params.id} selected the wrong credential`,
+    );
+    const requestShapeMatches =
+      params.expectedPath === "/v2/search"
+        ? request.body?.query === params.args.query
+        : request.body?.url === params.args.url;
+    assert(requestShapeMatches, `${params.id} sent the wrong request body`);
+
+    const persistedConfigText = await readFile(configPath, "utf8");
+    assert(
+      !persistedConfigText.includes(searchCredential) &&
+        !persistedConfigText.includes(fetchCredential),
+      `${params.id} persisted resolved credential material`,
+    );
+    const persistedConfig = JSON.parse(persistedConfigText);
+    const configuredCapabilities = ["webSearch", "webFetch"].filter(
+      (capability) => persistedConfig.plugins.entries.firecrawl.config[capability],
+    );
+    for (const capability of configuredCapabilities) {
+      const apiKey = persistedConfig.plugins.entries.firecrawl.config[capability].apiKey;
+      assert(
+        apiKey?.source === "file" && apiKey.provider === "proof_file",
+        `${params.id} did not preserve the ${capability} SecretRef`,
+      );
+    }
+    assert(
+      !logs.includes(searchCredential) &&
+        !logs.includes(fetchCredential) &&
+        !logs.includes(gatewayToken),
+      `${params.id} leaked proof credentials to Gateway logs`,
     );
     return {
       id: params.id,
@@ -255,10 +305,12 @@ async function runScenario(params) {
       endpointMatches: true,
       credentialMatches: true,
       fileSecretRefResolved: true,
+      nonTargetEndpointRequests: 0,
+      persistedSecretRefs: configuredCapabilities,
+      persistedConfigCredentialFree: true,
+      gatewayLogsCredentialFree: true,
       requestShape:
-        params.expectedPath === "/v2/search"
-          ? { queryMatches: request.body?.query === params.args.query }
-          : { targetUrlMatches: request.body?.url === params.args.url },
+        params.expectedPath === "/v2/search" ? { queryMatches: true } : { targetUrlMatches: true },
     };
   } finally {
     await stopGateway(gateway);
