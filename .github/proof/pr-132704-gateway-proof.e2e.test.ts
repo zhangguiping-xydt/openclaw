@@ -20,8 +20,10 @@ const CHILD_MODEL_ID = "gpt-5.6-luna";
 const PARENT_PROVIDER_TIMEOUT_SECONDS = 5;
 const CHILD_PROVIDER_TIMEOUT_SECONDS = 60;
 const HIGH_PROMPT_TOKENS = 96_000;
-const REQUESTER_PROMPT =
+const SPAWN_PROMPT =
   "Subagent terminal reply QA check: visible. Spawn one native worker, then finish the parent turn without waiting. Do not use ACP.";
+const RECOVERY_PROMPT =
+  "Subagent terminal reply QA recovery check: answer briefly without calling tools.";
 const CHILD_MARKER = "QA-SUBAGENT-TERMINAL-VISIBLE-OK";
 const CHILD_TASK_TITLE = "qa-terminal-visible";
 const TEST_TIMEOUT_MS = 300_000;
@@ -151,13 +153,6 @@ function rewriteParentSpawnResponse(body: Buffer): Buffer {
             completedCallRewritten = true;
           }
         }
-        if (completed) {
-          completed.usage = {
-            input_tokens: HIGH_PROMPT_TOKENS,
-            output_tokens: 16,
-            total_tokens: HIGH_PROMPT_TOKENS + 16,
-          };
-        }
       }
       return `data: ${JSON.stringify(event)}`;
     });
@@ -270,6 +265,7 @@ async function startRecoveryProviderProxy(params: {
   failRecovery: boolean;
 }) {
   const childRelease = createDeferred();
+  const childStarted = createDeferred();
   const compactionRelease = createDeferred();
   const compactionStarted = createDeferred();
   const compactionSettled = createDeferred();
@@ -277,7 +273,8 @@ async function startRecoveryProviderProxy(params: {
   const successorRelease = createDeferred();
   const events: ProviderEvent[] = [];
   let recoverySucceeded = false;
-  let requesterRequestCount = 0;
+  let spawnRequestCount = 0;
+  let recoveryRequestCount = 0;
   const record = (phase: string) => events.push({ phase, at: new Date().toISOString() });
   const server = createServer((request, response) => {
     void (async () => {
@@ -289,14 +286,18 @@ async function startRecoveryProviderProxy(params: {
       const isModelRequest = request.method === "POST" && request.url === "/v1/responses";
       const isCompaction = /context summarization assistant/iu.test(allText);
       const isChild = /Your session:\s*agent:[^\s]+:subagent:/u.test(allText);
-      const isRequesterRequest =
-        isModelRequest && !isChild && !isCompaction && allText.includes(REQUESTER_PROMPT);
-      const requesterRequestIndex = isRequesterRequest ? requesterRequestCount++ : -1;
-      const isParentHighUsageRetrySeed = requesterRequestIndex === 0;
-      const isParentInitialSpawn = requesterRequestIndex === 1;
-      // The terminal high-usage empty turn is a separate runner attempt. Its usage
-      // survives the visible-answer retry and remains available when this attempt stalls.
-      const isParentToolContinuation = requesterRequestIndex >= 2 && !recoverySucceeded;
+      // A later turn includes the earlier session transcript. Match the recovery turn
+      // first so its replay-safe timeout never falls back into the spawn flow.
+      const isRecoveryRequest =
+        isModelRequest && !isChild && !isCompaction && allText.includes(RECOVERY_PROMPT);
+      const isSpawnRequest =
+        isModelRequest &&
+        !isChild &&
+        !isCompaction &&
+        !isRecoveryRequest &&
+        allText.includes(SPAWN_PROMPT);
+      const spawnRequestIndex = isSpawnRequest ? spawnRequestCount++ : -1;
+      const recoveryRequestIndex = isRecoveryRequest ? recoveryRequestCount++ : -1;
       const fetchUpstream = async () => {
         const upstream = await fetch(`${params.upstreamBaseUrl}${request.url ?? "/"}`, {
           method: request.method,
@@ -308,47 +309,10 @@ async function startRecoveryProviderProxy(params: {
         return { upstream, body: Buffer.from(await upstream.arrayBuffer()) };
       };
 
-      if (isParentHighUsageRetrySeed) {
-        record("parent_high_usage_empty_response");
-        writeAssistantResponse(response, undefined, HIGH_PROMPT_TOKENS);
-        return;
-      }
-      if (isParentInitialSpawn) {
-        record("parent_initial_spawn_response");
-        const upstream = await fetchUpstream();
-        const upstreamBody = rewriteParentSpawnResponse(upstream.body);
-        copyResponse(upstream.upstream, upstreamBody, response);
-        return;
-      }
-      if (isParentToolContinuation) {
-        // The upstream QA fixture records the parent as settled here, which releases
-        // its worker gate. Return only stream-activity events to the Gateway, then stay
-        // silent so OpenClaw's stream idle watchdog owns the timeout classification.
-        await fetchUpstream();
-        record("parent_tool_continuation_held_for_timeout");
-        const responseId = `resp_${randomUUID()}`;
-        response.writeHead(200, {
-          "content-type": "text/event-stream",
-          "cache-control": "no-store",
-        });
-        response.write(
-          [
-            { type: "response.created", response: { id: responseId, status: "in_progress" } },
-            { type: "response.in_progress", response: { id: responseId, status: "in_progress" } },
-          ]
-            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
-            .join(""),
-        );
-        await new Promise<void>((resolve) => {
-          request.once("aborted", resolve);
-          response.once("close", resolve);
-        });
-        record("parent_tool_continuation_client_timed_out");
-        return;
-      }
       if (isChild) {
         const upstream = await fetchUpstream();
         record("child_response_held");
+        childStarted.resolve();
         await childRelease.promise;
         record("child_response_released");
         copyResponse(upstream.upstream, upstream.body, response);
@@ -394,6 +358,48 @@ async function startRecoveryProviderProxy(params: {
         }
         return;
       }
+      if (spawnRequestIndex === 0) {
+        record("parent_spawn_response");
+        const upstream = await fetchUpstream();
+        const upstreamBody = rewriteParentSpawnResponse(upstream.body);
+        copyResponse(upstream.upstream, upstreamBody, response);
+        return;
+      }
+      if (spawnRequestIndex >= 1) {
+        record("parent_spawn_tool_continuation");
+        const upstream = await fetchUpstream();
+        copyResponse(upstream.upstream, upstream.body, response);
+        return;
+      }
+      if (recoveryRequestIndex === 0) {
+        record("parent_high_usage_empty_response");
+        writeAssistantResponse(response, undefined, HIGH_PROMPT_TOKENS);
+        return;
+      }
+      if (recoveryRequestIndex >= 1) {
+        // The recovery turn has no tool side effects and is safe to replay. Return only
+        // stream activity, then let OpenClaw's idle watchdog own timeout classification.
+        record("parent_recovery_request_held_for_timeout");
+        const responseId = `resp_${randomUUID()}`;
+        response.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-store",
+        });
+        response.write(
+          [
+            { type: "response.created", response: { id: responseId, status: "in_progress" } },
+            { type: "response.in_progress", response: { id: responseId, status: "in_progress" } },
+          ]
+            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+            .join(""),
+        );
+        await new Promise<void>((resolve) => {
+          request.once("aborted", resolve);
+          response.once("close", resolve);
+        });
+        record("parent_recovery_client_timed_out");
+        return;
+      }
 
       const upstream = await fetchUpstream();
       record("successor_or_auxiliary_response");
@@ -418,6 +424,7 @@ async function startRecoveryProviderProxy(params: {
     events,
     waitForCompaction: () =>
       waitForProviderPhase("timeout compaction request", compactionStarted.promise, events),
+    waitForChild: () => waitForProviderPhase("child request", childStarted.promise, events),
     waitForCompactionSettled: () =>
       waitForProviderPhase("timeout compaction settlement", compactionSettled.promise, events),
     waitForSuccessor: () =>
@@ -489,6 +496,48 @@ function requireTaskRunId(task: TaskSummary): string {
     throw new Error(`${CHILD_TASK_TITLE} task did not expose its run id`);
   }
   return task.runId;
+}
+
+function requireGatewayRunId(run: GatewayRun): string {
+  if (typeof run.runId !== "string" || !run.runId.trim()) {
+    throw new Error("Gateway run did not expose its run id");
+  }
+  return run.runId;
+}
+
+async function startRequesterTurn(
+  gateway: Awaited<ReturnType<ReturnType<typeof createQaGatewayChild>["start"]>>,
+  params: { sessionKey: string; conversationId: string; message: string },
+): Promise<GatewayRun> {
+  const run = (await gateway.call(
+    "chat.send",
+    {
+      sessionKey: params.sessionKey,
+      message: params.message,
+      deliver: true,
+      originatingChannel: "qa-channel",
+      originatingTo: `dm:${params.conversationId}`,
+      originatingAccountId: "default",
+      idempotencyKey: randomUUID(),
+    },
+    { timeoutMs: 30_000 },
+  )) as GatewayRun;
+  expect(run.status).toBe("started");
+  requireGatewayRunId(run);
+  return run;
+}
+
+async function waitForRunTerminal(
+  gateway: Awaited<ReturnType<ReturnType<typeof createQaGatewayChild>["start"]>>,
+  run: GatewayRun,
+): Promise<GatewayRun> {
+  const terminal = (await gateway.call(
+    "agent.wait",
+    { runId: requireGatewayRunId(run), timeoutMs: 30_000 },
+    { timeoutMs: 35_000 },
+  )) as GatewayRun;
+  expect(["ok", "error"]).toContain(terminal.status);
+  return terminal;
 }
 
 async function writeVerdict(name: string, verdict: unknown): Promise<void> {
@@ -583,13 +632,22 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
         await transport.waitReady({ gateway });
 
         const conversationId = `pr132704-success-${randomUUID().slice(0, 8)}`;
+        const sessionKey = `agent:qa:${conversationId}`;
         const outboundStart = state.getSnapshot().messages.length;
-        await transport.sendInbound({
-          accountId: "default",
-          conversation: { id: conversationId, kind: "direct" },
-          senderId: conversationId,
-          senderName: "PR 132704 proof",
-          text: REQUESTER_PROMPT,
+        const spawnRun = await startRequesterTurn(gateway, {
+          sessionKey,
+          conversationId,
+          message: SPAWN_PROMPT,
+        });
+        await proxy.waitForChild();
+        const runningTask = await waitForTask(gateway, (task) => task.status === "running", 30_000);
+        const childRunId = requireTaskRunId(runningTask);
+        const spawnTerminal = await waitForRunTerminal(gateway, spawnRun);
+
+        const recoveryRun = await startRequesterTurn(gateway, {
+          sessionKey,
+          conversationId,
+          message: RECOVERY_PROMPT,
         });
 
         await proxy.waitForCompaction();
@@ -602,7 +660,7 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
           (task) => task.status === "completed" && task.deliveryStatus === "pending",
           30_000,
         );
-        const childRunId = requireTaskRunId(pendingTask);
+        expect(requireTaskRunId(pendingTask)).toBe(childRunId);
         const pendingLedger = await waitForSubagentLedger(
           gateway,
           childRunId,
@@ -688,6 +746,8 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
           pendingLedger,
           deliveredTask,
           deliveredLedger,
+          spawnTerminal,
+          recoveryRunId: requireGatewayRunId(recoveryRun),
           matchingOutboundCount: matchingOutbound.length,
           providerEvents: proxy.events,
           gatewayLogEvidence: gateway
@@ -738,21 +798,21 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
         const conversationId = `pr132704-failure-${randomUUID().slice(0, 8)}`;
         const sessionKey = `agent:qa:${conversationId}`;
         const outboundStart = state.getSnapshot().messages.length;
-        const started = (await gateway.call(
-          "chat.send",
-          {
-            sessionKey,
-            message: REQUESTER_PROMPT,
-            deliver: true,
-            originatingChannel: "qa-channel",
-            originatingTo: `dm:${conversationId}`,
-            originatingAccountId: "default",
-            idempotencyKey: randomUUID(),
-          },
-          { timeoutMs: 30_000 },
-        )) as GatewayRun;
-        expect(started.status).toBe("started");
-        expect(typeof started.runId).toBe("string");
+        const spawnRun = await startRequesterTurn(gateway, {
+          sessionKey,
+          conversationId,
+          message: SPAWN_PROMPT,
+        });
+        await proxy.waitForChild();
+        const runningTask = await waitForTask(gateway, (task) => task.status === "running", 30_000);
+        const childRunId = requireTaskRunId(runningTask);
+        const spawnTerminal = await waitForRunTerminal(gateway, spawnRun);
+
+        const recoveryRun = await startRequesterTurn(gateway, {
+          sessionKey,
+          conversationId,
+          message: RECOVERY_PROMPT,
+        });
 
         await proxy.waitForCompaction();
         expect(proxy.events.map((event) => event.phase)).toContain(
@@ -760,12 +820,7 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
         );
         proxy.releaseCompaction();
         await proxy.waitForCompactionSettled();
-        const parentTerminal = (await gateway.call(
-          "agent.wait",
-          { runId: started.runId, timeoutMs: 30_000 },
-          { timeoutMs: 35_000 },
-        )) as GatewayRun;
-        expect(["ok", "error"]).toContain(parentTerminal.status);
+        const parentTerminal = await waitForRunTerminal(gateway, recoveryRun);
         proxy.releaseChild();
         const terminalTask = await waitForTask(
           gateway,
@@ -773,6 +828,7 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
           30_000,
         );
         const terminalChildRunId = requireTaskRunId(terminalTask);
+        expect(terminalChildRunId).toBe(childRunId);
         const terminalLedger = await waitForSubagentLedger(
           gateway,
           terminalChildRunId,
@@ -811,6 +867,7 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
             terminalDispatchCount: matchingOutbound.length,
           },
           parentTerminal,
+          spawnTerminal,
           terminalTask,
           terminalLedger,
           matchingOutboundCount: matchingOutbound.length,
