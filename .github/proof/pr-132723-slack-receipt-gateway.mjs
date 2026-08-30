@@ -6,7 +6,7 @@ import net from "node:net";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
-const RECEIPT_MESSAGE = "Slack inbound message dropped before dispatch";
+const RECEIPT_MESSAGE = "Slack inbound event rejected during preparation";
 const WEBHOOK_PATH = "/slack/events";
 const TEAM_ID = "TMOCK12345";
 const APP_ID = "AMOCK12345";
@@ -15,12 +15,15 @@ const BOT_ID = "BMOCK12345";
 const DROP_CHANNEL_ID = "DDROP12345";
 const VISIBLE_CHANNEL_ID = "CVISIBLE12";
 const SENTINEL_CHANNEL_ID = "DSENTINEL1";
+const TWIN_CHANNEL_ID = "CTWIN12345";
 const DROP_TS = "1710000000.000100";
 const VISIBLE_TS = "1710000000.000200";
 const SENTINEL_TS = "1710000000.000300";
+const TWIN_TS = "1710000000.000400";
 const DROP_BODY_MARKER = "DROP_BODY_MARKER";
 const VISIBLE_BODY_MARKER = "VISIBLE_BODY_MARKER";
 const SENTINEL_BODY_MARKER = "SENTINEL_BODY_MARKER";
+const TWIN_BODY_MARKER = "TWIN_BODY_MARKER";
 const STARTUP_TIMEOUT_MS = 60_000;
 const EVENT_TIMEOUT_MS = 30_000;
 
@@ -375,10 +378,11 @@ let activeGateway = null;
 let mockServerPort;
 let gatewayPort;
 let verdict = {
-  schema: "openclaw.pr132723.slack-receipt-gateway-proof.v1",
+  schema: "openclaw.pr132723.slack-receipt-gateway-proof.v2",
   exactHead: expectedHead,
   status: "fail",
-  proofKind: "secretless mock Slack API plus real built ephemeral Gateway restart",
+  proofKind:
+    "secretless mock Slack API + real built ephemeral Gateway; not authenticated live Slack",
   authenticatedSlack: false,
 };
 
@@ -439,6 +443,7 @@ try {
         webhookPath: WEBHOOK_PATH,
         dm: { enabled: false },
         groupPolicy: "allowlist",
+        channels: { [TWIN_CHANNEL_ID]: { enabled: true, requireMention: true } },
         presenceEvents: { mode: "off" },
         reactionNotifications: "off",
       },
@@ -530,6 +535,16 @@ try {
     event_ts: SENTINEL_TS,
     client_msg_id: eventId,
   });
+  const twinEvent = (type, eventId) => ({
+    type,
+    channel: TWIN_CHANNEL_ID,
+    channel_type: "channel",
+    user: "UTWIN12345",
+    text: type === "app_mention" ? `<@${BOT_USER_ID}> ${TWIN_BODY_MARKER}` : TWIN_BODY_MARKER,
+    ts: TWIN_TS,
+    event_ts: TWIN_TS,
+    client_msg_id: eventId,
+  });
 
   activeGateway = await launchGateway(1);
   await sendSlackEvent({
@@ -578,6 +593,23 @@ try {
     eventId: "EvSentinelRunTwo",
     event: sentinelEvent("sentinel-run-two"),
   });
+  await sendSlackEvent({
+    gatewayPort,
+    signingSecret,
+    eventId: "EvTwinMessageRunTwo",
+    event: twinEvent("message", "twin-message-run-two"),
+  });
+  await waitFor(
+    async () => receiptCount(await readJsonLogRecords(gatewayLogPath), TWIN_TS) === 1,
+    "ordinary-message twin rejection receipt",
+  );
+  await sendSlackEvent({
+    gatewayPort,
+    signingSecret,
+    eventId: "EvTwinMentionRunTwo",
+    event: twinEvent("app_mention", "twin-mention-run-two"),
+  });
+  await waitFor(() => modelRequests.length === 1, "app_mention twin model dispatch");
   await waitFor(
     async () => receiptCount(await readJsonLogRecords(gatewayLogPath), SENTINEL_TS) === 1,
     "post-replay sentinel receipt",
@@ -591,6 +623,8 @@ try {
   const dropReceipts = receiptCount(persistedGatewayLogs, DROP_TS);
   const visibleReceipts = receiptCount(persistedGatewayLogs, VISIBLE_TS);
   const sentinelReceipts = receiptCount(persistedGatewayLogs, SENTINEL_TS);
+  const twinReceiptRecords = receipts.filter((receipt) => receipt.messageTs === TWIN_TS);
+  const twinReceipts = twinReceiptRecords.length;
   const channelPolicyGateExecutions = logCount(
     gatewayLogs,
     "slack: drop message (channel not allowed)",
@@ -598,36 +632,46 @@ try {
   const ephemeralCalls = slackRequests.filter(
     (request) => request.method === "chat.postEphemeral",
   ).length;
-  const replayedNonVisibleGateExecutions = channelPolicyGateExecutions - ephemeralCalls;
+  const repeatedNonVisibleGateExecutions = channelPolicyGateExecutions - ephemeralCalls;
   const authTestCalls = slackRequests.filter((request) => request.method === "auth.test").length;
   const receiptText = JSON.stringify(receipts);
   const sqliteFiles = await findSqliteFiles(stateDir);
 
-  assert(dropReceipts === 1, `expected one replayed-message receipt, observed ${dropReceipts}`);
+  assert(dropReceipts === 2, `expected two event-attempt receipts, observed ${dropReceipts}`);
   assert(visibleReceipts === 1, `expected one visible-drop receipt, observed ${visibleReceipts}`);
   assert(sentinelReceipts === 1, `expected one sentinel receipt, observed ${sentinelReceipts}`);
+  assert(
+    twinReceipts === 1,
+    `expected one rejected twin-attempt receipt, observed ${twinReceipts}`,
+  );
+  assert(
+    twinReceiptRecords[0]?.source === "message" &&
+      twinReceiptRecords[0]?.reason === "missing-mention",
+    "expected only the ordinary message twin to record a missing-mention rejection",
+  );
   assert(
     channelPolicyGateExecutions === 3,
     `expected three controlled channel-policy gate executions, observed ${channelPolicyGateExecutions}`,
   );
   assert(
-    replayedNonVisibleGateExecutions === 2,
-    `expected the released non-visible gate to execute twice, observed ${replayedNonVisibleGateExecutions}`,
+    repeatedNonVisibleGateExecutions === 2,
+    `expected the released non-visible gate to execute twice, observed ${repeatedNonVisibleGateExecutions}`,
   );
   assert(ephemeralCalls === 1, `expected one sender-visible denial, observed ${ephemeralCalls}`);
   assert(
-    authTestCalls === 7,
-    `expected auth.test for two starts and five authorized events, observed ${authTestCalls}`,
+    authTestCalls === 9,
+    `expected auth.test for two starts and seven authorized events, observed ${authTestCalls}`,
   );
   assert(
-    modelRequests.length === 0,
-    `expected zero model requests, observed ${modelRequests.length}`,
+    modelRequests.length === 1,
+    `expected one model request from the successful app_mention twin, observed ${modelRequests.length}`,
   );
   assert(sqliteFiles.length > 0, "Gateway proof did not create durable SQLite state");
   for (const forbidden of [
     DROP_BODY_MARKER,
     VISIBLE_BODY_MARKER,
     SENTINEL_BODY_MARKER,
+    TWIN_BODY_MARKER,
     botToken,
     signingSecret,
     gatewayToken,
@@ -646,12 +690,12 @@ try {
       transport: "Slack HTTP event route",
       durableSqliteObserved: true,
     },
-    replayedNonVisibleDrop: {
+    repeatedNonVisibleAttempts: {
       logicalKeyDigest: sha256(JSON.stringify(["default", TEAM_ID, DROP_CHANNEL_ID, DROP_TS])),
       gatewayDeliveries: 2,
-      preparationGateExecutions: replayedNonVisibleGateExecutions,
+      preparationGateExecutions: repeatedNonVisibleGateExecutions,
       operatorReceipts: dropReceipts,
-      agentModelRequests: modelRequests.length,
+      semantics: "at-least-once event-attempt facts",
     },
     senderVisibleSibling: {
       logicalKeyDigest: sha256(
@@ -664,6 +708,15 @@ try {
     orderingSentinel: {
       operatorReceipts: sentinelReceipts,
       confirmsReplayQueueDrainedBeforeVerdict: true,
+    },
+    rejectedThenDispatchedTwin: {
+      logicalKeyDigest: sha256(JSON.stringify(["default", TEAM_ID, TWIN_CHANNEL_ID, TWIN_TS])),
+      gatewayDeliveries: 2,
+      rejectedAttemptReceipts: twinReceipts,
+      rejectedAttemptSource: twinReceiptRecords[0]?.source,
+      rejectedAttemptReason: twinReceiptRecords[0]?.reason,
+      successfulTwinSource: "app_mention",
+      agentModelRequests: modelRequests.length,
     },
     mockSlackApi: {
       authTestCalls,
@@ -678,7 +731,7 @@ try {
     boundary: {
       authenticatedSlack: false,
       description:
-        "Secretless local mock Slack Web API and signed event callback requests; not a live Slack workspace test.",
+        "secretless mock Slack API + real built ephemeral Gateway; not authenticated live Slack",
     },
     gatewayLogSha256: sha256(gatewayLogs.map((record) => record.line).join("\n")),
   };
@@ -696,7 +749,8 @@ try {
       .replaceAll(providerApiKey, "[redacted-provider-key]")
       .replaceAll(DROP_BODY_MARKER, "[redacted-message-body]")
       .replaceAll(VISIBLE_BODY_MARKER, "[redacted-message-body]")
-      .replaceAll(SENTINEL_BODY_MARKER, "[redacted-message-body]"),
+      .replaceAll(SENTINEL_BODY_MARKER, "[redacted-message-body]")
+      .replaceAll(TWIN_BODY_MARKER, "[redacted-message-body]"),
   };
   throw error;
 } finally {
