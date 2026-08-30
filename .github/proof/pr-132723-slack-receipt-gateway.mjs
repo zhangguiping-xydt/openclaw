@@ -591,10 +591,14 @@ try {
   const dropReceipts = receiptCount(persistedGatewayLogs, DROP_TS);
   const visibleReceipts = receiptCount(persistedGatewayLogs, VISIBLE_TS);
   const sentinelReceipts = receiptCount(persistedGatewayLogs, SENTINEL_TS);
-  const dmDisabledGateExecutions = logCount(gatewayLogs, "slack: drop dm (dms disabled)");
+  const channelPolicyGateExecutions = logCount(
+    gatewayLogs,
+    "slack: drop message (channel not allowed)",
+  );
   const ephemeralCalls = slackRequests.filter(
     (request) => request.method === "chat.postEphemeral",
   ).length;
+  const replayedNonVisibleGateExecutions = channelPolicyGateExecutions - ephemeralCalls;
   const authTestCalls = slackRequests.filter((request) => request.method === "auth.test").length;
   const receiptText = JSON.stringify(receipts);
   const sqliteFiles = await findSqliteFiles(stateDir);
@@ -603,8 +607,12 @@ try {
   assert(visibleReceipts === 1, `expected one visible-drop receipt, observed ${visibleReceipts}`);
   assert(sentinelReceipts === 1, `expected one sentinel receipt, observed ${sentinelReceipts}`);
   assert(
-    dmDisabledGateExecutions === 2,
-    `expected the released non-visible gate to execute twice, observed ${dmDisabledGateExecutions}`,
+    channelPolicyGateExecutions === 3,
+    `expected three controlled channel-policy gate executions, observed ${channelPolicyGateExecutions}`,
+  );
+  assert(
+    replayedNonVisibleGateExecutions === 2,
+    `expected the released non-visible gate to execute twice, observed ${replayedNonVisibleGateExecutions}`,
   );
   assert(ephemeralCalls === 1, `expected one sender-visible denial, observed ${ephemeralCalls}`);
   assert(
@@ -641,7 +649,7 @@ try {
     replayedNonVisibleDrop: {
       logicalKeyDigest: sha256(JSON.stringify(["default", TEAM_ID, DROP_CHANNEL_ID, DROP_TS])),
       gatewayDeliveries: 2,
-      preparationGateExecutions: dmDisabledGateExecutions,
+      preparationGateExecutions: replayedNonVisibleGateExecutions,
       operatorReceipts: dropReceipts,
       agentModelRequests: modelRequests.length,
     },
