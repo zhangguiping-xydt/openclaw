@@ -50,6 +50,7 @@ jobs:
           git init source
           git -C source remote add origin https://github.com/zhangguiping-xydt/openclaw.git
           git -C source fetch --depth=8 origin verify/pr-132704-bd1c036
+          git -C source fetch --depth=1 origin "$BEFORE_SHA"
           git -C source checkout --detach "$EXPECTED_SHA"
           actual_sha="$(git -C source rev-parse HEAD)"
           echo "Validation SHA: $actual_sha"
