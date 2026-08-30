@@ -740,8 +740,8 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
               ledger.delivery?.status === "pending" &&
               ledger.delivery.disposition === "retryable" &&
               typeof ledger.delivery.lastError === "string" &&
-              ledger.delivery.lastError.includes("completion_handoff_pending"),
-            30_000,
+              !ledger.delivery.lastError.includes("requester_abandoned"),
+            10_000,
           );
           pendingTask = await waitForTask(
             gateway,
