@@ -1,0 +1,326 @@
+name: PR 132668 held-convergence proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact PR head to package and prove
+        required: true
+        default: fbe693e4da7b29c035be85c84a17b9f7a81b1d34
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Checkout exact source head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify immutable source identity
+        env:
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+          test "$actual_sha" = "fbe693e4da7b29c035be85c84a17b9f7a81b1d34"
+
+      - name: Setup Node 24
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.16.0
+
+      - name: Enable the repository package manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack install
+          pnpm --version
+
+      - name: Install and package the exact head
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          mkdir -p "$RUNNER_TEMP/package"
+          node scripts/package-openclaw-for-docker.mjs \
+            --allow-unreleased-changelog \
+            --output-dir "$RUNNER_TEMP/package" \
+            --output-name openclaw-current.tgz
+          mkdir -p "$RUNNER_TEMP/openclaw-prefix"
+          npm install --global --prefix "$RUNNER_TEMP/openclaw-prefix" \
+            "$RUNNER_TEMP/package/openclaw-current.tgz"
+          "$RUNNER_TEMP/openclaw-prefix/bin/openclaw" --version
+
+      - name: Interrupt held plugin convergence and start a replacement
+        id: proof
+        env:
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          proof_root="$RUNNER_TEMP/pr-132668-proof"
+          proof_home="$proof_root/home"
+          state_dir="$proof_root/state"
+          config_path="$state_dir/openclaw.json"
+          registry_port_file="$proof_root/registry-port"
+          registry_request_file="$proof_root/registry-request"
+          registry_log="$proof_root/registry.log"
+          gateway1_log="$proof_root/gateway1.log"
+          gateway2_log="$proof_root/gateway2.log"
+          trace="$proof_root/trace.txt"
+          lease_db="$state_dir/state/openclaw.sqlite"
+          gateway_port=19789
+          openclaw_bin="$RUNNER_TEMP/openclaw-prefix/bin/openclaw"
+          mkdir -p "$proof_home" "$state_dir"
+
+          cleanup() {
+            if test -n "${gateway1_pid:-}" && kill -0 "$gateway1_pid" 2>/dev/null; then
+              kill -KILL "$gateway1_pid" 2>/dev/null || true
+            fi
+            if test -n "${gateway2_pid:-}" && kill -0 "$gateway2_pid" 2>/dev/null; then
+              kill -TERM "$gateway2_pid" 2>/dev/null || true
+              sleep 1
+              kill -KILL "$gateway2_pid" 2>/dev/null || true
+            fi
+            if test -n "${registry_pid:-}" && kill -0 "$registry_pid" 2>/dev/null; then
+              kill -TERM "$registry_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          cat >"$config_path" <<'JSON'
+          {
+            "gateway": {
+              "mode": "local",
+              "bind": "loopback",
+              "auth": { "mode": "token", "token": "pr-132668-proof-only" }
+            },
+            "plugins": {
+              "entries": { "acpx": { "enabled": true } }
+            }
+          }
+          JSON
+
+          cat >"$proof_root/hold-registry.mjs" <<'NODE'
+          import fs from "node:fs";
+          import http from "node:http";
+
+          const [portFile, requestFile, logFile] = process.argv.slice(2);
+          const append = (line) => fs.appendFileSync(logFile, `${line}\n`);
+          const sockets = new Set();
+          const server = http.createServer((request, response) => {
+            append(`${request.method} ${request.url}`);
+            if (request.url?.toLowerCase().startsWith("/@openclaw%2facpx")) {
+              fs.writeFileSync(requestFile, "GET /@openclaw%2Facpx\n");
+              request.once("close", () => append("held request closed"));
+              response.once("close", () => append("held response closed"));
+              return;
+            }
+            response.writeHead(404, { "content-type": "application/json" });
+            response.end(JSON.stringify({ error: "not found" }));
+          });
+          server.on("connection", (socket) => {
+            sockets.add(socket);
+            socket.once("close", () => sockets.delete(socket));
+          });
+          server.listen(0, "127.0.0.1", () => {
+            const address = server.address();
+            if (!address || typeof address === "string") {
+              throw new Error("registry did not bind a TCP port");
+            }
+            fs.writeFileSync(portFile, `${address.port}\n`);
+          });
+          process.once("SIGTERM", () => {
+            for (const socket of sockets) socket.destroy();
+            server.close(() => process.exit(0));
+          });
+          NODE
+
+          node "$proof_root/hold-registry.mjs" \
+            "$registry_port_file" "$registry_request_file" "$registry_log" &
+          registry_pid=$!
+          for _ in $(seq 1 100); do
+            test -s "$registry_port_file" && break
+            sleep 0.1
+          done
+          test -s "$registry_port_file"
+          registry_port="$(tr -d '\r\n' <"$registry_port_file")"
+
+          lease_count() {
+            node --input-type=module - "$lease_db" <<'NODE'
+          import { DatabaseSync } from "node:sqlite";
+          const db = new DatabaseSync(process.argv[2], { readOnly: true });
+          const row = db.prepare(
+            "SELECT COUNT(*) AS count FROM state_leases WHERE scope = 'core:plugin-lifecycle' AND lease_key = 'global'",
+          ).get();
+          console.log(Number(row?.count ?? 0));
+          db.close();
+          NODE
+          }
+
+          collect_descendants() {
+            local root_pid="$1"
+            local known=" $root_pid "
+            local changed=1
+            while test "$changed" -eq 1; do
+              changed=0
+              while read -r child_pid parent_pid; do
+                if [[ "$known" == *" $parent_pid "* ]] && [[ "$known" != *" $child_pid "* ]]; then
+                  known+="$child_pid "
+                  changed=1
+                fi
+              done < <(ps -e -o pid=,ppid=)
+            done
+            for pid in $known; do
+              test "$pid" = "$root_pid" || printf '%s\n' "$pid"
+            done
+          }
+
+          registry_url="http://127.0.0.1:$registry_port/"
+          setsid env \
+            HOME="$proof_home" \
+            OPENCLAW_STATE_DIR="$state_dir" \
+            OPENCLAW_CONFIG_PATH="$config_path" \
+            NPM_CONFIG_REGISTRY="$registry_url" \
+            npm_config_registry="$registry_url" \
+            "$openclaw_bin" gateway run \
+              --port "$gateway_port" --bind loopback --verbose \
+              >"$gateway1_log" 2>&1 &
+          gateway1_pid=$!
+          gateway1_original_pid="$gateway1_pid"
+
+          for _ in $(seq 1 1200); do
+            if test -s "$registry_request_file" && test -f "$lease_db"; then
+              current_lease_count="$(lease_count 2>/dev/null || true)"
+              test "$current_lease_count" = "1" && break
+            fi
+            if ! kill -0 "$gateway1_pid" 2>/dev/null; then
+              echo "Gateway 1 exited before the held convergence boundary" >&2
+              sed -n '1,240p' "$gateway1_log" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          test -s "$registry_request_file"
+          test "$(lease_count)" = "1"
+
+          ready_before="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --max-time 2 "http://127.0.0.1:$gateway_port/readyz" || true)"
+          test "$ready_before" = "000"
+          collect_descendants "$gateway1_pid" >"$proof_root/gateway1-descendants"
+          pstree -ap "$gateway1_pid" >"$proof_root/gateway1-tree-before.txt" || true
+
+          kill -TERM "$gateway1_pid"
+          set +e
+          wait "$gateway1_pid"
+          gateway1_exit_code=$?
+          set -e
+          gateway1_pid=""
+          test "$gateway1_exit_code" -eq 143
+
+          for _ in $(seq 1 200); do
+            test "$(lease_count 2>/dev/null || true)" = "0" && break
+            sleep 0.1
+          done
+          lease_after_exit="$(lease_count)"
+          test "$lease_after_exit" = "0"
+
+          surviving_descendants=0
+          while read -r child_pid; do
+            if test -n "$child_pid" && kill -0 "$child_pid" 2>/dev/null; then
+              surviving_descendants=$((surviving_descendants + 1))
+            fi
+          done <"$proof_root/gateway1-descendants"
+          test "$surviving_descendants" -eq 0
+
+          setsid env \
+            HOME="$proof_home" \
+            OPENCLAW_STATE_DIR="$state_dir" \
+            OPENCLAW_CONFIG_PATH="$config_path" \
+            NPM_CONFIG_REGISTRY="https://registry.npmjs.org/" \
+            npm_config_registry="https://registry.npmjs.org/" \
+            "$openclaw_bin" gateway run \
+              --port "$gateway_port" --bind loopback --verbose \
+              >"$gateway2_log" 2>&1 &
+          gateway2_pid=$!
+          test "$gateway2_pid" -ne "$gateway1_original_pid"
+
+          gateway2_ready_http=000
+          for _ in $(seq 1 1200); do
+            gateway2_ready_http="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --max-time 2 "http://127.0.0.1:$gateway_port/readyz" || true)"
+            test "$gateway2_ready_http" = "200" && break
+            if ! kill -0 "$gateway2_pid" 2>/dev/null; then
+              echo "Gateway 2 exited before readiness" >&2
+              sed -n '1,300p' "$gateway2_log" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          test "$gateway2_ready_http" = "200"
+          lease_at_ready="$(lease_count)"
+          test "$lease_at_ready" = "0"
+
+          gateway2_original_pid="$gateway2_pid"
+          kill -TERM "$gateway2_pid"
+          set +e
+          wait "$gateway2_pid"
+          gateway2_exit_code=$?
+          set -e
+          gateway2_pid=""
+          test "$gateway2_exit_code" -eq 143
+          final_lease_count="$(lease_count)"
+          test "$final_lease_count" = "0"
+
+          shutdown_line="$(grep -E 'completed cleanly' "$gateway2_log" | tail -1 | sed -E 's/.*(completed cleanly[^[:cntrl:]]*).*/\1/' || true)"
+          test -n "$shutdown_line"
+          registry_request="$(tr -d '\r\n' <"$registry_request_file")"
+
+          {
+            echo "head=$EXPECTED_SHA"
+            echo "node=$(node --version)"
+            echo "gateway1_phase=plugin-convergence"
+            echo "registry_request=$registry_request"
+            echo "lease_count_before_signal=1"
+            echo "ready_http_before_signal=$ready_before"
+            echo "gateway1_signal=SIGTERM"
+            echo "gateway1_exit_code=$gateway1_exit_code"
+            echo "npm_process_tree_after_exit=none"
+            echo "lease_count_after_exit=$lease_after_exit"
+            echo "gateway2_pid_differs=true"
+            echo "gateway2_ready_http=$gateway2_ready_http"
+            echo "gateway2_ready=true"
+            echo "lease_count_at_ready=$lease_at_ready"
+            echo "gateway2_shutdown=\"$shutdown_line\""
+            echo "final_lease_count=$final_lease_count"
+          } | tee "$trace"
+
+          cp "$trace" "$GITHUB_WORKSPACE/pr-132668-held-convergence-trace.txt"
+          cp "$registry_log" "$GITHUB_WORKSPACE/pr-132668-registry.log"
+          cp "$gateway1_log" "$GITHUB_WORKSPACE/pr-132668-gateway1.log"
+          cp "$gateway2_log" "$GITHUB_WORKSPACE/pr-132668-gateway2.log"
+
+      - name: Upload redacted proof logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-132668-held-convergence-proof
+          path: |
+            pr-132668-held-convergence-trace.txt
+            pr-132668-registry.log
+            pr-132668-gateway1.log
+            pr-132668-gateway2.log
+          if-no-files-found: warn
+          retention-days: 14
