@@ -19,6 +19,7 @@ const CHILD_MODEL_REF = `${CHILD_PROVIDER_ID}/gpt-5.6-luna`;
 const CHILD_MODEL_ID = "gpt-5.6-luna";
 const PARENT_PROVIDER_TIMEOUT_SECONDS = 5;
 const CHILD_PROVIDER_TIMEOUT_SECONDS = 60;
+const HIGH_PROMPT_TOKENS = 96_000;
 const REQUESTER_PROMPT =
   "Subagent terminal reply QA check: visible. Spawn one native worker, then finish the parent turn without waiting. Do not use ACP.";
 const CHILD_MARKER = "QA-SUBAGENT-TERMINAL-VISIBLE-OK";
@@ -151,7 +152,11 @@ function rewriteParentSpawnResponse(body: Buffer): Buffer {
           }
         }
         if (completed) {
-          completed.usage = { input_tokens: 84_000, output_tokens: 16, total_tokens: 84_016 };
+          completed.usage = {
+            input_tokens: HIGH_PROMPT_TOKENS,
+            output_tokens: 16,
+            total_tokens: HIGH_PROMPT_TOKENS + 16,
+          };
         }
       }
       return `data: ${JSON.stringify(event)}`;
@@ -216,13 +221,19 @@ function copyResponse(response: Response, body: Buffer, target: ServerResponse):
   target.end(body);
 }
 
-function writeAssistantResponse(response: ServerResponse, text: string): void {
+function writeAssistantResponse(
+  response: ServerResponse,
+  text: string | undefined,
+  inputTokens = 100,
+): void {
+  const content = text ? [{ type: "output_text", text, annotations: [] }] : [];
+  const outputTokens = text ? 5 : 0;
   const message = {
     type: "message",
     id: `msg_${randomUUID()}`,
     role: "assistant",
     status: "completed",
-    content: [{ type: "output_text", text, annotations: [] }],
+    content,
   };
   const events = [
     {
@@ -237,7 +248,11 @@ function writeAssistantResponse(response: ServerResponse, text: string): void {
         id: `resp_${randomUUID()}`,
         status: "completed",
         output: [message],
-        usage: { input_tokens: 100, output_tokens: 5, total_tokens: 105 },
+        usage: {
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          total_tokens: inputTokens + outputTokens,
+        },
       },
     },
   ];
@@ -277,10 +292,11 @@ async function startRecoveryProviderProxy(params: {
       const isRequesterRequest =
         isModelRequest && !isChild && !isCompaction && allText.includes(REQUESTER_PROMPT);
       const requesterRequestIndex = isRequesterRequest ? requesterRequestCount++ : -1;
-      const isParentInitial = requesterRequestIndex === 0;
-      // One quiet provider request is retried before timeout recovery begins.
-      // Hold every pre-recovery continuation so the retry cannot settle the parent.
-      const isParentToolContinuation = requesterRequestIndex >= 1 && !recoverySucceeded;
+      const isParentHighUsageRetrySeed = requesterRequestIndex === 0;
+      const isParentInitialSpawn = requesterRequestIndex === 1;
+      // The terminal high-usage empty turn is a separate runner attempt. Its usage
+      // survives the visible-answer retry and remains available when this attempt stalls.
+      const isParentToolContinuation = requesterRequestIndex >= 2 && !recoverySucceeded;
       const fetchUpstream = async () => {
         const upstream = await fetch(`${params.upstreamBaseUrl}${request.url ?? "/"}`, {
           method: request.method,
@@ -292,7 +308,12 @@ async function startRecoveryProviderProxy(params: {
         return { upstream, body: Buffer.from(await upstream.arrayBuffer()) };
       };
 
-      if (isParentInitial) {
+      if (isParentHighUsageRetrySeed) {
+        record("parent_high_usage_empty_response");
+        writeAssistantResponse(response, undefined, HIGH_PROMPT_TOKENS);
+        return;
+      }
+      if (isParentInitialSpawn) {
         record("parent_initial_spawn_response");
         const upstream = await fetchUpstream();
         const upstreamBody = rewriteParentSpawnResponse(upstream.body);
@@ -301,9 +322,23 @@ async function startRecoveryProviderProxy(params: {
       }
       if (isParentToolContinuation) {
         // The upstream QA fixture records the parent as settled here, which releases
-        // its worker gate. Keep that completed provider response away from the Gateway.
+        // its worker gate. Return only stream-activity events to the Gateway, then stay
+        // silent so OpenClaw's stream idle watchdog owns the timeout classification.
         await fetchUpstream();
         record("parent_tool_continuation_held_for_timeout");
+        const responseId = `resp_${randomUUID()}`;
+        response.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-store",
+        });
+        response.write(
+          [
+            { type: "response.created", response: { id: responseId, status: "in_progress" } },
+            { type: "response.in_progress", response: { id: responseId, status: "in_progress" } },
+          ]
+            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+            .join(""),
+        );
         await new Promise<void>((resolve) => {
           request.once("aborted", resolve);
           response.once("close", resolve);
@@ -558,6 +593,9 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
         });
 
         await proxy.waitForCompaction();
+        expect(proxy.events.map((event) => event.phase)).toContain(
+          "parent_high_usage_empty_response",
+        );
         proxy.releaseChild();
         const pendingTask = await waitForTask(
           gateway,
@@ -639,6 +677,7 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
           assertions: {
             realGateway: true,
             realQaChannelIngressAndEgress: true,
+            highUsageRetrySeedObserved: true,
             timeoutCompactionObserved: true,
             completionPendingDuringRecovery: true,
             noDispatchBeforeSuccessor: true,
@@ -716,6 +755,9 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
         expect(typeof started.runId).toBe("string");
 
         await proxy.waitForCompaction();
+        expect(proxy.events.map((event) => event.phase)).toContain(
+          "parent_high_usage_empty_response",
+        );
         proxy.releaseCompaction();
         await proxy.waitForCompactionSettled();
         const parentTerminal = (await gateway.call(
@@ -761,6 +803,7 @@ describe.runIf(process.env.OPENCLAW_PR132704_GATEWAY_PROOF === "1")(
           assertions: {
             realGateway: true,
             qaChannelDeliveryRouteConfigured: true,
+            highUsageRetrySeedObserved: true,
             timeoutCompactionObserved: true,
             recoveryFailureObservedBeforeChildRelease: true,
             parentTerminalObservedBeforeChildRelease: true,
