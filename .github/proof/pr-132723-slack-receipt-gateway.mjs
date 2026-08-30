@@ -59,6 +59,56 @@ function writeJson(response, value, status = 200) {
   response.end(`${JSON.stringify(value)}\n`);
 }
 
+function writeModelResponse(response) {
+  const text = "proof response";
+  const message = {
+    type: "message",
+    id: "msg_pr132723",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }],
+  };
+  const events = [
+    {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { ...message, status: "in_progress", content: [] },
+    },
+    {
+      type: "response.output_text.delta",
+      item_id: message.id,
+      output_index: 0,
+      content_index: 0,
+      delta: text,
+    },
+    {
+      type: "response.output_text.done",
+      item_id: message.id,
+      output_index: 0,
+      content_index: 0,
+      text,
+    },
+    { type: "response.output_item.done", output_index: 0, item: message },
+    {
+      type: "response.completed",
+      response: {
+        id: "resp_pr132723",
+        status: "completed",
+        output: [message],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      },
+    },
+  ];
+  response.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-store",
+    connection: "keep-alive",
+  });
+  response.end(
+    `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
+  );
+}
+
 async function listen(server) {
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -290,13 +340,7 @@ const mockServer = createServer((request, response) => {
     const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
     if (pathname.startsWith("/v1/")) {
       modelRequests.push({ method: request.method ?? "", pathname });
-      writeJson(response, {
-        id: "resp_fixture",
-        object: "response",
-        status: "completed",
-        output: [],
-        usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
-      });
+      writeModelResponse(response);
       return;
     }
     if (!pathname.startsWith("/api/")) {
@@ -360,6 +404,14 @@ const mockServer = createServer((request, response) => {
         ok: true,
         channel: form.get("channel") ?? VISIBLE_CHANNEL_ID,
         message_ts: "1710000000.900001",
+      });
+      return;
+    }
+    if (method === "chat.postMessage") {
+      writeJson(response, {
+        ok: true,
+        channel: form.get("channel") ?? TWIN_CHANNEL_ID,
+        ts: "1710000000.900002",
       });
       return;
     }
@@ -611,6 +663,10 @@ try {
   });
   await waitFor(() => modelRequests.length === 1, "app_mention twin model dispatch");
   await waitFor(
+    () => slackRequests.filter((request) => request.method === "chat.postMessage").length === 1,
+    "app_mention twin Slack reply",
+  );
+  await waitFor(
     async () => receiptCount(await readJsonLogRecords(gatewayLogPath), SENTINEL_TS) === 1,
     "post-replay sentinel receipt",
   );
@@ -631,6 +687,9 @@ try {
   );
   const ephemeralCalls = slackRequests.filter(
     (request) => request.method === "chat.postEphemeral",
+  ).length;
+  const messageCalls = slackRequests.filter(
+    (request) => request.method === "chat.postMessage",
   ).length;
   const repeatedNonVisibleGateExecutions = channelPolicyGateExecutions - ephemeralCalls;
   const authTestCalls = slackRequests.filter((request) => request.method === "auth.test").length;
@@ -658,6 +717,7 @@ try {
     `expected the released non-visible gate to execute twice, observed ${repeatedNonVisibleGateExecutions}`,
   );
   assert(ephemeralCalls === 1, `expected one sender-visible denial, observed ${ephemeralCalls}`);
+  assert(messageCalls === 1, `expected one successful twin reply, observed ${messageCalls}`);
   assert(
     authTestCalls === 9,
     `expected auth.test for two starts and seven authorized events, observed ${authTestCalls}`,
@@ -717,10 +777,12 @@ try {
       rejectedAttemptReason: twinReceiptRecords[0]?.reason,
       successfulTwinSource: "app_mention",
       agentModelRequests: modelRequests.length,
+      slackReplies: messageCalls,
     },
     mockSlackApi: {
       authTestCalls,
       chatPostEphemeralCalls: ephemeralCalls,
+      chatPostMessageCalls: messageCalls,
       totalCalls: slackRequests.length,
     },
     privacy: {
