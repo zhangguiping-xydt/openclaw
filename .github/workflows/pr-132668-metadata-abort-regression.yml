@@ -55,6 +55,7 @@ jobs:
             src/plugins/install.npm-spec.test.ts \
             src/commands/doctor/shared/missing-configured-plugin-install.test.ts \
             src/cli/gateway-cli/startup-signal.test.ts \
+            src/cli/update-cli/post-core-plugin-convergence.abort.test.ts \
             src/cli/update-cli/post-core-plugin-convergence.test.ts
 
       - name: Run changed checks
