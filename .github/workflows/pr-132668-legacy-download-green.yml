@@ -14,13 +14,13 @@ jobs:
       - name: Checkout immutable repaired head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 8630910ebbb36edb903654e94baa4e65b35ee31f
+          ref: 4d8d0286feaf44259324abba4c815b69c9e86a2e
           fetch-depth: 1
           persist-credentials: false
 
       - name: Verify source identity
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "8630910ebbb36edb903654e94baa4e65b35ee31f"
+        run: test "$(git rev-parse HEAD)" = "4d8d0286feaf44259324abba4c815b69c9e86a2e"
 
       - name: Setup Node 24
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
