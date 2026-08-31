@@ -14,13 +14,13 @@ jobs:
       - name: Checkout immutable repaired head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: f57cc73c128f1eeaa772ccff53568a278d6952b5
+          ref: 49c5c21e4637a6e37144158c4be335efc97d0607
           fetch-depth: 1
           persist-credentials: false
 
       - name: Verify source identity
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "f57cc73c128f1eeaa772ccff53568a278d6952b5"
+        run: test "$(git rev-parse HEAD)" = "49c5c21e4637a6e37144158c4be335efc97d0607"
 
       - name: Fetch the changed-gate baseline
         shell: bash
@@ -52,7 +52,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/pr-132668-green.log"
           grep -F "stops suspicious config recovery when Gateway startup is interrupted" \
             "$RUNNER_TEMP/pr-132668-green.log"
-          grep -F "passes the Gateway startup signal to full-CLI pre-bootstrap" \
+          grep -F "passes CLI options and the startup signal to Gateway pre-bootstrap" \
             "$RUNNER_TEMP/pr-132668-green.log"
 
       - name: Verify the changed owner boundary
