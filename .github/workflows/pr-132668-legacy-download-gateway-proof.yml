@@ -103,6 +103,17 @@ jobs:
             if test -n "${clawhub_pid:-}"; then
               sudo -n kill -TERM "$clawhub_pid" 2>/dev/null || true
             fi
+            for proof_log in \
+              "$trace:pr-132668-legacy-download-trace.txt" \
+              "$clawhub_log:pr-132668-clawhub.log" \
+              "$gateway1_log:pr-132668-gateway1.log" \
+              "$gateway2_log:pr-132668-gateway2.log"; do
+              source_path="${proof_log%%:*}"
+              destination_name="${proof_log#*:}"
+              if test -f "$source_path"; then
+                cp "$source_path" "$GITHUB_WORKSPACE/$destination_name"
+              fi
+            done
           }
           trap cleanup EXIT
 
@@ -181,7 +192,7 @@ jobs:
             response.end(body);
           };
           const sockets = new Set();
-          let heldRequestObserved = false;
+          let legacyDownloadCount = 0;
 
           const server = https.createServer(
             { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) },
@@ -239,8 +250,8 @@ jobs:
                 return;
               }
               if (path === `/api/v1/packages/${packageName}/download`) {
-                if (!heldRequestObserved) {
-                  heldRequestObserved = true;
+                legacyDownloadCount += 1;
+                if (legacyDownloadCount === 2) {
                   fs.writeFileSync(requestFile, `GET ${path}\n`);
                   const markClosed = () => {
                     if (!fs.existsSync(closedFile)) {
@@ -258,7 +269,11 @@ jobs:
                   "content-length": String(archive.length),
                 });
                 response.end(archive);
-                append("replacement legacy download served");
+                append(
+                  legacyDownloadCount === 1
+                    ? "consent priming legacy download served"
+                    : "replacement legacy download served",
+                );
                 return;
               }
               response.writeHead(404, { "content-type": "application/json" });
@@ -332,6 +347,18 @@ jobs:
             NO_PROXY="clawhub.ai,127.0.0.1,localhost"
             no_proxy="clawhub.ai,127.0.0.1,localhost"
           )
+
+          # Seed an accepted install record, then make only its payload absent. This models a
+          # repairable external-plugin install without asking an unattended Gateway to invent
+          # operator capability consent; both Gateway processes still exercise the repair path.
+          env "${gateway_env[@]}" "$openclaw_bin" plugins install \
+            clawhub:@openclaw/matrix@2026.8.1 --accept-capabilities
+          grep -F "consent priming legacy download served" "$clawhub_log"
+          primed_plugin_dir="$state_dir/extensions/matrix"
+          test -d "$primed_plugin_dir"
+          mv "$primed_plugin_dir" "$proof_root/primed-matrix-artifact"
+          test ! -e "$primed_plugin_dir"
+
           setsid env "${gateway_env[@]}" "$openclaw_bin" gateway run \
             --port "$gateway_port" --bind loopback --verbose \
             >"$gateway1_log" 2>&1 &
