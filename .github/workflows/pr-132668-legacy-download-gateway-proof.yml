@@ -434,7 +434,7 @@ jobs:
           gateway2_exit_code=$?
           set -e
           gateway2_pid=""
-          test "$gateway2_exit_code" -eq 143
+          test "$gateway2_exit_code" -eq 0
           final_lease_count="$(lease_count)"
           test "$final_lease_count" = "0"
 
@@ -464,6 +464,7 @@ jobs:
             echo "gateway2_ready_http=$gateway2_ready_http"
             echo "gateway2_ready=true"
             echo "lease_count_at_ready=$lease_at_ready"
+            echo "gateway2_exit_code=$gateway2_exit_code"
             echo "gateway2_shutdown=\"$shutdown_line\""
             echo "final_lease_count=$final_lease_count"
           } | tee "$trace"
