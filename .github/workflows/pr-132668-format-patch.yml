@@ -1,4 +1,4 @@
-name: PR 132668 formatting patch
+name: PR 132668 lint-budget proof
 
 on:
   workflow_dispatch:
@@ -14,13 +14,13 @@ jobs:
       - name: Checkout immutable repaired head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 8c45dbb14584a25d90abac26f051a6f410ab8f67
+          ref: 49c5c21e4637a6e37144158c4be335efc97d0607
           fetch-depth: 1
           persist-credentials: false
 
       - name: Verify source identity
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "8c45dbb14584a25d90abac26f051a6f410ab8f67"
+        run: test "$(git rev-parse HEAD)" = "49c5c21e4637a6e37144158c4be335efc97d0607"
 
       - name: Setup Node 24
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -35,29 +35,13 @@ jobs:
           corepack install
           pnpm install --frozen-lockfile
 
-      - name: Generate the formatter-owned patch
+      - name: Verify formatter and lint budgets
         shell: bash
         run: |
           set -euo pipefail
-          pnpm exec oxfmt \
+          pnpm exec oxfmt --check \
             src/cli/gateway-cli/pre-bootstrap.ts \
-            src/cli/program/preaction.test.ts \
-            src/cli/program/preaction.ts \
-            src/cli/run-main.exit.test.ts \
-            src/cli/run-main.ts
-          git diff --binary -- \
+            src/cli/program/preaction.test.ts
+          pnpm exec oxlint \
             src/cli/gateway-cli/pre-bootstrap.ts \
-            src/cli/program/preaction.test.ts \
-            src/cli/program/preaction.ts \
-            src/cli/run-main.exit.test.ts \
-            src/cli/run-main.ts \
-            >"$RUNNER_TEMP/pr-132668-format.patch"
-          test -s "$RUNNER_TEMP/pr-132668-format.patch"
-
-      - name: Upload formatting patch
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
-        with:
-          name: pr-132668-format-patch
-          path: ${{ runner.temp }}/pr-132668-format.patch
-          if-no-files-found: error
-          retention-days: 2
+            src/cli/program/preaction.test.ts
