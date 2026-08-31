@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      EXPECTED_HEAD: 16959b63810601f720bb0f43ec83defacecdbc83
+      EXPECTED_HEAD: 95aea02f2636515e04b6105e1b0631cd4bd5ac05
       PR_BRANCH: ocpr/auto-issue-20260826-2
       PROVIDER_PORT: "19653"
 
@@ -712,7 +712,7 @@ jobs:
             PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=false \
             pnpm_config_verify_deps_before_run=false \
             OPENAI_API_KEY="$dummy_key" \
-            OPENAI_BASE_URL="$provider_url" \
+            OPENCLAW_LIVE_CODEX_HARNESS_APP_SERVER_BASE_URL="$provider_url" \
             OPENCLAW_CODEX_APP_SERVER_BIN="$codex_bin" \
             OPENCLAW_CODEX_APP_SERVER_ARGS="$app_server_args" \
             OPENCLAW_LIVE_CODEX_HARNESS_AUTH=api-key \
