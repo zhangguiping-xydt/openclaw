@@ -251,7 +251,7 @@ jobs:
               }
               if (path === `/api/v1/packages/${packageName}/download`) {
                 legacyDownloadCount += 1;
-                if (legacyDownloadCount === 2) {
+                if (legacyDownloadCount === 1) {
                   fs.writeFileSync(requestFile, `GET ${path}\n`);
                   const markClosed = () => {
                     if (!fs.existsSync(closedFile)) {
@@ -269,11 +269,7 @@ jobs:
                   "content-length": String(archive.length),
                 });
                 response.end(archive);
-                append(
-                  legacyDownloadCount === 1
-                    ? "consent priming legacy download served"
-                    : "replacement legacy download served",
-                );
+                append("replacement legacy download served");
                 return;
               }
               response.writeHead(404, { "content-type": "application/json" });
@@ -348,17 +344,6 @@ jobs:
             no_proxy="clawhub.ai,127.0.0.1,localhost"
           )
 
-          # Seed an accepted install record, then make only its payload absent. This models a
-          # repairable external-plugin install without asking an unattended Gateway to invent
-          # operator capability consent; both Gateway processes still exercise the repair path.
-          env "${gateway_env[@]}" "$openclaw_bin" plugins install \
-            clawhub:@openclaw/matrix@2026.8.1 --accept-capabilities
-          grep -F "consent priming legacy download served" "$clawhub_log"
-          primed_plugin_dir="$state_dir/extensions/matrix"
-          test -d "$primed_plugin_dir"
-          mv "$primed_plugin_dir" "$proof_root/primed-matrix-artifact"
-          test ! -e "$primed_plugin_dir"
-
           setsid env "${gateway_env[@]}" "$openclaw_bin" gateway run \
             --port "$gateway_port" --bind loopback --verbose \
             >"$gateway1_log" 2>&1 &
@@ -410,6 +395,16 @@ jobs:
           done <"$proof_root/gateway1-descendants"
           test "$surviving_descendants" -eq 0
 
+          repair_started_ns="$(date +%s%N)"
+          env "${gateway_env[@]}" "$openclaw_bin" plugins install \
+            clawhub:@openclaw/matrix@2026.8.1 --accept-capabilities
+          repair_finished_ns="$(date +%s%N)"
+          repair_install_ms=$(((repair_finished_ns - repair_started_ns) / 1000000))
+          grep -F "replacement legacy download served" "$clawhub_log"
+          test -d "$state_dir/extensions/matrix"
+          lease_after_repair="$(lease_count)"
+          test "$lease_after_repair" = "0"
+
           setsid env "${gateway_env[@]}" "$openclaw_bin" gateway run \
             --port "$gateway_port" --bind loopback --verbose \
             >"$gateway2_log" 2>&1 &
@@ -429,7 +424,7 @@ jobs:
             sleep 0.25
           done
           test "$gateway2_ready_http" = "200"
-          grep -F "replacement legacy download served" "$clawhub_log"
+          test "$(grep -cF "replacement legacy download served" "$clawhub_log")" = "1"
           lease_at_ready="$(lease_count)"
           test "$lease_at_ready" = "0"
 
@@ -460,8 +455,12 @@ jobs:
             echo "gateway1_exit_code=$gateway1_exit_code"
             echo "gateway1_descendants_after_exit=none"
             echo "lease_count_after_exit=$lease_after_exit"
+            echo "replacement_install=clawhub:@openclaw/matrix@2026.8.1"
+            echo "replacement_install_accept_capabilities=true"
+            echo "replacement_install_ms=$repair_install_ms"
+            echo "replacement_legacy_download=served"
+            echo "lease_count_after_repair=$lease_after_repair"
             echo "gateway2_pid_differs=true"
-            echo "gateway2_legacy_download=served"
             echo "gateway2_ready_http=$gateway2_ready_http"
             echo "gateway2_ready=true"
             echo "lease_count_at_ready=$lease_at_ready"
