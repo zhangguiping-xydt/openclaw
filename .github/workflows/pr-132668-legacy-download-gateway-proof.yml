@@ -6,7 +6,7 @@ on:
       source_sha:
         description: Exact PR head to package and prove
         required: true
-        default: f57cc73c128f1eeaa772ccff53568a278d6952b5
+        default: 49c5c21e4637a6e37144158c4be335efc97d0607
         type: string
 
 permissions:
@@ -32,7 +32,7 @@ jobs:
           set -euo pipefail
           actual_sha="$(git rev-parse HEAD)"
           test "$actual_sha" = "$EXPECTED_SHA"
-          test "$actual_sha" = "f57cc73c128f1eeaa772ccff53568a278d6952b5"
+          test "$actual_sha" = "49c5c21e4637a6e37144158c4be335efc97d0607"
 
       - name: Setup Node 24
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
