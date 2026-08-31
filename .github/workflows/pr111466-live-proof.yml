@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      EXPECTED_HEAD: d222208dcbcefb43aac7efc2f5d087e1bf3bbd1d
+      EXPECTED_HEAD: 235565fe2f10c0a91b4c2c82810771d39fe01f92
       PR_BRANCH: ocpr/auto-issue-20260826-2
       PROVIDER_PORT: "19653"
 
