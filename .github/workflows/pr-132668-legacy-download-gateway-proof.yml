@@ -1,0 +1,461 @@
+name: PR 132668 legacy-download Gateway proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact PR head to package and prove
+        required: true
+        default: 8630910ebbb36edb903654e94baa4e65b35ee31f
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Checkout exact source head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify immutable source identity
+        env:
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+          test "$actual_sha" = "8630910ebbb36edb903654e94baa4e65b35ee31f"
+
+      - name: Setup Node 24
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.16.0
+
+      - name: Enable the repository package manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack install
+          pnpm --version
+
+      - name: Install and package the exact head
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          mkdir -p "$RUNNER_TEMP/package"
+          node scripts/package-openclaw-for-docker.mjs \
+            --allow-unreleased-changelog \
+            --output-dir "$RUNNER_TEMP/package" \
+            --output-name openclaw-current.tgz
+          mkdir -p "$RUNNER_TEMP/openclaw-prefix"
+          npm install --global --prefix "$RUNNER_TEMP/openclaw-prefix" \
+            "$RUNNER_TEMP/package/openclaw-current.tgz"
+          "$RUNNER_TEMP/openclaw-prefix/bin/openclaw" --version
+
+      - name: Interrupt a held legacy ClawHub download and start a replacement Gateway
+        env:
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          proof_root="$RUNNER_TEMP/pr-132668-proof"
+          proof_home="$proof_root/home"
+          state_dir="$proof_root/state"
+          config_path="$state_dir/openclaw.json"
+          fixture_dir="$proof_root/matrix-fixture"
+          fixture_archive="$proof_root/matrix.zip"
+          cert_path="$proof_root/clawhub.crt"
+          key_path="$proof_root/clawhub.key"
+          mock_ready_file="$proof_root/clawhub-ready"
+          mock_pid_file="$proof_root/clawhub-pid"
+          held_request_file="$proof_root/legacy-download-request"
+          held_closed_file="$proof_root/legacy-download-closed"
+          clawhub_log="$proof_root/clawhub.log"
+          gateway1_log="$proof_root/gateway1.log"
+          gateway2_log="$proof_root/gateway2.log"
+          trace="$proof_root/trace.txt"
+          lease_db="$state_dir/state/openclaw.sqlite"
+          gateway_port=19789
+          openclaw_bin="$RUNNER_TEMP/openclaw-prefix/bin/openclaw"
+          node_bin="$(command -v node)"
+          mkdir -p "$proof_home" "$state_dir" "$fixture_dir"
+
+          cleanup() {
+            if test -n "${gateway1_pid:-}" && kill -0 "$gateway1_pid" 2>/dev/null; then
+              kill -KILL "$gateway1_pid" 2>/dev/null || true
+            fi
+            if test -n "${gateway2_pid:-}" && kill -0 "$gateway2_pid" 2>/dev/null; then
+              kill -TERM "$gateway2_pid" 2>/dev/null || true
+              sleep 1
+              kill -KILL "$gateway2_pid" 2>/dev/null || true
+            fi
+            if test -n "${clawhub_pid:-}"; then
+              sudo -n kill -TERM "$clawhub_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          cat >"$config_path" <<'JSON'
+          {
+            "gateway": {
+              "mode": "local",
+              "bind": "loopback",
+              "auth": { "mode": "token", "token": "pr-132668-proof-only" }
+            },
+            "plugins": {
+              "allow": ["matrix"],
+              "entries": { "matrix": { "enabled": true } }
+            }
+          }
+          JSON
+
+          cat >"$fixture_dir/openclaw.plugin.json" <<'JSON'
+          {
+            "id": "matrix",
+            "name": "Matrix proof fixture",
+            "description": "Minimal local fixture for legacy ClawHub cancellation proof.",
+            "configSchema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {}
+            }
+          }
+          JSON
+          cat >"$fixture_dir/package.json" <<'JSON'
+          {
+            "name": "@openclaw/matrix",
+            "version": "2026.8.1",
+            "type": "module",
+            "openclaw": { "extensions": ["./index.js"] }
+          }
+          JSON
+          cat >"$fixture_dir/index.js" <<'JS'
+          export default function register() {}
+          JS
+          zip -q -j "$fixture_archive" \
+            "$fixture_dir/openclaw.plugin.json" \
+            "$fixture_dir/package.json" \
+            "$fixture_dir/index.js"
+          fixture_sha="$(sha256sum "$fixture_archive" | awk '{print $1}')"
+
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$key_path" -out "$cert_path" \
+            -subj "/CN=clawhub.ai" -addext "subjectAltName=DNS:clawhub.ai" \
+            >/dev/null 2>&1
+
+          cat >"$proof_root/hold-clawhub.mjs" <<'NODE'
+          import fs from "node:fs";
+          import https from "node:https";
+
+          const [
+            certPath,
+            keyPath,
+            archivePath,
+            archiveSha,
+            readyFile,
+            pidFile,
+            requestFile,
+            closedFile,
+            logFile,
+          ] = process.argv.slice(2);
+          const packageName = "@openclaw/matrix";
+          const version = "2026.8.1";
+          const append = (line) => fs.appendFileSync(logFile, `${line}\n`);
+          const sendJson = (response, value) => {
+            const body = Buffer.from(JSON.stringify(value));
+            response.writeHead(200, {
+              "content-type": "application/json",
+              "content-length": String(body.length),
+            });
+            response.end(body);
+          };
+          const sockets = new Set();
+          let heldRequestObserved = false;
+
+          const server = https.createServer(
+            { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) },
+            (request, response) => {
+              const rawPath = new URL(request.url ?? "/", "https://clawhub.ai").pathname;
+              const path = decodeURIComponent(rawPath);
+              append(`${request.method} ${path}`);
+              if (path === `/api/v1/packages/${packageName}`) {
+                sendJson(response, {
+                  package: {
+                    name: packageName,
+                    displayName: "Matrix proof fixture",
+                    family: "code-plugin",
+                    runtimeId: "matrix",
+                    channel: "official",
+                    isOfficial: true,
+                    createdAt: 0,
+                    updatedAt: 0,
+                    latestVersion: version,
+                    tags: { latest: version },
+                    compatibility: {
+                      pluginApiRange: ">=2026.4.10",
+                      minGatewayVersion: "2026.4.10",
+                    },
+                    capabilities: { runtimeId: "matrix" },
+                  },
+                });
+                return;
+              }
+              if (path === `/api/v1/packages/${packageName}/versions/${version}/artifact`) {
+                sendJson(response, {
+                  package: {
+                    name: packageName,
+                    displayName: "Matrix proof fixture",
+                    family: "code-plugin",
+                  },
+                  version: {
+                    version,
+                    createdAt: 0,
+                    changelog: "",
+                    sha256hash: archiveSha,
+                    compatibility: {
+                      pluginApiRange: ">=2026.4.10",
+                      minGatewayVersion: "2026.4.10",
+                    },
+                  },
+                  artifact: {
+                    source: "clawhub",
+                    artifactKind: "legacy-zip",
+                    packageName,
+                    version,
+                    artifactSha256: archiveSha,
+                  },
+                });
+                return;
+              }
+              if (path === `/api/v1/packages/${packageName}/download`) {
+                if (!heldRequestObserved) {
+                  heldRequestObserved = true;
+                  fs.writeFileSync(requestFile, `GET ${path}\n`);
+                  const markClosed = () => {
+                    if (!fs.existsSync(closedFile)) {
+                      fs.writeFileSync(closedFile, "caller disconnected\n");
+                      append("held legacy download closed");
+                    }
+                  };
+                  request.once("aborted", markClosed);
+                  response.once("close", markClosed);
+                  return;
+                }
+                const archive = fs.readFileSync(archivePath);
+                response.writeHead(200, {
+                  "content-type": "application/zip",
+                  "content-length": String(archive.length),
+                });
+                response.end(archive);
+                append("replacement legacy download served");
+                return;
+              }
+              response.writeHead(404, { "content-type": "application/json" });
+              response.end(JSON.stringify({ error: "not found" }));
+            },
+          );
+          server.on("connection", (socket) => {
+            sockets.add(socket);
+            socket.once("close", () => sockets.delete(socket));
+          });
+          server.listen(443, "127.0.0.1", () => {
+            fs.writeFileSync(pidFile, `${process.pid}\n`);
+            fs.writeFileSync(readyFile, "ready\n");
+            append("mock ClawHub ready on 127.0.0.1:443");
+          });
+          process.once("SIGTERM", () => {
+            for (const socket of sockets) socket.destroy();
+            server.close(() => process.exit(0));
+          });
+          NODE
+
+          echo "127.0.0.1 clawhub.ai # pr-132668-proof" | sudo tee -a /etc/hosts >/dev/null
+          sudo -n "$node_bin" "$proof_root/hold-clawhub.mjs" \
+            "$cert_path" "$key_path" "$fixture_archive" "$fixture_sha" \
+            "$mock_ready_file" "$mock_pid_file" "$held_request_file" \
+            "$held_closed_file" "$clawhub_log" &
+          clawhub_launcher_pid=$!
+          for _ in $(seq 1 100); do
+            test -s "$mock_ready_file" && test -s "$mock_pid_file" && break
+            sleep 0.1
+          done
+          test -s "$mock_ready_file"
+          clawhub_pid="$(tr -d '\r\n' <"$mock_pid_file")"
+
+          lease_count() {
+            node --input-type=module - "$lease_db" <<'NODE'
+          import { DatabaseSync } from "node:sqlite";
+          const db = new DatabaseSync(process.argv[2], { readOnly: true });
+          const row = db.prepare(
+            "SELECT COUNT(*) AS count FROM state_leases WHERE scope = 'core:plugin-lifecycle' AND lease_key = 'global'",
+          ).get();
+          console.log(Number(row?.count ?? 0));
+          db.close();
+          NODE
+          }
+
+          collect_descendants() {
+            local root_pid="$1"
+            local known=" $root_pid "
+            local changed=1
+            while test "$changed" -eq 1; do
+              changed=0
+              while read -r child_pid parent_pid; do
+                if [[ "$known" == *" $parent_pid "* ]] && [[ "$known" != *" $child_pid "* ]]; then
+                  known+="$child_pid "
+                  changed=1
+                fi
+              done < <(ps -e -o pid=,ppid=)
+            done
+            for pid in $known; do
+              test "$pid" = "$root_pid" || printf '%s\n' "$pid"
+            done
+          }
+
+          gateway_env=(
+            HOME="$proof_home"
+            OPENCLAW_STATE_DIR="$state_dir"
+            OPENCLAW_CONFIG_PATH="$config_path"
+            NODE_EXTRA_CA_CERTS="$cert_path"
+            NODE_OPTIONS="--dns-result-order=ipv4first"
+            NO_PROXY="clawhub.ai,127.0.0.1,localhost"
+            no_proxy="clawhub.ai,127.0.0.1,localhost"
+          )
+          setsid env "${gateway_env[@]}" "$openclaw_bin" gateway run \
+            --port "$gateway_port" --bind loopback --verbose \
+            >"$gateway1_log" 2>&1 &
+          gateway1_pid=$!
+          gateway1_original_pid="$gateway1_pid"
+
+          for _ in $(seq 1 1200); do
+            if test -s "$held_request_file" && test -f "$lease_db"; then
+              current_lease_count="$(lease_count 2>/dev/null || true)"
+              test "$current_lease_count" = "1" && break
+            fi
+            if ! kill -0 "$gateway1_pid" 2>/dev/null; then
+              echo "Gateway 1 exited before the held legacy download boundary" >&2
+              sed -n '1,300p' "$gateway1_log" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          test -s "$held_request_file"
+          test "$(lease_count)" = "1"
+
+          ready_before="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --max-time 2 "http://127.0.0.1:$gateway_port/readyz" || true)"
+          test "$ready_before" = "000"
+          collect_descendants "$gateway1_pid" >"$proof_root/gateway1-descendants"
+          pstree -ap "$gateway1_pid" >"$proof_root/gateway1-tree-before.txt" || true
+
+          kill -TERM "$gateway1_pid"
+          set +e
+          wait "$gateway1_pid"
+          gateway1_exit_code=$?
+          set -e
+          gateway1_pid=""
+          test "$gateway1_exit_code" -eq 143
+
+          for _ in $(seq 1 200); do
+            test "$(lease_count 2>/dev/null || true)" = "0" && test -s "$held_closed_file" && break
+            sleep 0.1
+          done
+          lease_after_exit="$(lease_count)"
+          test "$lease_after_exit" = "0"
+          test -s "$held_closed_file"
+
+          surviving_descendants=0
+          while read -r child_pid; do
+            if test -n "$child_pid" && kill -0 "$child_pid" 2>/dev/null; then
+              surviving_descendants=$((surviving_descendants + 1))
+            fi
+          done <"$proof_root/gateway1-descendants"
+          test "$surviving_descendants" -eq 0
+
+          setsid env "${gateway_env[@]}" "$openclaw_bin" gateway run \
+            --port "$gateway_port" --bind loopback --verbose \
+            >"$gateway2_log" 2>&1 &
+          gateway2_pid=$!
+          test "$gateway2_pid" -ne "$gateway1_original_pid"
+
+          gateway2_ready_http=000
+          for _ in $(seq 1 1200); do
+            gateway2_ready_http="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --max-time 2 "http://127.0.0.1:$gateway_port/readyz" || true)"
+            test "$gateway2_ready_http" = "200" && break
+            if ! kill -0 "$gateway2_pid" 2>/dev/null; then
+              echo "Gateway 2 exited before readiness" >&2
+              sed -n '1,360p' "$gateway2_log" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          test "$gateway2_ready_http" = "200"
+          grep -F "replacement legacy download served" "$clawhub_log"
+          lease_at_ready="$(lease_count)"
+          test "$lease_at_ready" = "0"
+
+          kill -TERM "$gateway2_pid"
+          set +e
+          wait "$gateway2_pid"
+          gateway2_exit_code=$?
+          set -e
+          gateway2_pid=""
+          test "$gateway2_exit_code" -eq 143
+          final_lease_count="$(lease_count)"
+          test "$final_lease_count" = "0"
+
+          shutdown_line="$(grep -E 'completed cleanly' "$gateway2_log" | tail -1 | sed -E 's/.*(completed cleanly[^[:cntrl:]]*).*/\1/' || true)"
+          test -n "$shutdown_line"
+          held_request="$(tr -d '\r\n' <"$held_request_file")"
+          held_close="$(tr -d '\r\n' <"$held_closed_file")"
+
+          {
+            echo "head=$EXPECTED_SHA"
+            echo "node=$(node --version)"
+            echo "gateway1_phase=legacy-clawhub-download"
+            echo "clawhub_request=$held_request"
+            echo "clawhub_abort_observed=$held_close"
+            echo "lease_count_before_signal=1"
+            echo "ready_http_before_signal=$ready_before"
+            echo "gateway1_signal=SIGTERM"
+            echo "gateway1_exit_code=$gateway1_exit_code"
+            echo "gateway1_descendants_after_exit=none"
+            echo "lease_count_after_exit=$lease_after_exit"
+            echo "gateway2_pid_differs=true"
+            echo "gateway2_legacy_download=served"
+            echo "gateway2_ready_http=$gateway2_ready_http"
+            echo "gateway2_ready=true"
+            echo "lease_count_at_ready=$lease_at_ready"
+            echo "gateway2_shutdown=\"$shutdown_line\""
+            echo "final_lease_count=$final_lease_count"
+          } | tee "$trace"
+
+          cp "$trace" "$GITHUB_WORKSPACE/pr-132668-legacy-download-trace.txt"
+          cp "$clawhub_log" "$GITHUB_WORKSPACE/pr-132668-clawhub.log"
+          cp "$gateway1_log" "$GITHUB_WORKSPACE/pr-132668-gateway1.log"
+          cp "$gateway2_log" "$GITHUB_WORKSPACE/pr-132668-gateway2.log"
+
+      - name: Upload redacted proof logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: pr-132668-legacy-download-gateway-proof
+          path: |
+            pr-132668-legacy-download-trace.txt
+            pr-132668-clawhub.log
+            pr-132668-gateway1.log
+            pr-132668-gateway2.log
+          if-no-files-found: warn
+          retention-days: 14

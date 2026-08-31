@@ -1,0 +1,53 @@
+name: PR 132668 formatting patch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout immutable repaired head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: 8630910ebbb36edb903654e94baa4e65b35ee31f
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source identity
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "8630910ebbb36edb903654e94baa4e65b35ee31f"
+
+      - name: Setup Node 24
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.16.0
+
+      - name: Install pinned dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack install
+          pnpm install --frozen-lockfile
+
+      - name: Generate the formatter-owned patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec oxfmt src/infra/clawhub-artifacts.ts src/infra/clawhub-artifacts.test.ts
+          git diff --binary -- src/infra/clawhub-artifacts.ts src/infra/clawhub-artifacts.test.ts \
+            >"$RUNNER_TEMP/pr-132668-format.patch"
+          test -s "$RUNNER_TEMP/pr-132668-format.patch"
+
+      - name: Upload formatting patch
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: pr-132668-format-patch
+          path: ${{ runner.temp }}/pr-132668-format.patch
+          if-no-files-found: error
+          retention-days: 2
