@@ -14,13 +14,13 @@ jobs:
       - name: Checkout immutable repaired head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 9afc89cebf69ce867b32583d5274acfc40b11a78
+          ref: 1be34067e3c2477a095992d9e1c50f453eafab85
           fetch-depth: 1
           persist-credentials: false
 
       - name: Verify source identity
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "9afc89cebf69ce867b32583d5274acfc40b11a78"
+        run: test "$(git rev-parse HEAD)" = "1be34067e3c2477a095992d9e1c50f453eafab85"
 
       - name: Fetch the changed-gate baseline
         shell: bash
