@@ -2541,7 +2541,7 @@ describe("short-term promotion", () => {
     expect(await testing.readRecallStore(workspaceDir, new Date().toISOString())).toEqual(raw);
   });
 
-  it("waits for an active short-term lock before repairing", async (workspaceDir) => {
+  it("preserves an active stale same-pid lease while repairing", async (workspaceDir) => {
     await testing.writeRawRecallStore(workspaceDir, {
       version: 1,
       updatedAt: "2026-04-04T00:00:00.000Z",
@@ -2551,30 +2551,44 @@ describe("short-term promotion", () => {
         },
       },
     });
-    await testing.writeShortTermLock(workspaceDir, {
-      owner: `${process.pid}:${Date.now()}`,
-      acquiredAt: Date.now(),
-    });
 
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse("2026-09-01T00:00:00.000Z"));
+    const entered = createDeferred<void>();
+    const release = createDeferred<void>();
+    let owner: Promise<void> | undefined;
+    let repairPromise: ReturnType<typeof repairShortTermPromotionArtifacts> | undefined;
     try {
+      owner = withMemoryWorkspaceLock(workspaceDir, async () => {
+        entered.resolve();
+        await release.promise;
+      });
+      await entered.promise;
+      vi.setSystemTime(Date.now() + 120_000);
+
+      const audit = await auditShortTermPromotionArtifacts({ workspaceDir });
+      expect(audit.issues.map((issue) => issue.code)).not.toContain("recall-lock-stale");
+
       let settled = false;
-      const repairPromise = repairShortTermPromotionArtifacts({ workspaceDir }).then((result) => {
+      repairPromise = repairShortTermPromotionArtifacts({ workspaceDir }).then((result) => {
         settled = true;
         return result;
       });
-
       await vi.advanceTimersByTimeAsync(41);
       expect(settled).toBe(false);
 
-      await testing.deleteShortTermLock(workspaceDir);
-      await vi.advanceTimersByTimeAsync(40);
+      release.resolve();
+      await owner;
       const repair = await repairPromise;
 
       expect(repair.changed).toBe(true);
       expect(repair.rewroteStore).toBe(true);
       expect(repair.removedInvalidEntries).toBe(1);
+      expect(repair.removedStaleLock).toBe(false);
     } finally {
+      release.resolve();
+      await owner;
+      await repairPromise?.catch(() => undefined);
       vi.useRealTimers();
     }
   });
@@ -2657,6 +2671,27 @@ describe("short-term promotion", () => {
       message: "Short-term promotion lock appears stale.",
       fixable: true,
     });
+  });
+
+  it("reclaims a stale same-pid sqlite lock from a previous process", async (workspaceDir) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse("2026-09-01T00:00:00.000Z"));
+    try {
+      const previousBootAt = Date.now() - 120_000;
+      await testing.writeShortTermLock(workspaceDir, {
+        owner: `${process.pid}:${previousBootAt}`,
+        acquiredAt: previousBootAt,
+      });
+
+      const acquired = withMemoryWorkspaceLock(workspaceDir, async () => "acquired").then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+      await vi.advanceTimersByTimeAsync(10_040);
+      await expect(acquired).resolves.toEqual({ value: "acquired" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reclaims a stale sqlite lock owned by a Linux zombie", async (workspaceDir) => {

@@ -14,9 +14,11 @@ import {
 import type { ShortTermLockEntry } from "./short-term-promotion-types.js";
 
 const MEMORY_WORKSPACE_LOCK_WAIT_TIMEOUT_MS = 10_000;
-export const SHORT_TERM_LOCK_STALE_MS = 60_000;
+const SHORT_TERM_LOCK_STALE_MS = 60_000;
 const MEMORY_WORKSPACE_LOCK_RETRY_DELAY_MS = 40;
 const inProcessMemoryWorkspaceLocks = new KeyedAsyncQueue();
+// PID reuse makes process existence insufficient; only exact leases acquired here are active.
+const activeMemoryWorkspaceLeases = new Map<string, ShortTermLockEntry>();
 
 type MemoryWorkspaceLease = { key: string; active: boolean };
 type MemoryWorkspaceLockScope = {
@@ -65,7 +67,7 @@ export function resolveLockPath(workspaceDir: string): string {
   return memoryCoreStateReference(SHORT_TERM_LOCK_NAMESPACE, workspaceDir);
 }
 
-export function parseLockOwnerPid(raw: string): number | null {
+function parseLockOwnerPid(raw: string): number | null {
   const match = raw.trim().match(/^(\d+):/);
   if (!match) {
     return null;
@@ -77,7 +79,7 @@ export function parseLockOwnerPid(raw: string): number | null {
   return pid;
 }
 
-export function isProcessLikelyAlive(pid: number): boolean {
+function isProcessLikelyAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
   } catch (err) {
@@ -99,6 +101,31 @@ export function isProcessLikelyAlive(pid: number): boolean {
   }
 }
 
+function matchesShortTermLockEntry(
+  current: ShortTermLockEntry | undefined,
+  expected: ShortTermLockEntry,
+): boolean {
+  return current?.owner === expected.owner && current.acquiredAt === expected.acquiredAt;
+}
+
+export function isShortTermLockEntryReclaimable(
+  lockKey: string,
+  entry: ShortTermLockEntry,
+  now = Date.now(),
+): boolean {
+  if (now - entry.acquiredAt <= SHORT_TERM_LOCK_STALE_MS) {
+    return false;
+  }
+  const ownerPid = parseLockOwnerPid(entry.owner);
+  if (ownerPid === null) {
+    return true;
+  }
+  if (ownerPid !== process.pid) {
+    return !isProcessLikelyAlive(ownerPid);
+  }
+  return !matchesShortTermLockEntry(activeMemoryWorkspaceLeases.get(lockKey), entry);
+}
+
 export async function deleteShortTermLockEntryIfCurrent(
   lockStore: PluginStateKeyedStore<ShortTermLockEntry>,
   lockKey: string,
@@ -107,9 +134,8 @@ export async function deleteShortTermLockEntryIfCurrent(
   if (!lockStore.deleteIf) {
     throw new Error("memory-core short-term lock store requires conditional deletion");
   }
-  return await lockStore.deleteIf(
-    lockKey,
-    (current) => current.owner === expected.owner && current.acquiredAt === expected.acquiredAt,
+  return await lockStore.deleteIf(lockKey, (current) =>
+    matchesShortTermLockEntry(current, expected),
   );
 }
 
@@ -145,22 +171,25 @@ export async function withMemoryWorkspaceLock<T>(
       const acquired = await lockStore.registerIfAbsent(lockKey, lockEntry);
       if (acquired) {
         const lease = { key: lockKey, active: true };
+        activeMemoryWorkspaceLeases.set(lockKey, lockEntry);
         try {
           return await runWorkspaceLockScope(lease, task);
         } finally {
           lease.active = false;
+          if (matchesShortTermLockEntry(activeMemoryWorkspaceLeases.get(lockKey), lockEntry)) {
+            activeMemoryWorkspaceLeases.delete(lockKey);
+          }
           await deleteShortTermLockEntryIfCurrent(lockStore, lockKey, lockEntry).catch(() => false);
         }
       }
 
       const existing = await lockStore.lookup(lockKey);
-      if (existing && Date.now() - existing.acquiredAt > SHORT_TERM_LOCK_STALE_MS) {
-        const ownerPid = parseLockOwnerPid(existing.owner);
-        if (ownerPid === null || !isProcessLikelyAlive(ownerPid)) {
-          if (await deleteShortTermLockEntryIfCurrent(lockStore, lockKey, existing)) {
-            continue;
-          }
-        }
+      if (
+        existing &&
+        isShortTermLockEntryReclaimable(lockKey, existing) &&
+        (await deleteShortTermLockEntryIfCurrent(lockStore, lockKey, existing))
+      ) {
+        continue;
       }
 
       if (Date.now() - startedAt >= MEMORY_WORKSPACE_LOCK_WAIT_TIMEOUT_MS) {
