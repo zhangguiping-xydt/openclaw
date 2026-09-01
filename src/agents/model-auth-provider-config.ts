@@ -539,7 +539,7 @@ export function resolveConfiguredAwsSdkProfileAuth(params: {
   };
 }
 
-function isLocalAuthProviderBaseUrl(baseUrl: string): boolean {
+export function isLocalAuthProviderBaseUrl(baseUrl: string): boolean {
   return isLocalProviderBaseUrl(baseUrl, MODEL_AUTH_LOCAL_HOST_ALIASES);
 }
 

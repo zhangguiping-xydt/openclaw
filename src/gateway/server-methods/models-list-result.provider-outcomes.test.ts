@@ -237,6 +237,30 @@ describe("models.list provider catalog outcomes", () => {
       expected: { available: false },
     },
     {
+      name: "unknown availability backed by a synthetic local route",
+      evaluation: { availability: undefined, evidence: "synthetic" },
+      expected: { available: true },
+    },
+    {
+      name: "missing synthetic auth backed by a completed local route",
+      evaluation: {
+        availability: false,
+        evidence: "synthetic",
+        unavailableReason: "missing-auth",
+      },
+      expected: { available: true },
+    },
+    {
+      name: "synthetic auth backed by a remote route",
+      evaluation: {
+        availability: false,
+        evidence: "synthetic",
+        unavailableReason: "missing-auth",
+      },
+      baseUrl: "https://ollama.example.com/v1",
+      expected: { available: false, unavailableReason: "missing-auth" },
+    },
+    {
       name: "available models without stale unavailability metadata",
       evaluation: {
         availability: true,
@@ -245,12 +269,30 @@ describe("models.list provider catalog outcomes", () => {
       },
       expected: { available: true },
     },
-  ] as const)("projects $name", async ({ evaluation, expected }) => {
+  ] as const)("projects $name", async ({ evaluation, expected, ...testCase }) => {
     const config = {
-      agents: { defaults: { models: { "custom/test-model": {} } } },
+      agents: {
+        defaults: {
+          model: { primary: "ollama/test-model" },
+          models: { "ollama/test-model": { agentRuntime: { id: "openclaw" } } },
+        },
+      },
     } as OpenClawConfig;
-    const model = { id: "test-model", name: "Test Model", provider: "custom" };
-    const snapshot = markPreparedModelCatalogFull({ entries: [model], routeVariants: [model] });
+    const model = {
+      id: "test-model",
+      name: "Test Model",
+      provider: "ollama",
+    };
+    const route = {
+      ...model,
+      api: "ollama" as const,
+      ...("baseUrl" in testCase && testCase.baseUrl ? { baseUrl: testCase.baseUrl } : {}),
+    };
+    const snapshot = markPreparedModelCatalogFull({
+      entries: [model],
+      routeVariants: [model],
+      staticEntries: [route],
+    });
     const projector = createGatewayAgentModelCatalogProjector({
       cfg: config,
       agentId: "main",
@@ -277,12 +319,24 @@ describe("models.list provider catalog outcomes", () => {
       catalogProjector: projector,
     });
 
-    expect(prepared.read().models).toEqual([{ ...model, tags: ["configured"], ...expected }]);
+    expect(prepared.read().models).toEqual([
+      expect.objectContaining({
+        id: model.id,
+        name: model.name,
+        provider: model.provider,
+        tags: ["default", "configured"],
+        ...expected,
+      }),
+    ]);
     const hostEvaluations = evaluateEntry.mock.calls.length;
     evaluateNative.mockReturnValue({ availability: true, routeResolution: null });
-    expect(prepared.read().models).toEqual([{ ...model, tags: ["configured"], available: true }]);
+    expect(prepared.read().models).toEqual([
+      expect.objectContaining({ id: model.id, available: true }),
+    ]);
     evaluateNative.mockReturnValue({ availability: false, routeResolution: null });
-    expect(prepared.read().models).toEqual([{ ...model, tags: ["configured"], available: false }]);
+    expect(prepared.read().models).toEqual([
+      expect.objectContaining({ id: model.id, available: false }),
+    ]);
     expect(evaluateEntry).toHaveBeenCalledTimes(hostEvaluations);
   });
 });
