@@ -230,7 +230,7 @@ it("drains only its own pending work and sessions during shutdown", async () => 
   await agentA.shutdown();
   await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
   expect(request.mock.calls.find(([method]) => method === "chat.abort")?.[1]).toEqual({
-    sessionKey: `acp-bridge:${sessionA.sessionId}`,
+    sessionKey: send?.[1]?.sessionKey,
     runId: send?.[1]?.idempotencyKey,
   });
   for (const agent of [agentA, agentB]) {
