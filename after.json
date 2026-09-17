@@ -1,0 +1,22 @@
+{
+  "phase": "green",
+  "count": 10000,
+  "reply": {
+    "text": "✅ Session exported!\n\n📄 File: deep-chain.html\n📊 Entries: 10000\n🧠 System prompt: 7,182 chars\n🔧 Tools: 0"
+  },
+  "errors": [],
+  "treeNodes": 10000,
+  "first": 1,
+  "last": 1,
+  "afterFirstClick": {
+    "messages": 10000,
+    "selected": "entry-0",
+    "first": 1,
+    "last": 1
+  },
+  "afterLastClick": {
+    "messages": 10000,
+    "selected": "entry-9999",
+    "last": 1
+  }
+}

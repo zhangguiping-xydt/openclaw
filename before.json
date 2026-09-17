@@ -1,0 +1,16 @@
+{
+  "phase": "red",
+  "count": 10000,
+  "reply": {
+    "text": "✅ Session exported!\n\n📄 File: deep-chain.html\n📊 Entries: 10000\n🧠 System prompt: 7,182 chars\n🔧 Tools: 0"
+  },
+  "errors": [
+    {
+      "message": "Maximum call stack size exceeded",
+      "stack": "RangeError: Maximum call stack size exceeded\n    at Array.sort (<anonymous>)\n    at sortChildren (<export>/command-red.html:1363:13)\n    at Array.forEach (<anonymous>)\n    at sortChildren (<export>/command-red.html:1363:13)\n    at Array.forEach (<anonymous>)\n    at sortChildren (<export>/command-red.html:1363:13)\n    at Array.forEach (<anonymous>)\n    at sortChildren (<export>/command-red.html:1363:13)\n    at Array.forEach (<anonymous>)\n    at sortChildren (<export>/command-red.html:1363:13)"
+    }
+  ],
+  "treeNodes": 0,
+  "first": 0,
+  "last": 0
+}
