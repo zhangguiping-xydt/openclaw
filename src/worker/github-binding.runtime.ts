@@ -204,30 +204,32 @@ async function bindWorkerGitHubCheckout(
         hasPathPrefixCollision = true;
         break;
       }
-      // Git never reports `.git` entries, so an empty status cannot prove that a tracked
-      // directory holds no nested repository; deleting one would discard its own history.
-      const trackedDirectories = new Set([gitPath]);
-      for (const entry of tracked) {
-        const trackedPath = entry.slice(entry.indexOf("\t") + 1);
-        let separator = trackedPath.lastIndexOf("/");
-        while (separator > 0) {
-          trackedDirectories.add(trackedPath.slice(0, separator));
-          separator = trackedPath.lastIndexOf("/", separator - 1);
+      // Git reports neither nested repositories, empty directories, named pipes nor sockets, so an
+      // empty status cannot prove the subtree the removal would delete is reproducible from the
+      // index. Every on-disk entry has to be a tracked path; anything else is local work Git
+      // cannot see, and deleting the directory would destroy it with no way to restore it.
+      const trackedPaths = new Set(tracked.map((entry) => entry.slice(entry.indexOf("\t") + 1)));
+      const holdsUnreproducibleEntry = async (relative: string): Promise<boolean> => {
+        const entries = await fs.readdir(path.join(cwd, relative), { withFileTypes: true });
+        if (entries.length === 0) {
+          return true;
         }
-      }
-      let holdsNestedRepository = false;
-      for (const trackedDirectory of trackedDirectories) {
-        try {
-          await fs.lstat(path.join(cwd, trackedDirectory, ".git"));
-          holdsNestedRepository = true;
-          break;
-        } catch (error) {
-          if (!isMissingPathError(error)) {
-            throw error;
+        for (const entry of entries) {
+          const entryPath = `${relative}/${entry.name}`;
+          if (!entry.isDirectory()) {
+            if (!trackedPaths.has(entryPath)) {
+              return true;
+            }
+            continue;
+          }
+          if (await holdsUnreproducibleEntry(entryPath)) {
+            return true;
           }
         }
-      }
-      if (holdsNestedRepository) {
+        return false;
+      };
+      const collisionIsDirectory = (await fs.lstat(path.join(cwd, collisionPath))).isDirectory();
+      if (collisionIsDirectory && (await holdsUnreproducibleEntry(gitPath))) {
         hasPathPrefixCollision = true;
         break;
       }

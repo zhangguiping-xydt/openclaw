@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -401,6 +402,66 @@ describe("prepareWorkerGitHubEnvironment", () => {
     );
   });
 
+  // Git reports none of these entries, so an empty status plus tracked index entries cannot prove
+  // the directory the removal deletes is reproducible from the index. A named pipe needs a POSIX
+  // host; the empty directory covers the same code path everywhere. A live socket needs a short
+  // path for `sun_path`, so the runtime proof covers that variant in a shorter scenario root.
+  const gitInvisibleEntries: Array<{
+    entry: string;
+    create: (target: string) => Promise<void>;
+  }> = [
+    {
+      entry: "an empty directory",
+      create: async (target) => {
+        await fs.mkdir(target);
+      },
+    },
+  ];
+  if (process.platform !== "win32") {
+    gitInvisibleEntries.push({
+      entry: "a named pipe",
+      create: async (target) => {
+        const created = spawnSync("mkfifo", [target], { encoding: "utf8", timeout: 5_000 });
+        expect(created.status, created.stderr).toBe(0);
+      },
+    });
+  }
+
+  it.each(gitInvisibleEntries)(
+    "preserves $entry inside a tracked directory",
+    async ({ create }) => {
+      const collision = "collision";
+      const trackedFile = path.join(collision, "base.txt");
+      await fs.mkdir(path.join(cwd, collision));
+      await fs.writeFile(path.join(cwd, trackedFile), "base file\n");
+      initialHead = await commit(cwd, "Track collision directory");
+      await git(cwd, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+
+      const seed = path.join(root, "earlier-worker");
+      await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+      await fs.rm(path.join(seed, collision), { recursive: true });
+      await fs.writeFile(path.join(seed, collision), "remote file\n");
+      const remoteHead = await commit(seed, "Earlier turn");
+      await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+      const invisible = path.join(cwd, collision, "invisible");
+      await create(invisible);
+      // Git reports nothing for the entry, so the outer status is still empty here.
+      expect(await git(cwd, "status", "--porcelain", "--ignored", "-z")).toBe("");
+
+      await prepare();
+
+      await expect(fs.readFile(path.join(cwd, trackedFile), "utf8")).resolves.toBe("base file\n");
+      await expect(fs.lstat(invisible)).resolves.toBeDefined();
+      await expect(fs.readFile(path.join(cwd, collision), "utf8")).rejects.toThrow();
+      expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+      expect(remoteHead).not.toBe(initialHead);
+      expect(warn).toHaveBeenCalledExactlyOnceWith(
+        expect.stringContaining("GitHub checkout fast-forward skipped"),
+      );
+    },
+  );
+
   it("completes the move when the turn is fenced after the removals", async () => {
     const collision = "collision";
     await fs.writeFile(path.join(cwd, collision), "base file\n");
@@ -443,7 +504,14 @@ describe("prepareWorkerGitHubEnvironment", () => {
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
 
     // The next turn sees a local head that already matches the remote one, so it returns early.
-    await prepareFenced();
+    // A fresh live signal keeps that early return on its normal path instead of the fence exit.
+    await prepareWorkerGitHubEnvironment({
+      binding,
+      stateDir: path.join(root, "state"),
+      runId: "turn",
+      cwd,
+      signal: new AbortController().signal,
+    });
 
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
     await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(
