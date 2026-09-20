@@ -50,9 +50,11 @@ async function bindWorkerGitHubCheckout(
   // local work completes instead of honoring the abort.
   const requireMoveGit = (args: string[]) => requireGitWith(args, false);
   try {
-    if ((await git(["rev-parse", "--git-dir"])).code !== 0) {
+    const repository = await git(["rev-parse", "--absolute-git-dir"]);
+    if (repository.code !== 0) {
       return;
     }
+    const gitDirectory = repository.stdout.trim();
     if (binding.remoteUrl) {
       const origin = await git(["remote", "get-url", "origin"]);
       if (origin.code !== 0) {
@@ -242,10 +244,32 @@ async function bindWorkerGitHubCheckout(
     // Paths already missing before the move are the session's own deletions and stay
     // deleted; only files the incoming commits introduce are materialized.
     const deletedBefore = new Set(await listPaths(["ls-files", "--deleted", "-z"]));
-    await requireMoveGit(["reset", "--mixed", "FETCH_HEAD"]);
-    for (const collisionPath of removableTrackedCollisions) {
-      await fs.rm(path.join(cwd, collisionPath), { recursive: true });
+    // The checks above cannot reserve what they approved: a background command from an earlier
+    // turn still runs as the worker user and can write into an approved path after the
+    // classification and before the move. Renaming that path aside replaces it without
+    // destroying whatever landed in the meantime, and the Git directory is both on the checkout's
+    // own filesystem and invisible to `git status`, so the preserved bytes can never be mistaken
+    // for work to publish. They stay there for the lifetime of the checkout, which is discarded
+    // with the worker. A turn that lost its authority while classifying must not start the move;
+    // from here on the bounded local work runs to completion, because a turn that returned after
+    // advancing the branch would leave the workspace half applied and the next turn returns
+    // immediately on the matching local head.
+    if (signal?.aborted) {
+      return;
     }
+    if (removableTrackedCollisions.size > 0) {
+      const collisionRecovery = path.join(gitDirectory, "github-checkout-collision-recovery");
+      await fs.mkdir(collisionRecovery, { recursive: true });
+      const recoveryDirectory = await fs.mkdtemp(path.join(collisionRecovery, "move-"));
+      for (const [index, collisionPath] of [...removableTrackedCollisions].entries()) {
+        const sanitized = collisionPath.split(path.sep).join("_");
+        await fs.rename(
+          path.join(cwd, collisionPath),
+          path.join(recoveryDirectory, `${index}-${sanitized}`),
+        );
+      }
+    }
+    await requireMoveGit(["reset", "--mixed", "FETCH_HEAD"]);
     const missing = (await listMovePaths(["ls-files", "--deleted", "-z"])).filter(
       (file) => !deletedBefore.has(file),
     );

@@ -520,6 +520,118 @@ describe("prepareWorkerGitHubEnvironment", () => {
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
   });
 
+  // Everything the move set aside lives under the checkout's Git directory, where `git status`
+  // cannot see it and a later `git add` cannot pick it up as work to publish.
+  async function replacedBytes(
+    directory = path.join(cwd, ".git", "github-checkout-collision-recovery"),
+  ): Promise<string[]> {
+    try {
+      const entries = await fs.readdir(directory, { withFileTypes: true });
+      const contents = await Promise.all(
+        entries
+          .filter((entry) => !entry.isDirectory())
+          .map(async (entry) =>
+            (await fs.readFile(path.join(directory, entry.name), "utf8")).trim(),
+          ),
+      );
+      const nested = await Promise.all(
+        entries
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => replacedBytes(path.join(directory, entry.name))),
+      );
+      return [...contents, ...nested.flat()].toSorted();
+    } catch {
+      return [];
+    }
+  }
+
+  it("preserves a file written into a replaced directory after the classification", async () => {
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, collision));
+    await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track collision directory");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    await fs.rm(path.join(seed, collision), { recursive: true });
+    await fs.writeFile(path.join(seed, collision), "remote file\n");
+    const remoteHead = await commit(seed, "Earlier turn");
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+    // A background command from an earlier turn still runs as the worker user, so it can write
+    // into a directory the classifier already approved and is about to replace.
+    const runCommand = exec.runCommandWithTimeout;
+    let written = 0;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      const result = await runCommand(argv, options);
+      if (argv.includes("--deleted") && written === 0) {
+        written += 1;
+        await fs.writeFile(path.join(cwd, collision, "late.txt"), "written after classification\n");
+      }
+      return result;
+    });
+
+    await prepare();
+
+    expect(written).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    await expect(fs.readFile(path.join(cwd, collision), "utf8")).resolves.toBe("remote file\n");
+    // The replacement sets the directory aside, so the late bytes survive it instead of being
+    // deleted along with the directory the classifier approved.
+    await expect(replacedBytes()).resolves.toEqual(["base file", "written after classification"]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("does not start the move when the turn is fenced while classifying", async () => {
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, collision));
+    await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track collision directory");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    await fs.rm(path.join(seed, collision), { recursive: true });
+    await fs.writeFile(path.join(seed, collision), "remote file\n");
+    const remoteHead = await commit(seed, "Earlier turn");
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+    const controller = new AbortController();
+    const runCommand = exec.runCommandWithTimeout;
+    const runner = vi
+      .spyOn(exec, "runCommandWithTimeout")
+      .mockImplementation(async (argv, options) => {
+        const result = await runCommand(argv, options);
+        if (argv.includes("--deleted")) {
+          // The fence lands after the classifier approved the path and before the move touches it.
+          controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
+        }
+        return result;
+      });
+
+    await prepareWorkerGitHubEnvironment({
+      binding,
+      stateDir: path.join(root, "state"),
+      runId: "turn",
+      cwd,
+      signal: controller.signal,
+    });
+
+    // The move advances the branch before it materializes the replacements, so a fenced turn that
+    // started it would leave the workspace half applied with no later recovery.
+    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(remoteHead).not.toBe(initialHead);
+    await expect(fs.readFile(path.join(cwd, collision, "base.txt"), "utf8")).resolves.toBe(
+      "base file\n",
+    );
+    await expect(replacedBytes()).resolves.toEqual([]);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("preserves a tracked dirty directory that blocks an incoming file", async () => {
     const collision = "collision";
     const localFile = path.join(collision, "local.txt");
