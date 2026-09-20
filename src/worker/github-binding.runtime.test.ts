@@ -479,9 +479,9 @@ describe("prepareWorkerGitHubEnvironment", () => {
     const controller = new AbortController();
     const runCommand = exec.runCommandWithTimeout;
     vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
-      if (argv.includes("checkout")) {
-        // The removals are already done and HEAD has advanced; the replacement files must still
-        // be materialized, otherwise the checkout stays half applied with no later recovery.
+      if (argv.includes("checkout-index")) {
+        // The replacements are already set aside and HEAD has advanced; the incoming files must
+        // still be materialized, otherwise the checkout stays half applied with no later recovery.
         controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
       }
       return await runCommand(argv, options);
@@ -629,6 +629,79 @@ describe("prepareWorkerGitHubEnvironment", () => {
     );
     await expect(replacedBytes()).resolves.toEqual([]);
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("preserves a path a writer recreates before the incoming file is materialized", async () => {
+    const collision = "collision";
+    await fs.writeFile(path.join(cwd, collision), "base file\n");
+    initialHead = await commit(cwd, "Track collision file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    await fs.rm(path.join(seed, collision));
+    await fs.mkdir(path.join(seed, collision));
+    await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
+    const remoteHead = await commit(seed, "Earlier turn");
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+    // The file is already set aside here, which is the window a background command from an earlier
+    // turn keeps running in: it recreates the path the incoming directory has to be written under.
+    const runCommand = exec.runCommandWithTimeout;
+    let written = 0;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      const result = await runCommand(argv, options);
+      if (argv.includes("reset") && written === 0) {
+        written += 1;
+        await fs.writeFile(path.join(cwd, collision), "written while the move ran\n");
+      }
+      return result;
+    });
+
+    await prepare();
+
+    expect(written).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(
+      "remote file\n",
+    );
+    // Neither the replaced file nor the recreated path was overwritten: both are recoverable.
+    await expect(replacedBytes()).resolves.toEqual(["base file", "written while the move ran"]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("replaces a collision whose path exceeds the recovery name limit", async () => {
+    const long = "l".repeat(140);
+    const nested = `${long}/${long}`;
+    const short = "a";
+    await fs.writeFile(path.join(cwd, short), "a bytes\n");
+    await fs.mkdir(path.join(cwd, nested), { recursive: true });
+    await fs.writeFile(path.join(cwd, nested, "base.txt"), "nested bytes\n");
+    initialHead = await commit(cwd, "Track collision paths");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    await fs.rm(path.join(seed, short));
+    await fs.mkdir(path.join(seed, short));
+    await fs.writeFile(path.join(seed, short, "remote.txt"), "remote short\n");
+    await fs.rm(path.join(seed, nested), { recursive: true });
+    await fs.writeFile(path.join(seed, nested), "remote nested\n");
+    const remoteHead = await commit(seed, "Earlier turn");
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+    await prepare();
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    await expect(fs.readFile(path.join(cwd, short, "remote.txt"), "utf8")).resolves.toBe(
+      "remote short\n",
+    );
+    await expect(fs.readFile(path.join(cwd, nested), "utf8")).resolves.toBe("remote nested\n");
+    // Both blockers were set aside: a name the filesystem rejects cannot strand the first one.
+    await expect(replacedBytes()).resolves.toEqual(["a bytes", "nested bytes"]);
     expect(warn).not.toHaveBeenCalled();
   });
 

@@ -7,7 +7,7 @@ import {
 } from "../agents/github-tool-identity.js";
 import type { PreparedGitHubToolEnvironment } from "../agents/github-tool-identity.types.js";
 import { sha256HexPrefixCore } from "../infra/crypto-digest.js";
-import { isMissingPathError } from "../infra/errno.js";
+import { hasErrnoCode, isMissingPathError } from "../infra/errno.js";
 import { executeGitCommand } from "../infra/git-exec.js";
 import { isPathCaseInsensitive } from "../infra/path-case.js";
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
@@ -19,6 +19,16 @@ const log = createSubsystemLogger("worker/github");
 export function disposeWorkerGitHubEnvironment(stateDir: string, turnId: string) {
   return removeManagedGitHubProfile(
     path.join(stateDir, "github-profiles", sha256HexPrefixCore(turnId, 16)),
+  );
+}
+
+/** Whether the filesystem refused a write because something else is already at that path. */
+function isOccupiedPathError(error: unknown) {
+  return (
+    hasErrnoCode(error, "EEXIST") ||
+    hasErrnoCode(error, "EISDIR") ||
+    hasErrnoCode(error, "ENOTEMPTY") ||
+    hasErrnoCode(error, "ENOTDIR")
   );
 }
 
@@ -246,35 +256,133 @@ async function bindWorkerGitHubCheckout(
     const deletedBefore = new Set(await listPaths(["ls-files", "--deleted", "-z"]));
     // The checks above cannot reserve what they approved: a background command from an earlier
     // turn still runs as the worker user and can write into an approved path after the
-    // classification and before the move. Renaming that path aside replaces it without
-    // destroying whatever landed in the meantime, and the Git directory is both on the checkout's
-    // own filesystem and invisible to `git status`, so the preserved bytes can never be mistaken
-    // for work to publish. They stay there for the lifetime of the checkout, which is discarded
-    // with the worker. A turn that lost its authority while classifying must not start the move;
-    // from here on the bounded local work runs to completion, because a turn that returned after
-    // advancing the branch would leave the workspace half applied and the next turn returns
-    // immediately on the matching local head.
+    // classification and before the move. Nothing here may destroy bytes this turn did not write,
+    // so no step deletes or overwrites: an approved path is moved into a recovery directory under
+    // the Git directory, the incoming files are staged there too and linked into place, which
+    // fails instead of overwriting, and a path a writer recreated in the meantime is moved aside
+    // and retried. The Git directory is on the checkout's own filesystem and invisible to
+    // `git status`, so preserved bytes cannot be mistaken for work to publish, and they stay for
+    // the lifetime of the checkout, which is discarded with the worker. Recovery names are digest
+    // based, so a legal path of any length still fits the filesystem's component limit, and a
+    // failure part way through puts back what this turn already moved. A turn that lost its
+    // authority while classifying must not start the move; from here on the bounded local work
+    // runs to completion, because a turn that returned after advancing the branch would leave the
+    // workspace half applied and the next turn returns immediately on the matching local head.
     if (signal?.aborted) {
       return;
     }
-    if (removableTrackedCollisions.size > 0) {
-      const collisionRecovery = path.join(gitDirectory, "github-checkout-collision-recovery");
-      await fs.mkdir(collisionRecovery, { recursive: true });
-      const recoveryDirectory = await fs.mkdtemp(path.join(collisionRecovery, "move-"));
-      for (const [index, collisionPath] of [...removableTrackedCollisions].entries()) {
-        const sanitized = collisionPath.split(path.sep).join("_");
-        await fs.rename(
-          path.join(cwd, collisionPath),
-          path.join(recoveryDirectory, `${index}-${sanitized}`),
-        );
+    const collisionRecovery = path.join(gitDirectory, "github-checkout-collision-recovery");
+    let recoveryDirectory: string | undefined;
+    const ensureRecoveryDirectory = async () => {
+      if (!recoveryDirectory) {
+        await fs.mkdir(collisionRecovery, { recursive: true });
+        recoveryDirectory = await fs.mkdtemp(path.join(collisionRecovery, "move-"));
       }
+      return recoveryDirectory;
+    };
+    let recoverySequence = 0;
+    const recoveryName = (relative: string) => {
+      recoverySequence += 1;
+      const leaf = path.basename(relative);
+      const digest = sha256HexPrefixCore(relative.split(path.sep).join("/"), 16);
+      return `${recoverySequence}-${digest}${leaf.length <= 64 ? `-${leaf}` : ""}`;
+    };
+    /** Replacing a path means moving it aside, so a writer's bytes survive at one of the two. */
+    const moveAside = async (relative: string) => {
+      const preserved = path.join(await ensureRecoveryDirectory(), recoveryName(relative));
+      await fs.rename(path.join(cwd, relative), preserved);
+      return preserved;
+    };
+    /**
+     * The path a writer's file occupies on the way to `relative`, or the path itself when the
+     * whole path exists as directories. Walking from the top finds the blocker whatever errno the
+     * filesystem chose: `mkdir` of a path that is a file reports `EEXIST`, while a `mkdir` or
+     * `link` below a file reports `ENOTDIR`.
+     */
+    const blockingPath = async (relative: string) => {
+      let current = "";
+      for (const segment of relative.split(path.sep)) {
+        current = current ? path.join(current, segment) : segment;
+        const stats = await fs.lstat(path.join(cwd, current)).catch(() => undefined);
+        if (!stats) {
+          // Nothing is in the way below this point, so the retry can create the rest itself.
+          return undefined;
+        }
+        if (!stats.isDirectory()) {
+          return current;
+        }
+      }
+      return relative;
+    };
+    const movedAside: Array<{ relative: string; preserved: string }> = [];
+    try {
+      for (const collisionPath of removableTrackedCollisions) {
+        movedAside.push({ relative: collisionPath, preserved: await moveAside(collisionPath) });
+      }
+    } catch (error) {
+      // Never leave the checkout half replaced: put back what this turn already moved.
+      for (const { relative, preserved } of movedAside) {
+        await fs.rename(preserved, path.join(cwd, relative)).catch(() => {});
+      }
+      throw error;
     }
     await requireMoveGit(["reset", "--mixed", "FETCH_HEAD"]);
     const missing = (await listMovePaths(["ls-files", "--deleted", "-z"])).filter(
       (file) => !deletedBefore.has(file),
     );
-    if (missing.length > 0) {
-      await requireMoveGit(["--literal-pathspecs", "checkout", "--", ...missing]);
+    if (missing.length === 0) {
+      return;
+    }
+    const staging = await fs.mkdtemp(path.join(await ensureRecoveryDirectory(), "incoming-"));
+    try {
+      await requireMoveGit([
+        "--literal-pathspecs",
+        "checkout-index",
+        `--prefix=${staging}${path.sep}`,
+        "--",
+        ...missing,
+      ]);
+      for (const file of missing) {
+        const staged = path.join(staging, file);
+        const stats = await fs.lstat(staged).catch(() => undefined);
+        if (!stats) {
+          // Git writes no content for a submodule entry.
+          continue;
+        }
+        const target = path.join(cwd, file);
+        let materialized = false;
+        for (let attempt = 0; attempt < 4 && !materialized; attempt += 1) {
+          try {
+            await fs.mkdir(path.dirname(target), { recursive: true });
+            if (stats.isSymbolicLink()) {
+              await fs.symlink(await fs.readlink(staged), target);
+            } else {
+              // Linking refuses an occupied path, so a writer's bytes are never overwritten.
+              await fs.link(staged, target);
+            }
+            materialized = true;
+          } catch (error) {
+            if (!isOccupiedPathError(error)) {
+              // A directory that vanished between the two steps is recreated by the next attempt.
+              if (isMissingPathError(error)) {
+                continue;
+              }
+              throw error;
+            }
+            const blocking = await blockingPath(file);
+            if (!blocking) {
+              continue;
+            }
+            await moveAside(blocking);
+          }
+        }
+        if (!materialized) {
+          // A writer that keeps recreating the path keeps its bytes; the next turn can retry.
+          log.warn(`GitHub checkout replacement left ${path.basename(file)} in place`);
+        }
+      }
+    } finally {
+      await fs.rm(staging, { recursive: true, force: true });
     }
   } catch (error) {
     // Checkout metadata helps direct publication; a failure must not discard the coding turn.
