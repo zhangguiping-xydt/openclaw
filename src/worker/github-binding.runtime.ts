@@ -38,27 +38,37 @@ async function bindWorkerGitHubCheckout(
   baseEnv: NodeJS.ProcessEnv,
   signal?: AbortSignal,
 ) {
-  const runGit = (args: string[], timeoutMs: number, honorSignal: boolean) =>
+  const runGit = (
+    args: string[],
+    timeoutMs: number,
+    honorSignal: boolean,
+    extraEnv: NodeJS.ProcessEnv = {},
+  ) =>
     executeGitCommand(cwd, args, {
-      baseEnv,
+      baseEnv: { ...baseEnv, ...extraEnv },
       timeoutMs,
       maxOutputBytes: { stdout: 1_048_576, stderr: 2_048 },
       ...(honorSignal && signal ? { signal } : {}),
     });
   const git = (args: string[], timeoutMs = 5_000) => runGit(args, timeoutMs, true);
-  const requireGitWith = async (args: string[], honorSignal: boolean) => {
-    const result = await runGit(args, 5_000, honorSignal);
+  const requireGitWith = async (
+    args: string[],
+    honorSignal: boolean,
+    extraEnv: NodeJS.ProcessEnv = {},
+  ) => {
+    const result = await runGit(args, 5_000, honorSignal, extraEnv);
     if (result.code !== 0 || result.stdoutTruncatedBytes) {
       throw new Error(`git ${args[0]} failed or output was truncated (exit ${result.code})`);
     }
     return result.stdout;
   };
   const requireGit = (args: string[]) => requireGitWith(args, true);
-  // The move below advances HEAD before it materializes the replacements, so a turn fenced
-  // partway through would leave the workspace half applied and the next turn returns early
-  // because the local head already equals the remote head. Once the move starts, this bounded
-  // local work completes instead of honoring the abort.
-  const requireMoveGit = (args: string[]) => requireGitWith(args, false);
+  // The move below advances the branch only once every incoming file is in place, so a turn fenced
+  // partway through cannot leave the workspace half applied: it either completes its bounded local
+  // work or leaves the checkout exactly as the next turn expects it. Once the move starts it
+  // completes instead of honoring the abort.
+  const requireMoveGit = (args: string[], extraEnv: NodeJS.ProcessEnv = {}) =>
+    requireGitWith(args, false, extraEnv);
   try {
     const repository = await git(["rev-parse", "--absolute-git-dir"]);
     if (repository.code !== 0) {
@@ -111,7 +121,6 @@ async function bindWorkerGitHubCheckout(
     }
     const splitPaths = (stdout: string) => stdout.split("\0").filter(Boolean);
     const listPaths = async (args: string[]) => splitPaths(await requireGit(args));
-    const listMovePaths = async (args: string[]) => splitPaths(await requireMoveGit(args));
     const added = await listPaths([
       "diff",
       "--name-only",
@@ -264,10 +273,11 @@ async function bindWorkerGitHubCheckout(
     // `git status`, so preserved bytes cannot be mistaken for work to publish, and they stay for
     // the lifetime of the checkout, which is discarded with the worker. Recovery names are digest
     // based, so a legal path of any length still fits the filesystem's component limit, and a
-    // failure part way through puts back what this turn already moved. A turn that lost its
-    // authority while classifying must not start the move; from here on the bounded local work
-    // runs to completion, because a turn that returned after advancing the branch would leave the
-    // workspace half applied and the next turn returns immediately on the matching local head.
+    // failure part way through puts back what this turn already moved without overwriting a
+    // writer's bytes. The branch and the index only move once every incoming file is in place, so
+    // a turn that cannot finish leaves the checkout exactly as the next turn expects it and that
+    // turn retries the same fast-forward; a turn that lost its authority while classifying must
+    // not start the move.
     if (signal?.aborted) {
       return;
     }
@@ -281,6 +291,9 @@ async function bindWorkerGitHubCheckout(
       return recoveryDirectory;
     };
     let recoverySequence = 0;
+    // Enough attempts for a writer that keeps recreating the path, while every attempt that moves
+    // a blocker aside is still followed by another write into the path it freed.
+    const placementAttempts = 8;
     const recoveryName = (relative: string) => {
       recoverySequence += 1;
       const leaf = path.basename(relative);
@@ -292,6 +305,35 @@ async function bindWorkerGitHubCheckout(
       const preserved = path.join(await ensureRecoveryDirectory(), recoveryName(relative));
       await fs.rename(path.join(cwd, relative), preserved);
       return preserved;
+    };
+    /**
+     * Puts a moved path back without overwriting anything a writer put there in the meantime.
+     * Linking refuses an occupied path, so a recreation wins and the restored bytes stay
+     * recoverable under the Git directory instead of being written over it. A directory or a
+     * symlink cannot be linked back, so it returns only into a path that is still free.
+     */
+    const restoreAside = async (relative: string, preserved: string) => {
+      const stats = await fs.lstat(preserved).catch(() => undefined);
+      if (!stats) {
+        return;
+      }
+      const target = path.join(cwd, relative);
+      if (stats.isFile()) {
+        const linked = await fs
+          .link(preserved, target)
+          .then(() => true)
+          .catch(() => false);
+        if (linked) {
+          // Failing to unlink the preserved name only leaves the same inode reachable twice, and
+          // the copy under the Git directory is the recoverable one, so it is never an error.
+          await fs.rm(preserved, { force: true }).catch(() => {});
+        }
+        return;
+      }
+      if (await fs.lstat(target).catch(() => undefined)) {
+        return;
+      }
+      await fs.rename(preserved, target).catch(() => {});
     };
     /**
      * The path a writer's file occupies on the way to `relative`, or the path itself when the
@@ -315,51 +357,76 @@ async function bindWorkerGitHubCheckout(
       return relative;
     };
     const movedAside: Array<{ relative: string; preserved: string }> = [];
+    // The incoming history is exported and materialized from its own index, held outside the
+    // checkout's index, so HEAD and the index only move after every incoming file is in place.
+    const incomingIndex = path.join(gitDirectory, "github-checkout-incoming.index");
+    const incomingEnv = { GIT_INDEX_FILE: incomingIndex };
+    let staging: string | undefined;
+    let replaced = false;
     try {
       for (const collisionPath of removableTrackedCollisions) {
         movedAside.push({ relative: collisionPath, preserved: await moveAside(collisionPath) });
       }
-    } catch (error) {
-      // Never leave the checkout half replaced: put back what this turn already moved.
-      for (const { relative, preserved } of movedAside) {
-        await fs.rename(preserved, path.join(cwd, relative)).catch(() => {});
+      // A crashed turn can leave the index behind; a stale index file is not a valid one.
+      await fs.rm(incomingIndex, { force: true });
+      await requireMoveGit(["read-tree", "FETCH_HEAD"], incomingEnv);
+      const missing = splitPaths(
+        await requireMoveGit(["ls-files", "--deleted", "-z"], incomingEnv),
+      ).filter((file) => !deletedBefore.has(file));
+      if (missing.length === 0) {
+        await requireMoveGit(["reset", "--mixed", "FETCH_HEAD"]);
+        replaced = true;
+        return;
       }
-      throw error;
-    }
-    await requireMoveGit(["reset", "--mixed", "FETCH_HEAD"]);
-    const missing = (await listMovePaths(["ls-files", "--deleted", "-z"])).filter(
-      (file) => !deletedBefore.has(file),
-    );
-    if (missing.length === 0) {
-      return;
-    }
-    const staging = await fs.mkdtemp(path.join(await ensureRecoveryDirectory(), "incoming-"));
-    try {
-      await requireMoveGit([
-        "--literal-pathspecs",
-        "checkout-index",
-        `--prefix=${staging}${path.sep}`,
-        "--",
-        ...missing,
-      ]);
+      // A submodule entry has no content to materialize; Git expects the directory to exist and
+      // reports its absence as a deletion of the entry, so those paths are created as directories.
+      const stagedEntries = splitPaths(
+        await requireMoveGit(
+          ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", ...missing],
+          incomingEnv,
+        ),
+      );
+      const gitlinks = new Set(
+        stagedEntries
+          .filter((entry) => entry.startsWith("160000 "))
+          .map((entry) => entry.slice(entry.indexOf("\t") + 1)),
+      );
+      staging = await fs.mkdtemp(path.join(await ensureRecoveryDirectory(), "incoming-"));
+      await requireMoveGit(
+        [
+          "--literal-pathspecs",
+          "checkout-index",
+          `--prefix=${staging}${path.sep}`,
+          "--",
+          ...missing,
+        ],
+        incomingEnv,
+      );
       for (const file of missing) {
+        const gitlink = gitlinks.has(file);
         const staged = path.join(staging, file);
-        const stats = await fs.lstat(staged).catch(() => undefined);
-        if (!stats) {
-          // Git writes no content for a submodule entry.
+        const stats = gitlink ? undefined : await fs.lstat(staged).catch(() => undefined);
+        if (!gitlink && !stats) {
           continue;
         }
         const target = path.join(cwd, file);
+        const place = async () => {
+          if (gitlink) {
+            await fs.mkdir(target, { recursive: true });
+            return;
+          }
+          await fs.mkdir(path.dirname(target), { recursive: true });
+          if (stats?.isSymbolicLink()) {
+            await fs.symlink(await fs.readlink(staged), target);
+          } else {
+            // Linking refuses an occupied path, so a writer's bytes are never overwritten.
+            await fs.link(staged, target);
+          }
+        };
         let materialized = false;
-        for (let attempt = 0; attempt < 4 && !materialized; attempt += 1) {
+        for (let attempt = 0; attempt < placementAttempts && !materialized; attempt += 1) {
           try {
-            await fs.mkdir(path.dirname(target), { recursive: true });
-            if (stats.isSymbolicLink()) {
-              await fs.symlink(await fs.readlink(staged), target);
-            } else {
-              // Linking refuses an occupied path, so a writer's bytes are never overwritten.
-              await fs.link(staged, target);
-            }
+            await place();
             materialized = true;
           } catch (error) {
             if (!isOccupiedPathError(error)) {
@@ -373,16 +440,38 @@ async function bindWorkerGitHubCheckout(
             if (!blocking) {
               continue;
             }
+            // Never end the loop on a move: every move has to be followed by a write into the path
+            // it freed, or the replacement is left incomplete with nothing to retry it.
+            if (attempt + 1 >= placementAttempts) {
+              break;
+            }
             await moveAside(blocking);
           }
         }
         if (!materialized) {
-          // A writer that keeps recreating the path keeps its bytes; the next turn can retry.
-          log.warn(`GitHub checkout replacement left ${path.basename(file)} in place`);
+          // The branch has not moved, so the next turn repeats this fast-forward with the writer's
+          // bytes preserved under the Git directory.
+          throw new Error(`incoming path stayed occupied while a writer kept recreating it`);
         }
       }
+      await requireMoveGit(["reset", "--mixed", "FETCH_HEAD"]);
+      replaced = true;
+    } catch (error) {
+      // Nothing has moved yet, so put the checkout back exactly as this turn found it: the paths
+      // this turn set aside are what the next turn's fast-forward expects to classify. The restored
+      // bytes never overwrite a writer's, and whatever stays under the Git directory is still
+      // recoverable from there.
+      if (!replaced) {
+        for (const { relative, preserved } of movedAside) {
+          await restoreAside(relative, preserved);
+        }
+      }
+      throw error;
     } finally {
-      await fs.rm(staging, { recursive: true, force: true });
+      if (staging) {
+        await fs.rm(staging, { recursive: true, force: true });
+      }
+      await fs.rm(incomingIndex, { force: true });
     }
   } catch (error) {
     // Checkout metadata helps direct publication; a failure must not discard the coding turn.

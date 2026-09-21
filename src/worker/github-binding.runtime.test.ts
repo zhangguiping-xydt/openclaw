@@ -480,8 +480,9 @@ describe("prepareWorkerGitHubEnvironment", () => {
     const runCommand = exec.runCommandWithTimeout;
     vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
       if (argv.includes("checkout-index")) {
-        // The replacements are already set aside and HEAD has advanced; the incoming files must
-        // still be materialized, otherwise the checkout stays half applied with no later recovery.
+        // The fence lands once the move is underway: the incoming files are staged and the
+        // approvals are set aside, but the branch has not moved yet. The bounded local work has to
+        // complete, because a turn that stopped here would leave the checkout half replaced.
         controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
       }
       return await runCommand(argv, options);
@@ -652,7 +653,7 @@ describe("prepareWorkerGitHubEnvironment", () => {
     let written = 0;
     vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
       const result = await runCommand(argv, options);
-      if (argv.includes("reset") && written === 0) {
+      if (argv.includes("checkout-index") && written === 0) {
         written += 1;
         await fs.writeFile(path.join(cwd, collision), "written while the move ran\n");
       }
@@ -703,6 +704,143 @@ describe("prepareWorkerGitHubEnvironment", () => {
     // Both blockers were set aside: a name the filesystem rejects cannot strand the first one.
     await expect(replacedBytes()).resolves.toEqual(["a bytes", "nested bytes"]);
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("keeps a writer's bytes when a failed move is rolled back", async () => {
+    const first = "aaa-first";
+    const second = "zzz-second";
+    await fs.writeFile(path.join(cwd, first), "first bytes\n");
+    await fs.writeFile(path.join(cwd, second), "second bytes\n");
+    initialHead = await commit(cwd, "Track collision files");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    for (const name of [first, second]) {
+      await fs.rm(path.join(seed, name), { force: true });
+      await fs.mkdir(path.join(seed, name));
+      await fs.writeFile(path.join(seed, name, "remote.txt"), `${name} remote\n`);
+    }
+    const remoteHead = await commit(seed, "Earlier turn");
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+    // The rollback runs when a later move fails. A writer recreating the earlier path in that
+    // window keeps its bytes, so the rollback may only restore what is still free.
+    const rename = fs.rename;
+    let recreated = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(to).includes(second)) {
+        recreated += 1;
+        await fs.writeFile(path.join(cwd, first), "written while the move ran\n");
+        throw Object.assign(new Error("ENOENT: the approved path vanished"), { code: "ENOENT" });
+      }
+      return await rename(from, to);
+    });
+
+    await prepare();
+
+    expect(recreated).toBe(1);
+    expect(remoteHead).not.toBe(initialHead);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    await expect(fs.readFile(path.join(cwd, first), "utf8")).resolves.toBe(
+      "written while the move ran\n",
+    );
+    // The restored bytes stayed recoverable instead of being written over the recreation.
+    await expect(replacedBytes()).resolves.toEqual(["first bytes"]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+  });
+
+  it("materializes a submodule entry without stranding the files after it", async () => {
+    await fs.writeFile(path.join(cwd, "base.txt"), "base bytes\n");
+    initialHead = await commit(cwd, "Track base file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    await git(
+      seed,
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      "160000,0000000000000000000000000000000000000001,a-module",
+    );
+    await fs.writeFile(path.join(seed, "z-file.txt"), "remote later\n");
+    // `git add .` would stage the submodule entry as a deletion, because the directory Git expects
+    // for it does not exist yet; the incoming history carries it the way an existing repository does.
+    await git(seed, "add", "z-file.txt");
+    await git(
+      seed,
+      "-c",
+      "user.name=Worker Fixture",
+      "-c",
+      "user.email=worker@openclaw.invalid",
+      "commit",
+      "--quiet",
+      "--no-gpg-sign",
+      "-m",
+      "Earlier turn",
+    );
+    const remoteHead = (await git(seed, "rev-parse", "HEAD")).trim();
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+    await prepare();
+
+    // A submodule entry is a directory Git expects to exist, and the file after it still lands.
+    expect((await fs.lstat(path.join(cwd, "a-module"))).isDirectory()).toBe(true);
+    await expect(fs.readFile(path.join(cwd, "z-file.txt"), "utf8")).resolves.toBe("remote later\n");
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("holds the branch when an incoming file cannot be put in place", async () => {
+    const collision = "collision";
+    await fs.writeFile(path.join(cwd, collision), "base file\n");
+    initialHead = await commit(cwd, "Track collision file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    await fs.rm(path.join(seed, collision));
+    await fs.mkdir(path.join(seed, collision));
+    await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
+    const remoteHead = await commit(seed, "Earlier turn");
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+    const before = await git(cwd, "status", "--porcelain", "-z");
+    const runCommand = exec.runCommandWithTimeout;
+    let denied = 0;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      const result = await runCommand(argv, options);
+      if (argv.includes("checkout-index") && denied === 0) {
+        denied += 1;
+        // The replacement cannot be put in place at all, after the approval was already set aside.
+        return { ...result, code: 1 };
+      }
+      return result;
+    });
+
+    await prepare();
+
+    // The branch and the index did not move, so the checkout is exactly what the next turn expects.
+    expect(denied).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    await expect(fs.readFile(path.join(cwd, collision), "utf8")).resolves.toBe("base file\n");
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe(before);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+
+    // That turn repeats the same fast-forward and completes it.
+    await prepare();
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(
+      "remote file\n",
+    );
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
   });
 
   it("preserves a tracked dirty directory that blocks an incoming file", async () => {
