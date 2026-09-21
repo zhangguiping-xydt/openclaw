@@ -65,8 +65,10 @@ async function bindWorkerGitHubCheckout(
   const requireGit = (args: string[]) => requireGitWith(args, true);
   // The move below advances the branch only once every incoming file is in place, so a turn fenced
   // partway through cannot leave the workspace half applied: it either completes its bounded local
-  // work or leaves the checkout exactly as the next turn expects it. Once the move starts it
-  // completes instead of honoring the abort.
+  // work or leaves the checkout exactly as the next turn expects it. The step that can still reach
+  // the network — exporting the incoming content, which fetches a blobless clone's missing blobs
+  // with the turn's credentials — runs while the abort is still honored, so the phase that ignores
+  // the fence only moves and links what is already on disk.
   const requireMoveGit = (args: string[], extraEnv: NodeJS.ProcessEnv = {}) =>
     requireGitWith(args, false, extraEnv);
   try {
@@ -121,6 +123,13 @@ async function bindWorkerGitHubCheckout(
     }
     const splitPaths = (stdout: string) => stdout.split("\0").filter(Boolean);
     const listPaths = async (args: string[]) => splitPaths(await requireGit(args));
+    /**
+     * The components of a Git path, which is `/`-separated on every platform: splitting on the
+     * checkout's own separator makes a nested incoming path a single component on Windows, and
+     * creating it fails with ENOENT before its parent exists. Joining back with `/` is for the same
+     * reason; `path.join` turns that into the platform's separators when an entry is created.
+     */
+    const pathComponents = (relative: string) => relative.split("/");
     const added = await listPaths([
       "diff",
       "--name-only",
@@ -399,8 +408,8 @@ async function bindWorkerGitHubCheckout(
      */
     const blockingPath = async (relative: string) => {
       let current = "";
-      for (const segment of relative.split(path.sep)) {
-        current = current ? path.join(current, segment) : segment;
+      for (const segment of pathComponents(relative)) {
+        current = current ? `${current}/${segment}` : segment;
         const stats = await fs.lstat(path.join(cwd, current)).catch(() => undefined);
         if (!stats) {
           // Nothing is in the way below this point, so the retry can create the rest itself.
@@ -450,8 +459,8 @@ async function bindWorkerGitHubCheckout(
      */
     const reachesIntendedDirectories = async (relative: string) => {
       let current = "";
-      for (const segment of relative.split(path.sep)) {
-        current = current ? path.join(current, segment) : segment;
+      for (const segment of pathComponents(relative)) {
+        current = current ? `${current}/${segment}` : segment;
         const stats = await fs.lstat(path.join(cwd, current)).catch(() => undefined);
         if (!stats?.isDirectory()) {
           return false;
@@ -471,8 +480,8 @@ async function bindWorkerGitHubCheckout(
     const createdDirectories: string[] = [];
     const createRealDirectories = async (relative: string) => {
       let current = "";
-      for (const segment of relative.split(path.sep)) {
-        current = current ? path.join(current, segment) : segment;
+      for (const segment of pathComponents(relative)) {
+        current = current ? `${current}/${segment}` : segment;
         const target = path.join(cwd, current);
         const existing = await fs.lstat(target).catch(() => undefined);
         if (existing) {
@@ -585,16 +594,31 @@ async function bindWorkerGitHubCheckout(
      * `reset --mixed` writes the checkout's index before it moves the branch, so a failure after
      * that point leaves the incoming entries staged against the head the checkout still has, and
      * every later turn would read that mixture as local work and keep skipping the fast-forward.
-     * The index is copied before the move and put back byte for byte when the move fails.
+     * The index is copied before the move and put back byte for byte when the move fails, and a
+     * checkout whose index cannot be copied is not one this turn advances: the reset writes the
+     * index anyway, and a branch ref that then refused would leave the mixture behind with no copy
+     * to put back. The copy is discarded only once it is not the checkout's own index — after the
+     * reset it describes, or after it was put back — and an unsuccessful restoration keeps it,
+     * because it then holds the only copy of the index the checkout still describes.
      */
     const previousIndex = path.join(gitDirectory, "github-checkout-previous.index");
-    let indexCopied = false;
+    let indexBackup: "absent" | "live" | "spent" = "absent";
     const backUpCheckoutIndex = async () => {
-      if (!indexCopied) {
-        indexCopied = await fs
-          .copyFile(path.join(gitDirectory, "index"), previousIndex)
-          .then(() => true)
-          .catch(() => false);
+      if (indexBackup === "absent") {
+        await fs.copyFile(path.join(gitDirectory, "index"), previousIndex);
+        indexBackup = "live";
+      }
+    };
+    const putBackCheckoutIndex = async () => {
+      if (indexBackup !== "live") {
+        return;
+      }
+      const putBack = await fs
+        .rename(previousIndex, path.join(gitDirectory, "index"))
+        .then(() => true)
+        .catch(() => false);
+      if (putBack) {
+        indexBackup = "spent";
       }
     };
     /**
@@ -626,51 +650,89 @@ async function bindWorkerGitHubCheckout(
       if (result.code !== 0) {
         throw new Error(`git reset --mixed FETCH_HEAD failed (exit ${result.code})`);
       }
+      // The index the reset wrote is the one the checkout now has, so the backup is not needed.
+      indexBackup = "spent";
     };
     let staging: string | undefined;
     let replaced = false;
     try {
-      for (const collisionPath of removableTrackedCollisions) {
-        movedAside.push({ relative: collisionPath, preserved: await moveAside(collisionPath) });
-      }
       // A crashed turn can leave the index behind; a stale index file is not a valid one.
       await fs.rm(incomingIndex, { force: true });
       await requireMoveGit(["read-tree", "FETCH_HEAD"], incomingEnv);
-      const missing = splitPaths(
+      const absent = splitPaths(
         await requireMoveGit(["ls-files", "--deleted", "-z"], incomingEnv),
       ).filter((file) => !deletedBefore.has(file));
+      // Exporting is the only step here that may reach the network: this checkout can be a blobless
+      // clone, where an entry's content is fetched from the origin on first use, and that fetch
+      // carries the turn's credentials. It therefore runs before the first mutation, while the turn
+      // still honors the fence, so a fence that lands here aborts with the checkout untouched. The
+      // approved paths are exported too, because setting them aside makes them absent: the export
+      // covers every path the move below can need, and everything after it only moves and links
+      // content that is already on disk.
+      const candidates = [...new Set([...absent, ...removableTrackedCollisions])];
+      // A submodule entry has no content to materialize; Git expects the directory to exist and
+      // reports its absence as a deletion of the entry, so those paths are created as directories.
+      const stagedEntries =
+        candidates.length === 0
+          ? []
+          : splitPaths(
+              await requireMoveGit(
+                ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", ...candidates],
+                incomingEnv,
+              ),
+            );
+      // An `ls-files --stage` line is a mode, an object name, a stage and the path.
+      const stagedPath = (entry: string) => entry.slice(entry.indexOf("\t") + 1);
+      const exportable = new Set(stagedEntries.map(stagedPath));
+      const gitlinks = new Set(
+        stagedEntries.filter((entry) => entry.startsWith("160000 ")).map(stagedPath),
+      );
+      if (exportable.size > 0) {
+        staging = await fs.mkdtemp(path.join(await ensureRecoveryDirectory(), "incoming-"));
+        try {
+          await requireGitWith(
+            [
+              "--literal-pathspecs",
+              "checkout-index",
+              `--prefix=${staging}${path.sep}`,
+              "--",
+              ...exportable,
+            ],
+            true,
+            incomingEnv,
+          );
+        } catch (error) {
+          // The export is the last cancellable step and the first one to touch the network, and
+          // nothing has been mutated under it: a fenced turn leaves the checkout as it found it.
+          if (signal?.aborted) {
+            return;
+          }
+          throw error;
+        }
+      }
+      for (const collisionPath of removableTrackedCollisions) {
+        movedAside.push({ relative: collisionPath, preserved: await moveAside(collisionPath) });
+      }
+      // Setting a path aside is what makes it absent, so the list is read again after the move: the
+      // paths this turn just emptied are exactly the ones the move below has to put back. A path a
+      // writer removed from the worktree in between is not one of those, and it is not in the export
+      // either, so it is left for the next turn rather than placed from a copy that is not there.
+      const missing = splitPaths(
+        await requireMoveGit(["ls-files", "--deleted", "-z"], incomingEnv),
+      ).filter((file) => !deletedBefore.has(file) && exportable.has(file));
       if (missing.length === 0) {
         await moveBranchToFetchedCommit();
         replaced = true;
         return;
       }
-      // A submodule entry has no content to materialize; Git expects the directory to exist and
-      // reports its absence as a deletion of the entry, so those paths are created as directories.
-      const stagedEntries = splitPaths(
-        await requireMoveGit(
-          ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", ...missing],
-          incomingEnv,
-        ),
-      );
-      const gitlinks = new Set(
-        stagedEntries
-          .filter((entry) => entry.startsWith("160000 "))
-          .map((entry) => entry.slice(entry.indexOf("\t") + 1)),
-      );
-      staging = await fs.mkdtemp(path.join(await ensureRecoveryDirectory(), "incoming-"));
-      await requireMoveGit(
-        [
-          "--literal-pathspecs",
-          "checkout-index",
-          `--prefix=${staging}${path.sep}`,
-          "--",
-          ...missing,
-        ],
-        incomingEnv,
-      );
+      const stagingDirectory = staging;
+      if (stagingDirectory === undefined) {
+        // Every path above is one the export covered, so the staging copy is what the move places.
+        throw new Error("the incoming content was not exported");
+      }
       for (const file of missing) {
         const gitlink = gitlinks.has(file);
-        const staged = path.join(staging, file);
+        const staged = path.join(stagingDirectory, file);
         const stats = gitlink ? undefined : await fs.lstat(staged).catch(() => undefined);
         if (!gitlink && !stats) {
           continue;
@@ -760,6 +822,10 @@ async function bindWorkerGitHubCheckout(
       // the index can still have moved the branch, so undoing that would restore the previous index
       // against a head it no longer describes and delete the incoming files that head holds.
       replaced ||= await branchReachedFetchedCommit();
+      if (replaced) {
+        // The branch is at the fetched commit, so the index the reset wrote is the checkout's own.
+        indexBackup = "spent";
+      }
       // Nothing has moved, so put the checkout back exactly as this turn found it: the paths this
       // turn set aside are what the next turn's fast-forward expects to classify, and the incoming
       // files this turn already placed are taken back out, or the checkout would keep them while
@@ -769,9 +835,7 @@ async function bindWorkerGitHubCheckout(
       // never overwrite a writer's bytes, so whatever is left under the Git directory is still
       // recoverable from there.
       if (!replaced) {
-        if (indexCopied) {
-          await fs.rename(previousIndex, path.join(gitDirectory, "index")).catch(() => {});
-        }
+        await putBackCheckoutIndex();
         await undoPlacements();
         for (const { relative, preserved } of movedAside) {
           await restoreAside(relative, preserved);
@@ -781,12 +845,18 @@ async function bindWorkerGitHubCheckout(
     } finally {
       // Every placed file keeps a name under the Git directory once the rollback has moved it there,
       // so the staging directory is only ever this turn's own scratch copy of the same bytes; the
-      // incoming index is a scratch file for the whole turn.
+      // incoming index is a scratch file for the whole turn. The backup is kept while it is still
+      // the only copy of the index the checkout describes, which is what an unsuccessful
+      // restoration leaves behind.
       if (staging) {
         await fs.rm(staging, { recursive: true, force: true });
       }
       await fs.rm(incomingIndex, { force: true });
-      await fs.rm(previousIndex, { force: true });
+      // "live" is the one state that must survive: it is the index the checkout still describes,
+      // reached when the reset ran and putting the copy back did not work.
+      if (indexBackup === "absent" || indexBackup === "spent") {
+        await fs.rm(previousIndex, { force: true });
+      }
     }
   } catch (error) {
     // Checkout metadata helps direct publication; a failure must not discard the coding turn.

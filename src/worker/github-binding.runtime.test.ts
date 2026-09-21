@@ -420,6 +420,67 @@ describe("prepareWorkerGitHubEnvironment", () => {
     },
   );
 
+  it("leaves the checkout untouched when the turn is fenced while the content is exported", async () => {
+    const collision = "collision";
+    await fs.writeFile(path.join(cwd, collision), "base file\n");
+    initialHead = await commit(cwd, "Track collision file");
+    await git(cwd, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    await fs.rm(path.join(seed, collision));
+    await fs.mkdir(path.join(seed, collision));
+    await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
+    const remoteHead = await commit(seed, "Earlier turn");
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+    // Exporting the incoming content is the last step that can reach the network: this checkout can
+    // be a blobless clone, where an entry's content is fetched from the origin with the turn's
+    // credentials. A fence that lands there has to abort it with the checkout untouched, instead of
+    // carrying the turn's authority into work that no longer honors the abort.
+    const controller = new AbortController();
+    const runCommand = exec.runCommandWithTimeout;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      if (argv.includes("checkout-index")) {
+        controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
+      }
+      return await runCommand(argv, options);
+    });
+    const prepareFenced = () =>
+      prepareWorkerGitHubEnvironment({
+        binding,
+        stateDir: path.join(root, "state"),
+        runId: "turn",
+        cwd,
+        signal: controller.signal,
+      });
+
+    await prepareFenced();
+
+    // Nothing was set aside and the branch did not move, so the next turn repeats the same
+    // fast-forward on the checkout it expects to find.
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    await expect(fs.readFile(path.join(cwd, collision), "utf8")).resolves.toBe("base file\n");
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(await git(cwd, "diff", "--cached", "--name-only")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+
+    // With a live signal the same fast-forward completes.
+    await prepareWorkerGitHubEnvironment({
+      binding,
+      stateDir: path.join(root, "state"),
+      runId: "turn",
+      cwd,
+      signal: new AbortController().signal,
+    });
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(
+      "remote file\n",
+    );
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+  });
+
   it("completes the move when the turn is fenced after the removals", async () => {
     const collision = "collision";
     await fs.writeFile(path.join(cwd, collision), "base file\n");
@@ -435,15 +496,16 @@ describe("prepareWorkerGitHubEnvironment", () => {
     await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
 
     const controller = new AbortController();
-    const runCommand = exec.runCommandWithTimeout;
-    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
-      if (argv.includes("checkout-index")) {
+    const rename = fs.rename;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      const result = await rename(from, to);
+      if (String(to).includes("collision-recovery") && !controller.signal.aborted) {
         // The fence lands once the move is underway: the incoming files are staged and the
         // approvals are set aside, but the branch has not moved yet. The bounded local work has to
         // complete, because a turn that stopped here would leave the checkout half replaced.
         controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
       }
-      return await runCommand(argv, options);
+      return result;
     });
     const prepareFenced = () =>
       prepareWorkerGitHubEnvironment({
@@ -624,7 +686,8 @@ describe("prepareWorkerGitHubEnvironment", () => {
       const result = await runCommand(argv, options);
       if (argv.includes("checkout-index") && denied === 0) {
         denied += 1;
-        // The replacement cannot be put in place at all, after the approval was already set aside.
+        // The replacement cannot be put in place at all: the content it would install cannot be
+        // exported, which fails the turn before anything in the checkout has been touched.
         return { ...result, code: 1 };
       }
       return result;

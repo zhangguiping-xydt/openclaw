@@ -88,13 +88,19 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
       await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
     });
 
-    // The file is already set aside here, which is the window a background command from an earlier
+    // The move sets the file aside here, which is the window a background command from an earlier
     // turn keeps running in: it recreates the path the incoming directory has to be written under.
-    const runCommand = exec.runCommandWithTimeout;
+    // The incoming content is already exported at this point, so the recreation lands between that
+    // export and the write into the path the move freed.
+    const rename = fs.rename;
     let written = 0;
-    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
-      const result = await runCommand(argv, options);
-      if (argv.includes("checkout-index") && written === 0) {
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      const result = await rename(from, to);
+      if (
+        written === 0 &&
+        String(from) === path.join(cwd, collision) &&
+        String(to).includes("collision-recovery")
+      ) {
         written += 1;
         await fs.writeFile(path.join(cwd, collision), "written while the move ran\n");
       }
@@ -275,11 +281,15 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     // and put the file outside the checkout, where nothing would own it.
     const outside = path.join(fixture.root, "outside");
     await fs.mkdir(outside);
-    const runCommand = exec.runCommandWithTimeout;
+    const rename = fs.rename;
     let redirected = 0;
-    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
-      const result = await runCommand(argv, options);
-      if (argv.includes("checkout-index") && redirected === 0) {
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      const result = await rename(from, to);
+      if (
+        redirected === 0 &&
+        String(from) === path.join(cwd, collision) &&
+        String(to).includes("collision-recovery")
+      ) {
         redirected += 1;
         await fs.symlink(outside, path.join(cwd, collision));
       }
@@ -385,6 +395,110 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     // recoverable copy under the Git directory. The incoming file the turn had placed comes back out
     // of the checkout by being moved there rather than removed, so its bytes are recoverable too.
     await expect(fixture.preservedBytes()).resolves.toEqual(["base file", "remote file"]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+  });
+
+  it("materializes a newly added nested directory one component at a time", async () => {
+    await fs.writeFile(path.join(cwd, "anchor.txt"), "anchor bytes\n");
+    initialHead = await commit(cwd, "Track anchor file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.mkdir(path.join(seed, "new", "deep"), { recursive: true });
+      await fs.writeFile(path.join(seed, "new", "deep", "file.txt"), "remote nested\n");
+    });
+
+    // Git reports the path with `/` on every platform, so a checkout that splits it on its own
+    // separator sees one component on Windows and never creates `new` before `deep`: every attempt
+    // fails with ENOENT and the turn repeats it forever. The parent chains are walked with Git's
+    // own separator, so each component is created on its own wherever the checkout runs.
+    await prepare();
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(path.join(cwd, "new", "deep", "file.txt"), "utf8")).resolves.toBe(
+      "remote nested\n",
+    );
+    await expect(fs.readdir(path.join(cwd, "new"))).resolves.toEqual(["deep"]);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("does not advance the branch when the index cannot be backed up", async () => {
+    await fs.writeFile(path.join(cwd, "added.txt"), "local bytes\n");
+    initialHead = await commit(cwd, "Track local file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.writeFile(path.join(seed, "later.txt"), "remote later\n");
+    });
+
+    // `reset --mixed` writes the index before it moves the branch, so a reset without a backup has
+    // no copy to put back when the branch ref then refuses: the incoming entries would stay staged
+    // against the head the checkout still has, and every later turn would read that mixture as its
+    // own local work. A checkout whose index cannot be copied is not one this turn advances.
+    const copyFile = fs.copyFile;
+    let refused = 0;
+    vi.spyOn(fs, "copyFile").mockImplementation(async (from, to) => {
+      if (refused === 0 && String(to).includes("github-checkout-previous.index")) {
+        refused += 1;
+        throw Object.assign(new Error("EACCES: cannot back up the index"), { code: "EACCES" });
+      }
+      return await copyFile(from, to);
+    });
+
+    await prepare();
+
+    expect(refused).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(await git(cwd, "diff", "--cached", "--name-only")).toBe("");
+    await expect(fs.lstat(path.join(cwd, "later.txt"))).rejects.toThrow();
+    await expect(fs.readFile(path.join(cwd, "added.txt"), "utf8")).resolves.toBe("local bytes\n");
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+
+    // With the copy available again the same fast-forward completes.
+    warn.mockClear();
+    await prepare();
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(path.join(cwd, "later.txt"), "utf8")).resolves.toBe("remote later\n");
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("keeps the index backup when it cannot be put back", async () => {
+    const collision = "collision";
+    await fs.writeFile(path.join(cwd, collision), "base file\n");
+    initialHead = await commit(cwd, "Track collision file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, collision));
+      await fs.mkdir(path.join(seed, collision));
+      await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
+    });
+
+    // The reset fails with the incoming entries staged against the head the checkout still has, so
+    // the backup is the only copy of the index that head describes. Putting it back can fail too,
+    // and then the cleanup may not delete what is left of it: the checkout keeps the name.
+    const lock = path.join(cwd, ".git", "refs", "heads", `${workerFixtureBranch}.lock`);
+    await fs.writeFile(lock, "");
+    const backup = path.join(cwd, ".git", "github-checkout-previous.index");
+    const rename = fs.rename;
+    let refused = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (refused === 0 && String(from) === backup) {
+        refused += 1;
+        throw Object.assign(new Error("EACCES: cannot put the index back"), { code: "EACCES" });
+      }
+      return await rename(from, to);
+    });
+
+    await prepare();
+
+    expect(refused).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    await expect(fs.lstat(backup)).resolves.toBeDefined();
     expect(warn).toHaveBeenCalledExactlyOnceWith(
       expect.stringContaining("checkout binding failed"),
     );
