@@ -272,12 +272,13 @@ async function bindWorkerGitHubCheckout(
     // and retried. The Git directory is on the checkout's own filesystem and invisible to
     // `git status`, so preserved bytes cannot be mistaken for work to publish, and they stay for
     // the lifetime of the checkout, which is discarded with the worker. Recovery names are digest
-    // based, so a legal path of any length still fits the filesystem's component limit, and a
-    // failure part way through puts back what this turn already moved without overwriting a
-    // writer's bytes. The branch and the index only move once every incoming file is in place, so
-    // a turn that cannot finish leaves the checkout exactly as the next turn expects it and that
-    // turn retries the same fast-forward; a turn that lost its authority while classifying must
-    // not start the move.
+    // based, so a legal path of any length still fits the filesystem's component limit, no
+    // placement writes through a directory a writer recreated as a symlink to somewhere else, and
+    // a failure part way through takes the placements back and puts back what this turn moved,
+    // without overwriting a writer's bytes. The branch and the index only move once every incoming
+    // file is in place, so a turn that cannot finish leaves the checkout exactly as the next turn
+    // expects it and that turn retries the same fast-forward; a turn that lost its authority while
+    // classifying must not start the move.
     if (signal?.aborted) {
       return;
     }
@@ -307,33 +308,67 @@ async function bindWorkerGitHubCheckout(
       return preserved;
     };
     /**
-     * Puts a moved path back without overwriting anything a writer put there in the meantime.
-     * Linking refuses an occupied path, so a recreation wins and the restored bytes stay
-     * recoverable under the Git directory instead of being written over it. A directory or a
-     * symlink cannot be linked back, so it returns only into a path that is still free.
+     * Every restoration refuses an occupied path instead of replacing what is there, so a writer
+     * that recreated the path in the meantime keeps its bytes and the preserved entry stays
+     * recoverable under the Git directory. Creating a link or a symlink reports the occupant on
+     * its own, and a directory is created before it is filled so the only directory a restore can
+     * ever replace is the empty one this function just made. Nothing here renames onto a path it
+     * checked first: a check is not atomic, and a rename would overwrite what appeared after it.
      */
-    const restoreAside = async (relative: string, preserved: string) => {
+    const restoreIntoFreePath = async (preserved: string, target: string): Promise<boolean> => {
       const stats = await fs.lstat(preserved).catch(() => undefined);
       if (!stats) {
-        return;
+        return false;
       }
-      const target = path.join(cwd, relative);
-      if (stats.isFile()) {
-        const linked = await fs
-          .link(preserved, target)
-          .then(() => true)
-          .catch(() => false);
-        if (linked) {
-          // Failing to unlink the preserved name only leaves the same inode reachable twice, and
-          // the copy under the Git directory is the recoverable one, so it is never an error.
-          await fs.rm(preserved, { force: true }).catch(() => {});
+      if (stats.isDirectory()) {
+        if (
+          !(await fs
+            .mkdir(target)
+            .then(() => true)
+            .catch(() => false))
+        ) {
+          return false;
         }
-        return;
+        if (
+          await fs
+            .rename(preserved, target)
+            .then(() => true)
+            .catch(() => false)
+        ) {
+          return true;
+        }
+        // Replacing the directory just created is not portable, so its entries go back one by one;
+        // an entry a writer claimed in the meantime keeps its bytes where they already are.
+        let complete = true;
+        for (const entry of await fs.readdir(preserved).catch(() => [])) {
+          const moved = await fs
+            .rename(path.join(preserved, entry), path.join(target, entry))
+            .then(() => true)
+            .catch(() => false);
+          complete = complete && moved;
+        }
+        return complete;
       }
-      if (await fs.lstat(target).catch(() => undefined)) {
-        return;
+      if (stats.isSymbolicLink()) {
+        const destination = await fs.readlink(preserved).catch(() => undefined);
+        return destination === undefined
+          ? false
+          : await fs
+              .symlink(destination, target)
+              .then(() => true)
+              .catch(() => false);
       }
-      await fs.rename(preserved, target).catch(() => {});
+      return await fs
+        .link(preserved, target)
+        .then(() => true)
+        .catch(() => false);
+    };
+    const restoreAside = async (relative: string, preserved: string) => {
+      if (await restoreIntoFreePath(preserved, path.join(cwd, relative))) {
+        // Failing to unlink the preserved name only leaves the same entry reachable twice, and the
+        // copy under the Git directory is the recoverable one, so it is never an error.
+        await fs.rm(preserved, { recursive: true, force: true }).catch(() => {});
+      }
     };
     /**
      * The path a writer's file occupies on the way to `relative`, or the path itself when the
@@ -356,7 +391,75 @@ async function bindWorkerGitHubCheckout(
       }
       return relative;
     };
+    /**
+     * Creates the directories an incoming path needs, refusing every ancestor that is not a real
+     * directory. A recursive `mkdir` resolves a symlinked ancestor and would put the incoming file
+     * wherever that link points, outside the checkout, so each component is created on its own and
+     * has to be a directory that `lstat` reports as one. A symlink a writer recreated in place of
+     * the directory this turn set aside is an occupied path, so the placement retry moves it aside
+     * like any other recreation instead of writing through it. Only the components this turn
+     * creates are recorded, so a rollback cannot remove a directory the checkout already had.
+     */
+    const createdDirectories: string[] = [];
+    const createRealDirectories = async (relative: string) => {
+      let current = "";
+      for (const segment of relative.split(path.sep)) {
+        current = current ? path.join(current, segment) : segment;
+        const target = path.join(cwd, current);
+        const existing = await fs.lstat(target).catch(() => undefined);
+        if (existing) {
+          if (!existing.isDirectory()) {
+            throw Object.assign(new Error(`${current} is not a directory`), { code: "EEXIST" });
+          }
+          continue;
+        }
+        try {
+          await fs.mkdir(target);
+        } catch (error) {
+          // Only a real directory created by someone else makes this attempt safe to continue.
+          const created = await fs.lstat(target).catch(() => undefined);
+          if (!created?.isDirectory() || !hasErrnoCode(error, "EEXIST")) {
+            throw error;
+          }
+          continue;
+        }
+        createdDirectories.push(current);
+      }
+    };
     const movedAside: Array<{ relative: string; preserved: string }> = [];
+    const placed: Array<{ relative: string; staged: string }> = [];
+    /**
+     * Undoes placements of a failed turn so the checkout goes back to what the next turn expects:
+     * the incoming files are gone and the branch never moved, so the next turn repeats the same
+     * fast-forward. Only an entry that is still exactly the one this turn placed is removed, which
+     * keeps a writer's own bytes: a hard link keeps the placed inode, a placed symlink keeps its
+     * destination, and a path a writer replaced is left where it is with the placed copy still
+     * recoverable under the Git directory. Directories are pruned only when this turn created them
+     * and only while they stayed empty, so a writer's files keep their directory.
+     */
+    const undoPlacements = async () => {
+      for (const { relative, staged } of placed.toReversed()) {
+        const target = path.join(cwd, relative);
+        const placedEntry = await fs.lstat(target).catch(() => undefined);
+        const stagedEntry = await fs.lstat(staged).catch(() => undefined);
+        if (!placedEntry || !stagedEntry || placedEntry.isDirectory()) {
+          continue;
+        }
+        const stillPlaced =
+          placedEntry.isSymbolicLink() || stagedEntry.isSymbolicLink()
+            ? placedEntry.isSymbolicLink() &&
+              stagedEntry.isSymbolicLink() &&
+              (await fs.readlink(target).catch(() => undefined)) ===
+                (await fs.readlink(staged).catch(() => undefined))
+            : placedEntry.dev === stagedEntry.dev && placedEntry.ino === stagedEntry.ino;
+        if (stillPlaced) {
+          await fs.rm(target, { force: true }).catch(() => {});
+        }
+      }
+      for (const directory of createdDirectories.toReversed()) {
+        await fs.rmdir(path.join(cwd, directory)).catch(() => {});
+      }
+    };
     // The incoming history is exported and materialized from its own index, held outside the
     // checkout's index, so HEAD and the index only move after every incoming file is in place.
     const incomingIndex = path.join(gitDirectory, "github-checkout-incoming.index");
@@ -411,11 +514,15 @@ async function bindWorkerGitHubCheckout(
         }
         const target = path.join(cwd, file);
         const place = async () => {
+          // A submodule entry has no content of its own, so the directory Git expects is the whole
+          // result; everything else needs its parent directories to exist first.
+          const directories = gitlink ? file : path.dirname(file);
+          if (directories !== ".") {
+            await createRealDirectories(directories);
+          }
           if (gitlink) {
-            await fs.mkdir(target, { recursive: true });
             return;
           }
-          await fs.mkdir(path.dirname(target), { recursive: true });
           if (stats?.isSymbolicLink()) {
             await fs.symlink(await fs.readlink(staged), target);
           } else {
@@ -453,15 +560,20 @@ async function bindWorkerGitHubCheckout(
           // bytes preserved under the Git directory.
           throw new Error(`incoming path stayed occupied while a writer kept recreating it`);
         }
+        placed.push({ relative: file, staged });
       }
       await requireMoveGit(["reset", "--mixed", "FETCH_HEAD"]);
       replaced = true;
     } catch (error) {
       // Nothing has moved yet, so put the checkout back exactly as this turn found it: the paths
-      // this turn set aside are what the next turn's fast-forward expects to classify. The restored
-      // bytes never overwrite a writer's, and whatever stays under the Git directory is still
-      // recoverable from there.
+      // this turn set aside are what the next turn's fast-forward expects to classify, and the
+      // incoming files this turn already placed are removed again, or the checkout would keep them
+      // while HEAD still holds the paths they replaced and the next turn would read that mixture
+      // as local work. The removals are limited to the exact entries this turn placed and the
+      // restorations never overwrite a writer's bytes, so whatever is left under the Git directory
+      // is still recoverable from there.
       if (!replaced) {
+        await undoPlacements();
         for (const { relative, preserved } of movedAside) {
           await restoreAside(relative, preserved);
         }

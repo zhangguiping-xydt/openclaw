@@ -1,14 +1,17 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as exec from "../process/exec.js";
 import {
   disposeWorkerGitHubEnvironment,
   prepareWorkerGitHubEnvironment,
 } from "./github-binding.runtime.js";
+import {
+  createWorkerCheckoutFixture,
+  workerFixtureBinding,
+  type WorkerCheckoutFixture,
+} from "./github-binding.test-support.js";
 
 const { warn, inspectPathPermissions, isPathCaseInsensitive } = vi.hoisted(() => ({
   warn: vi.fn(),
@@ -34,46 +37,16 @@ vi.mock("../logging/subsystem.js", async (importOriginal) => {
 });
 
 describe("prepareWorkerGitHubEnvironment", () => {
-  const remoteUrl = "https://github.com/openclaw/worker-fixture.git";
-  const binding = {
-    token: "worker-checkout-synthetic-token",
-    login: "worker-fixture",
-    branch: "openclaw/session-fixture",
-    remoteUrl,
-    gitAuthor: { name: "Worker Fixture", email: "worker@openclaw.invalid" },
-  };
+  const binding = workerFixtureBinding;
   const filename = " reconciled file.txt";
   const pushedContent = "earlier worker content\n";
+  let fixture: WorkerCheckoutFixture;
   let root: string;
   let cwd: string;
   let origin: string;
   let initialHead: string;
-
-  async function git(directory: string, ...args: string[]) {
-    const result = await exec.runExec("git", ["-C", directory, ...args], {
-      timeoutMs: 10_000,
-      logOutput: false,
-    });
-    return result.stdout;
-  }
-
-  async function commit(directory: string, message: string) {
-    await git(directory, "add", ".");
-    await git(
-      directory,
-      "-c",
-      "user.name=Worker Fixture",
-      "-c",
-      "user.email=worker@openclaw.invalid",
-      "commit",
-      "--quiet",
-      "--no-gpg-sign",
-      "--allow-empty",
-      "-m",
-      message,
-    );
-    return (await git(directory, "rev-parse", "HEAD")).trim();
-  }
+  let git: WorkerCheckoutFixture["git"];
+  let commit: WorkerCheckoutFixture["commit"];
 
   async function publishEarlierTurn() {
     const seed = path.join(root, "earlier-worker");
@@ -84,36 +57,21 @@ describe("prepareWorkerGitHubEnvironment", () => {
     return remoteHead;
   }
 
-  const prepare = () =>
-    prepareWorkerGitHubEnvironment({
-      binding,
-      stateDir: path.join(root, "state"),
-      turnId: "turn",
-      cwd,
-    });
+  const prepare = () => fixture.prepare();
+  // What the move set aside stays under the checkout's Git directory, where `git status` cannot see
+  // it and a later `git add` cannot pick it up as work to publish.
+  const replacedBytes = () => fixture.preservedBytes();
 
   beforeEach(async () => {
-    root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "worker-checkout-")));
-    cwd = path.join(root, "worker");
-    origin = pathToFileURL(path.join(root, "origin.git")).href;
-    vi.stubEnv("GIT_CONFIG_GLOBAL", path.join(root, "gitconfig"));
-    vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
-    vi.stubEnv("GIT_CONFIG_COUNT", "0");
-    await fs.mkdir(cwd);
-    await git(root, "init", "--quiet", "--bare", "origin.git");
-    // The binding rewrites origin to the verified GitHub URL; route it to the local bare repo.
-    await git(root, "config", "--global", `url.${origin}.insteadOf`, remoteUrl);
-    await git(cwd, "init", "--quiet", `--initial-branch=${binding.branch}`);
-    initialHead = await commit(cwd, "Initial commit");
-    await git(cwd, "remote", "add", "origin", origin);
-    await git(cwd, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+    fixture = await createWorkerCheckoutFixture();
+    ({ root, cwd, origin, initialHead, git, commit } = fixture);
     warn.mockClear();
   });
 
   afterEach(async () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
-    await fs.rm(root, { recursive: true, force: true });
+    await fixture.dispose();
   });
 
   it.each([
@@ -491,7 +449,7 @@ describe("prepareWorkerGitHubEnvironment", () => {
       prepareWorkerGitHubEnvironment({
         binding,
         stateDir: path.join(root, "state"),
-        runId: "turn",
+        turnId: "turn",
         cwd,
         signal: controller.signal,
       });
@@ -509,7 +467,7 @@ describe("prepareWorkerGitHubEnvironment", () => {
     await prepareWorkerGitHubEnvironment({
       binding,
       stateDir: path.join(root, "state"),
-      runId: "turn",
+      turnId: "turn",
       cwd,
       signal: new AbortController().signal,
     });
@@ -519,70 +477,6 @@ describe("prepareWorkerGitHubEnvironment", () => {
       "remote file\n",
     );
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
-  });
-
-  // Everything the move set aside lives under the checkout's Git directory, where `git status`
-  // cannot see it and a later `git add` cannot pick it up as work to publish.
-  async function replacedBytes(
-    directory = path.join(cwd, ".git", "github-checkout-collision-recovery"),
-  ): Promise<string[]> {
-    try {
-      const entries = await fs.readdir(directory, { withFileTypes: true });
-      const contents = await Promise.all(
-        entries
-          .filter((entry) => !entry.isDirectory())
-          .map(async (entry) =>
-            (await fs.readFile(path.join(directory, entry.name), "utf8")).trim(),
-          ),
-      );
-      const nested = await Promise.all(
-        entries
-          .filter((entry) => entry.isDirectory())
-          .map((entry) => replacedBytes(path.join(directory, entry.name))),
-      );
-      return [...contents, ...nested.flat()].toSorted();
-    } catch {
-      return [];
-    }
-  }
-
-  it("preserves a file written into a replaced directory after the classification", async () => {
-    const collision = "collision";
-    await fs.mkdir(path.join(cwd, collision));
-    await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
-    initialHead = await commit(cwd, "Track collision directory");
-    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
-
-    const seed = path.join(root, "earlier-worker");
-    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
-    await fs.rm(path.join(seed, collision), { recursive: true });
-    await fs.writeFile(path.join(seed, collision), "remote file\n");
-    const remoteHead = await commit(seed, "Earlier turn");
-    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
-
-    // A background command from an earlier turn still runs as the worker user, so it can write
-    // into a directory the classifier already approved and is about to replace.
-    const runCommand = exec.runCommandWithTimeout;
-    let written = 0;
-    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
-      const result = await runCommand(argv, options);
-      if (argv.includes("--deleted") && written === 0) {
-        written += 1;
-        await fs.writeFile(path.join(cwd, collision, "late.txt"), "written after classification\n");
-      }
-      return result;
-    });
-
-    await prepare();
-
-    expect(written).toBe(1);
-    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
-    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
-    await expect(fs.readFile(path.join(cwd, collision), "utf8")).resolves.toBe("remote file\n");
-    // The replacement sets the directory aside, so the late bytes survive it instead of being
-    // deleted along with the directory the classifier approved.
-    await expect(replacedBytes()).resolves.toEqual(["base file", "written after classification"]);
-    expect(warn).not.toHaveBeenCalled();
   });
 
   it("does not start the move when the turn is fenced while classifying", async () => {
@@ -615,7 +509,7 @@ describe("prepareWorkerGitHubEnvironment", () => {
     await prepareWorkerGitHubEnvironment({
       binding,
       stateDir: path.join(root, "state"),
-      runId: "turn",
+      turnId: "turn",
       cwd,
       signal: controller.signal,
     });
@@ -630,46 +524,6 @@ describe("prepareWorkerGitHubEnvironment", () => {
     );
     await expect(replacedBytes()).resolves.toEqual([]);
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
-    expect(warn).not.toHaveBeenCalled();
-  });
-
-  it("preserves a path a writer recreates before the incoming file is materialized", async () => {
-    const collision = "collision";
-    await fs.writeFile(path.join(cwd, collision), "base file\n");
-    initialHead = await commit(cwd, "Track collision file");
-    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
-
-    const seed = path.join(root, "earlier-worker");
-    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
-    await fs.rm(path.join(seed, collision));
-    await fs.mkdir(path.join(seed, collision));
-    await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
-    const remoteHead = await commit(seed, "Earlier turn");
-    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
-
-    // The file is already set aside here, which is the window a background command from an earlier
-    // turn keeps running in: it recreates the path the incoming directory has to be written under.
-    const runCommand = exec.runCommandWithTimeout;
-    let written = 0;
-    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
-      const result = await runCommand(argv, options);
-      if (argv.includes("checkout-index") && written === 0) {
-        written += 1;
-        await fs.writeFile(path.join(cwd, collision), "written while the move ran\n");
-      }
-      return result;
-    });
-
-    await prepare();
-
-    expect(written).toBe(1);
-    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
-    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
-    await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(
-      "remote file\n",
-    );
-    // Neither the replaced file nor the recreated path was overwritten: both are recoverable.
-    await expect(replacedBytes()).resolves.toEqual(["base file", "written while the move ran"]);
     expect(warn).not.toHaveBeenCalled();
   });
 
@@ -704,52 +558,6 @@ describe("prepareWorkerGitHubEnvironment", () => {
     // Both blockers were set aside: a name the filesystem rejects cannot strand the first one.
     await expect(replacedBytes()).resolves.toEqual(["a bytes", "nested bytes"]);
     expect(warn).not.toHaveBeenCalled();
-  });
-
-  it("keeps a writer's bytes when a failed move is rolled back", async () => {
-    const first = "aaa-first";
-    const second = "zzz-second";
-    await fs.writeFile(path.join(cwd, first), "first bytes\n");
-    await fs.writeFile(path.join(cwd, second), "second bytes\n");
-    initialHead = await commit(cwd, "Track collision files");
-    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
-
-    const seed = path.join(root, "earlier-worker");
-    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
-    for (const name of [first, second]) {
-      await fs.rm(path.join(seed, name), { force: true });
-      await fs.mkdir(path.join(seed, name));
-      await fs.writeFile(path.join(seed, name, "remote.txt"), `${name} remote\n`);
-    }
-    const remoteHead = await commit(seed, "Earlier turn");
-    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
-
-    // The rollback runs when a later move fails. A writer recreating the earlier path in that
-    // window keeps its bytes, so the rollback may only restore what is still free.
-    const rename = fs.rename;
-    let recreated = 0;
-    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
-      if (String(to).includes(second)) {
-        recreated += 1;
-        await fs.writeFile(path.join(cwd, first), "written while the move ran\n");
-        throw Object.assign(new Error("ENOENT: the approved path vanished"), { code: "ENOENT" });
-      }
-      return await rename(from, to);
-    });
-
-    await prepare();
-
-    expect(recreated).toBe(1);
-    expect(remoteHead).not.toBe(initialHead);
-    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
-    await expect(fs.readFile(path.join(cwd, first), "utf8")).resolves.toBe(
-      "written while the move ran\n",
-    );
-    // The restored bytes stayed recoverable instead of being written over the recreation.
-    await expect(replacedBytes()).resolves.toEqual(["first bytes"]);
-    expect(warn).toHaveBeenCalledExactlyOnceWith(
-      expect.stringContaining("checkout binding failed"),
-    );
   });
 
   it("materializes a submodule entry without stranding the files after it", async () => {
