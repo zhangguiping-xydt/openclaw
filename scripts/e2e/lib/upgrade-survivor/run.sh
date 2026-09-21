@@ -1469,12 +1469,33 @@ if [ "$NATIVE_SYSTEMD" = "1" ]; then
   run_startup_interruption_proof() {
     local proof_dir="$ARTIFACT_ROOT/startup-interruption"
     local NPM_CONFIG_REGISTRY="$NPM_CONFIG_REGISTRY" npm_config_registry="$npm_config_registry"
+    local fragment_path
+    local DOCTOR_LOG="$proof_dir/doctor.log"
     mkdir -p "$proof_dir"
+    fragment_path="$(systemctl --user show openclaw-gateway.service --property=FragmentPath --value)"
+    if [ "$native_service_created" != "1" ] || [ "$fragment_path" != "$native_unit_path" ]; then
+      echo "Refusing interruption proof for an unowned Gateway service." >&2
+      return 1
+    fi
+    record_native_systemd before-interruption
+    openclaw_e2e_maybe_timeout "$COMMAND_TIMEOUT" systemctl --user stop openclaw-gateway.service
+    if [ "$(systemctl --user show openclaw-gateway.service --property=MainPID --value)" != "0" ] ||
+      [ "$(systemctl --user show openclaw-gateway.service --property=ActiveState --value)" != "inactive" ]; then
+      echo "Native Gateway did not stop before the interruption proof." >&2
+      return 1
+    fi
+    record_native_systemd stopped-for-interruption
     OPENCLAW_NPM_REGISTRY_HOLD_FIRST_TARBALL=@openclaw/whatsapp \
       OPENCLAW_NPM_REGISTRY_HOLD_TRACE_FILE="$proof_dir/registry.jsonl" \
       openclaw_prepublish_plugin_registry_start_mounted \
       "$proof_dir/registry" interruption_registry_pid '["@openclaw/whatsapp"]'
-    node scripts/e2e/lib/upgrade-survivor/assertions.mjs assert-startup-interruption "$proof_dir"
+    node scripts/e2e/lib/upgrade-survivor/assertions.mjs assert-startup-interruption \
+      "$proof_dir" "$candidate_version" "$ARTIFACT_ROOT/pairing-record-before.json"
+    phase post-interruption-doctor run_doctor
+    phase post-interruption-config-validate validate_post_doctor_config
+    phase post-interruption-survival node scripts/e2e/lib/upgrade-survivor/assertions.mjs \
+      assert-interruption-state "$proof_dir" "$candidate_version" "$ARTIFACT_ROOT/pairing-record-before.json"
+    record_native_systemd after-interruption-doctor
     openclaw_e2e_stop_process "$interruption_registry_pid"
     interruption_registry_pid=""
   }

@@ -1459,20 +1459,37 @@ function assertPairingRecordSurvived(beforeFile, afterFile) {
   }
 }
 
-async function assertStartupInterruption(root) {
-  assertStrict.equal(process.platform, "linux");
-  const stateDir = path.join(root, "state-home");
-  fs.mkdirSync(stateDir, { recursive: false });
-  const configPath = path.join(stateDir, "openclaw.json");
-  writeJson(configPath, {
-    gateway: {
-      mode: "local",
-      port: 18790,
-      bind: "loopback",
-      auth: { mode: "token", token: "interruption-proof-token" },
-    },
-    plugins: { allow: ["whatsapp"], entries: { whatsapp: { enabled: true } } },
+function assertInterruptionState(root, expectedVersion, pairingFile, stage) {
+  const before = readJson(path.join(root, "parked-payload/install-records-before.json"));
+  const after = readInstalledPluginIndex().installRecords;
+  const otherRecords = (records) =>
+    Object.fromEntries(Object.entries(records).filter(([pluginId]) => pluginId !== "whatsapp"));
+  assertStrict.deepEqual(
+    stage === "cancelled" ? after : otherRecords(after),
+    stage === "cancelled" ? before : otherRecords(before),
+    "startup repair changed existing plugin install records",
+  );
+  assertConfigSurvived();
+  assertStateSurvived();
+  assertPairingRecordSurvived(pairingFile, path.join(root, `pairing-${stage}.json`));
+  if (stage !== "cancelled") {
+    assertNpmPluginInstall(["whatsapp", "@openclaw/whatsapp", expectedVersion, "1"]);
+  }
+  writeJson(path.join(root, `state-survival-${stage}.json`), {
+    stage,
+    stateDir: requireEnv("OPENCLAW_STATE_DIR"),
+    configAndSessions: "preserved",
+    sharedDependencies: "preserved",
+    pairingIdentityAndApproval: "preserved",
+    otherPluginRecords: "unchanged",
+    whatsapp: stage === "cancelled" ? "original record preserved" : "artifact and consent verified",
   });
+}
+
+async function assertStartupInterruption(root, expectedVersion, pairingFile) {
+  assertStrict.equal(process.platform, "linux");
+  const stateDir = requireEnv("OPENCLAW_STATE_DIR");
+  const configPath = requireEnv("OPENCLAW_CONFIG_PATH");
   const env = {
     ...process.env,
     OPENCLAW_STATE_DIR: stateDir,
@@ -1497,6 +1514,7 @@ async function assertStartupInterruption(root) {
   const evidence = {
     status: "running",
     sourceSha: process.env.OPENCLAW_DOCKER_E2E_SELECTED_SHA,
+    stateDir,
     events: [],
   };
   const event = (name, facts = {}) =>
@@ -1597,6 +1615,27 @@ async function assertStartupInterruption(root) {
     }
   };
   try {
+    assertNpmPluginInstall(["whatsapp", "@openclaw/whatsapp", expectedVersion, "1"]);
+    const records = readInstalledPluginIndex().installRecords;
+    const installPath = resolveHomePath(records.whatsapp.installPath);
+    assertStrict.ok(
+      fs.lstatSync(installPath).isDirectory(),
+      "WhatsApp payload must be a directory",
+    );
+    assertStrict.ok(
+      isPathInsideManagedNpmProjectPackageRoot({
+        stateDir: fs.realpathSync(stateDir),
+        installPath: fs.realpathSync(installPath),
+        packageName: "@openclaw/whatsapp",
+      }),
+      "refusing to park a WhatsApp payload outside this state's managed npm project",
+    );
+    const parkedRoot = path.join(root, "parked-payload");
+    fs.mkdirSync(parkedRoot, { recursive: false });
+    // Preserve the installed record and recovery payload; only the task-owned package is moved.
+    writeJson(path.join(parkedRoot, "install-records-before.json"), records);
+    fs.renameSync(installPath, path.join(parkedRoot, "whatsapp"));
+    event("payload-parked", { installPath, recoveryPath: path.join(parkedRoot, "whatsapp") });
     const first = launch("interrupted-gateway");
     await until(
       "held plugin download",
@@ -1633,10 +1672,13 @@ async function assertStartupInterruption(root) {
     assertStrict.deepEqual(survivors, [], "captured Gateway descendants survived cancellation");
     assertStrict.ok(registryEvents().some((entry) => entry.event === "disconnected"));
     event("cancelled", { ...first.outcome, leaseCount: 0, survivingProcesses: 0 });
+    assertInterruptionState(root, expectedVersion, pairingFile, "cancelled");
+    event("cancelled-state-preserved");
     const replacement = launch("replacement-gateway");
     await until("replacement readiness", replacement, isReady, 180_000);
     assertStrict.equal(leaseCount(), 0);
     assertStrict.ok(registryEvents().some((entry) => entry.event === "served"));
+    assertInterruptionState(root, expectedVersion, pairingFile, "replacement");
     event("replacement-ready", { leaseCount: 0 });
     evidence.status = "passed";
   } catch (error) {
@@ -1693,7 +1735,9 @@ async function assertStartupInterruption(root) {
 }
 
 if (command === "assert-startup-interruption") {
-  await assertStartupInterruption(process.argv[3]);
+  await assertStartupInterruption(process.argv[3], process.argv[4], process.argv[5]);
+} else if (command === "assert-interruption-state") {
+  assertInterruptionState(process.argv[3], process.argv[4], process.argv[5], "post-doctor");
 } else if (command === "snapshot-pairing-record") {
   snapshotPairingRecord(process.argv[3]);
 } else if (command === "assert-pairing-record") {

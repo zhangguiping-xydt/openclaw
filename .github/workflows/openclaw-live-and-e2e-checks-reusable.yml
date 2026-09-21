@@ -1988,6 +1988,8 @@ jobs:
             .artifacts/upgrade-survivor/*/native-systemd-*.json
             .artifacts/upgrade-survivor/*/pairing-record-*.json
             .artifacts/upgrade-survivor/*/startup-interruption/summary.json
+            .artifacts/upgrade-survivor/*/startup-interruption/pairing-*.json
+            .artifacts/upgrade-survivor/*/startup-interruption/state-survival-*.json
             .artifacts/upgrade-survivor/*/startup-interruption/registry.jsonl
             .artifacts/upgrade-survivor/*/startup-interruption/*.log
             .artifacts/upgrade-survivor/*/startup-interruption/registry/server.log
