@@ -1317,19 +1317,18 @@ phase prepare-update-restart-probe prepare_update_restart_probe
 phase configure-plugin-registry configure_plugin_registry
 phase update-candidate update_candidate
 if [ -n "${OPENCLAW_CLAWHUB_URL:-}" ]; then
-  clawhub_security_mode="required"
-  prepublish_package="@openclaw/whatsapp"
+  prepublish_plugin=whatsapp
   if configured_plugin_installs_enabled; then
-    prepublish_package="@openclaw/matrix"
+    prepublish_plugin=matrix
   fi
-  # 2026.6.35 predates the release-security endpoint. The trusted fixture still
-  # asserts its exact older request contract instead of accepting arbitrary IO.
-  if [ "$candidate_version" = "2026.6.35" ]; then
-    clawhub_security_mode="absent"
-  fi
+  # Upstream #135671 verifies the npm-primary artifact instead of requiring a
+  # ClawHub fallback request. This historical flow does not accept pending repair.
+  phase assert-prepublish-install node \
+    scripts/e2e/lib/upgrade-survivor/assertions.mjs \
+    assert-npm-plugin-install "$prepublish_plugin" "@openclaw/$prepublish_plugin" "$candidate_version" 1
   phase assert-prepublish-requests node \
     "${OPENCLAW_UPGRADE_SURVIVOR_CLAWHUB_FIXTURE_SERVER:-scripts/e2e/lib/clawhub-fixture-server.cjs}" \
-    assert-prepublish-requests "$OPENCLAW_CLAWHUB_URL" "$prepublish_package" "$candidate_version" "$clawhub_security_mode"
+    assert-no-requests "$OPENCLAW_CLAWHUB_URL"
 fi
 phase root-managed-vps-cli-usable assert_root_managed_vps_cli_usable
 phase assert-legacy-plugin-dependency-debris-before-doctor assert_legacy_plugin_dependency_debris_before_doctor
