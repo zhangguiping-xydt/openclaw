@@ -597,17 +597,20 @@ function assertStateSurvived() {
     assertAuthProfileMigrationSurvived(stateDir, stage);
   }
   const legacyRuntimeRoot = path.join(stateDir, "plugin-runtime-deps");
-  if (stage === "baseline") {
-    if (fs.existsSync(legacyRuntimeRoot)) {
-      assert(
-        fs.existsSync(path.join(legacyRuntimeRoot, "discord")),
-        "legacy plugin runtime deps root exists but discord debris is missing before doctor cleanup",
-      );
-    }
-  } else {
-    assert(
-      !fs.existsSync(legacyRuntimeRoot),
-      `legacy plugin runtime deps root survived update/doctor: ${legacyRuntimeRoot}`,
+  // Upstream #134099 preserves shared dependencies that may serve other installations.
+  for (const plugin of ["discord", "telegram", "whatsapp"]) {
+    const sentinel = path.join(
+      legacyRuntimeRoot,
+      plugin,
+      ".openclaw-runtime-deps-copy-stale",
+      "node_modules",
+      "stale-sentinel",
+      "package.json",
+    );
+    assertStrict.deepEqual(
+      readJson(sentinel),
+      { name: "stale-sentinel", version: "0.0.0" },
+      `shared plugin runtime cache changed during update/doctor: ${sentinel}`,
     );
   }
   if (scenario === "bootstrap-persona") {
@@ -624,18 +627,21 @@ function assertStateSurvived() {
     );
   }
   if (scenario === "versioned-runtime-deps") {
-    if (stage === "baseline") {
-      return;
-    }
     const version = process.env.OPENCLAW_UPGRADE_SURVIVOR_BASELINE_VERSION || "2026.4.24";
-    const runtimeRoot = path.join(stateDir, "plugin-runtime-deps");
-    const staleVersionedRoots = fs.existsSync(runtimeRoot)
-      ? fs.readdirSync(runtimeRoot).filter((entry) => entry.startsWith(`openclaw-${version}-`))
-      : [];
-    assert(
-      staleVersionedRoots.length === 0,
-      `stale versioned runtime deps survived update/doctor: ${staleVersionedRoots.join(", ")}`,
-    );
+    for (const plugin of ["discord", "feishu", "telegram", "whatsapp"]) {
+      const sentinel = path.join(
+        legacyRuntimeRoot,
+        `openclaw-${version}-${plugin}`,
+        "node_modules",
+        "stale-sentinel",
+        "package.json",
+      );
+      assertStrict.deepEqual(
+        readJson(sentinel),
+        { name: "stale-sentinel", version: "0.0.0" },
+        `versioned shared runtime cache changed during update/doctor: ${sentinel}`,
+      );
+    }
   }
 }
 
