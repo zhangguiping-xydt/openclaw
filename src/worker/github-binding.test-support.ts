@@ -13,7 +13,7 @@ import * as exec from "../process/exec.js";
 import { prepareWorkerGitHubEnvironment } from "./github-binding.runtime.js";
 import type { WorkerGitHubLaunchBinding } from "./launch-descriptor.js";
 
-export const workerFixtureRemoteUrl = "https://github.com/openclaw/worker-fixture.git";
+const workerFixtureRemoteUrl = "https://github.com/openclaw/worker-fixture.git";
 export const workerFixtureBranch = "openclaw/session-fixture";
 export const workerFixtureBinding = {
   token: "worker-checkout-synthetic-token",
@@ -24,7 +24,7 @@ export const workerFixtureBinding = {
 } satisfies WorkerGitHubLaunchBinding;
 
 /** Runs one Git command in the fixture, whose global config the fixture owns. */
-export async function fixtureGit(directory: string, ...args: string[]) {
+async function fixtureGit(directory: string, ...args: string[]) {
   const result = await exec.runExec("git", ["-C", directory, ...args], {
     timeoutMs: 10_000,
     logOutput: false,
@@ -33,7 +33,7 @@ export async function fixtureGit(directory: string, ...args: string[]) {
 }
 
 /** Commits everything a scenario prepared, so the bytes it starts from are a known revision. */
-export async function fixtureCommit(directory: string, message: string) {
+async function fixtureCommit(directory: string, message: string) {
   await fixtureGit(directory, "add", ".");
   await fixtureGit(
     directory,
@@ -63,7 +63,7 @@ async function recoveryEntries(
  * reports nothing inside its own directory, so this only ever holds what the replacement preserved
  * rather than work a later turn could publish.
  */
-export async function preservedRecoveryBytes(
+async function preservedRecoveryBytes(
   cwd: string,
   root = path.join(cwd, ".git", "github-checkout-collision-recovery"),
 ): Promise<string[]> {
@@ -85,7 +85,7 @@ export async function preservedRecoveryBytes(
 }
 
 /** Where a preserved symlink still points: a link has no bytes to compare, only a destination. */
-export async function preservedRecoveryLinks(
+async function preservedRecoveryLinks(
   cwd: string,
   root = path.join(cwd, ".git", "github-checkout-collision-recovery"),
 ): Promise<string[]> {
