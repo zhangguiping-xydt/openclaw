@@ -1949,6 +1949,10 @@ jobs:
             .artifacts/upgrade-survivor/*/update.err
             .artifacts/upgrade-survivor/*/systemctl-shim.log
             .artifacts/upgrade-survivor/*/systemctl-shim-gateway.log
+            .artifacts/upgrade-survivor/*/systemctl-shim.log.callers
+            .artifacts/upgrade-survivor/*/systemctl-shim-gateway.log.exit.json
+            .artifacts/upgrade-survivor/*/systemctl-shim-gateway.log.runtime.json
+            .artifacts/upgrade-survivor/*/systemctl-shim-gateway.log.bootstrap.log
             .artifacts/upgrade-survivor/*/healthz.json
             .artifacts/upgrade-survivor/*/readyz.json
             .artifacts/upgrade-survivor/*/status.json
