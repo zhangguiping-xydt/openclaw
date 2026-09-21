@@ -382,8 +382,9 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
       "written while the move ran\n",
     );
     // The replaced directory could not be put back without overwriting the writer, so it stays the
-    // recoverable copy under the Git directory.
-    await expect(fixture.preservedBytes()).resolves.toEqual(["base file"]);
+    // recoverable copy under the Git directory. The incoming file the turn had placed comes back out
+    // of the checkout by being moved there rather than removed, so its bytes are recoverable too.
+    await expect(fixture.preservedBytes()).resolves.toEqual(["base file", "remote file"]);
     expect(warn).toHaveBeenCalledExactlyOnceWith(
       expect.stringContaining("checkout binding failed"),
     );
@@ -426,6 +427,173 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
       "remote file\n",
     );
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("keeps bytes a writer adds after the rollback took its snapshot", async () => {
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, collision));
+    await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track collision directory");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, collision), { recursive: true });
+      await fs.writeFile(path.join(seed, collision), "remote file\n");
+    });
+    await fs.writeFile(path.join(cwd, ".git", "index.lock"), "");
+
+    // The writer lands inside the window the rollback opens between looking at the placed file and
+    // acting on what it saw. The look is answered with the state from before the write, so any
+    // comparison is already stale when it authorizes the removal: what the rollback does to a path
+    // may not depend on the order those two steps happen to run in.
+    const placed = path.join(cwd, collision);
+    const lstat = fs.lstat;
+    const runCommand = exec.runCommandWithTimeout;
+    let rollbackStarted = false;
+    let appended = 0;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      if (argv.includes("reset")) {
+        rollbackStarted = true;
+      }
+      return await runCommand(argv, options);
+    });
+    vi.spyOn(fs, "lstat").mockImplementation(async (target, options) => {
+      const stats = await lstat(target, options);
+      if (rollbackStarted && String(target) === placed && appended === 0) {
+        appended += 1;
+        await fs.appendFile(placed, "written after the snapshot\n");
+      }
+      return stats;
+    });
+
+    await prepare();
+
+    expect(appended).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    // Both copies still have a name: the writer's bytes at the path they went to, and the incoming
+    // copy the rollback moved out of the checkout.
+    await expect(fs.readFile(placed, "utf8")).resolves.toBe(
+      "remote file\nwritten after the snapshot\n",
+    );
+    await expect(replacedBytes()).resolves.toEqual([
+      "base file",
+      "remote file\nwritten after the snapshot",
+    ]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+  });
+
+  it("keeps the incoming file inside the checkout when its parent is replaced after the check", async () => {
+    const nested = "nested";
+    await fs.writeFile(path.join(cwd, "anchor.txt"), "anchor bytes\n");
+    initialHead = await commit(cwd, "Track anchor file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.mkdir(path.join(seed, nested));
+      await fs.writeFile(path.join(seed, nested, "remote.txt"), "remote file\n");
+    });
+
+    // The writer replaces the directory the replacement just created with a link to somewhere else,
+    // after the replacement checked that the parent is a real directory and before it creates the
+    // incoming file under it. Reading the path again after the entry exists is the only way to see
+    // that, and the entry has to be taken back instead of being accepted where it landed.
+    const outside = path.join(fixture.root, "outside");
+    await fs.mkdir(outside);
+    const parent = path.join(cwd, nested);
+    const target = path.join(parent, "remote.txt");
+    const link = fs.link;
+    let redirected = 0;
+    vi.spyOn(fs, "link").mockImplementation(async (from, to) => {
+      if (String(to) === target && redirected === 0) {
+        redirected += 1;
+        await fs.rm(parent, { recursive: true, force: true });
+        await fs.symlink(outside, parent);
+      }
+      return await link(from, to);
+    });
+
+    await prepare();
+
+    expect(redirected).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(target, "utf8")).resolves.toBe("remote file\n");
+    await expect(fs.readdir(outside)).resolves.toEqual([]);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    // The link is set aside like any other recreation, so the writer's directory stays reachable.
+    await expect(fixture.preservedLinks()).resolves.toEqual([outside]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("does not take a move back when only its report was truncated", async () => {
+    const collision = "collision";
+    await fs.writeFile(path.join(cwd, collision), "base file\n");
+    initialHead = await commit(cwd, "Track collision file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, collision));
+      await fs.mkdir(path.join(seed, collision));
+      await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
+    });
+
+    // `reset --mixed` prints one line per path it changes, so a large reconciliation comes back with
+    // the report cut off at the command's diagnostic cap: exit code 0, the index written and the
+    // branch moved. A truncated report is not a failed move; taking it back would restore the old
+    // index against the new head and delete the incoming file the new head already holds.
+    const runCommand = exec.runCommandWithTimeout;
+    let truncated = 0;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      const result = await runCommand(argv, options);
+      if (argv.includes("reset") && truncated === 0) {
+        truncated += 1;
+        return { ...result, stdoutTruncatedBytes: 1_048_576 };
+      }
+      return result;
+    });
+
+    await prepare();
+
+    expect(truncated).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(
+      "remote file\n",
+    );
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("puts the index back when a reset without placements cannot move the branch", async () => {
+    await fs.writeFile(path.join(cwd, "modified.txt"), "local bytes\n");
+    initialHead = await commit(cwd, "Track modified file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.writeFile(path.join(seed, "modified.txt"), "remote bytes\n");
+    });
+
+    // An incoming commit that only rewrites files materializes nothing, so there is no placement to
+    // notice the index the reset wrote before the branch ref it could not move. The backup cannot be
+    // tied to the placements: every reset writes the index first.
+    const lock = path.join(cwd, ".git", "refs", "heads", `${workerFixtureBranch}.lock`);
+    await fs.writeFile(lock, "");
+
+    await prepare();
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(await git(cwd, "diff", "--cached", "--name-only")).toBe("");
+    await expect(fs.readFile(path.join(cwd, "modified.txt"), "utf8")).resolves.toBe(
+      "local bytes\n",
+    );
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+
+    // With the branch free again, the same fast-forward completes.
+    await fs.rm(lock);
+    warn.mockClear();
+    await prepare();
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    expect(await git(cwd, "diff", "--cached", "--name-only")).toBe("");
     expect(warn).not.toHaveBeenCalled();
   });
 });
