@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as exec from "../process/exec.js";
 import {
   createWorkerCheckoutFixture,
+  workerFixtureBranch,
   type WorkerCheckoutFixture,
 } from "./github-binding.test-support.js";
 
@@ -297,6 +298,134 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
     // The link is set aside like any other recreation, so the writer's directory is still reachable.
     await expect(fixture.preservedLinks()).resolves.toEqual([outside]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("keeps a writer's bytes when a placed file is modified before the reset fails", async () => {
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, collision));
+    await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track collision directory");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, collision), { recursive: true });
+      await fs.writeFile(path.join(seed, collision), "remote file\n");
+    });
+
+    // A background command from an earlier turn appends to the file the replacement just put in
+    // place. The staging copy shares that file's inode, so a rollback that compared only inodes
+    // would take the checkout name back and drop the staging name with it, leaving the appended
+    // bytes with no name at all.
+    await fs.writeFile(path.join(cwd, ".git", "index.lock"), "");
+    const runCommand = exec.runCommandWithTimeout;
+    let appended = 0;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      if (argv.includes("reset") && appended === 0) {
+        appended += 1;
+        await fs.appendFile(path.join(cwd, collision), "appended by the writer\n");
+      }
+      return await runCommand(argv, options);
+    });
+
+    await prepare();
+
+    expect(appended).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    // The writer's bytes stayed at the path the writer claimed, and the incoming copy stayed
+    // recoverable instead of being deleted along with it.
+    await expect(fs.readFile(path.join(cwd, collision), "utf8")).resolves.toBe(
+      "remote file\nappended by the writer\n",
+    );
+    await expect(fixture.preservedBytes()).resolves.toEqual([
+      "base file",
+      "remote file\nappended by the writer",
+    ]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+  });
+
+  it("keeps a writer's bytes when a failed turn puts a replaced directory back", async () => {
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, collision));
+    await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track collision directory");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, collision), { recursive: true });
+      await fs.writeFile(path.join(seed, collision), "remote file\n");
+    });
+
+    await fs.writeFile(path.join(cwd, ".git", "index.lock"), "");
+    // Putting a directory back by replacing the one a restore just created is not portable, so a
+    // restore falls back to its entries one by one. A writer that fills the new directory inside
+    // that window owns the name it wrote: putting the entry back over it would delete those bytes.
+    const rename = fs.rename;
+    const restored = path.join(cwd, collision);
+    let filled = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(to) === restored && filled === 0 && String(from).includes(".git")) {
+        filled += 1;
+        await fs.writeFile(path.join(restored, "base.txt"), "written while the move ran\n");
+        throw Object.assign(new Error("ENOTEMPTY: the restored directory is not empty"), {
+          code: "ENOTEMPTY",
+        });
+      }
+      return await rename(from, to);
+    });
+
+    await prepare();
+
+    expect(filled).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    await expect(fs.readFile(path.join(cwd, collision, "base.txt"), "utf8")).resolves.toBe(
+      "written while the move ran\n",
+    );
+    // The replaced directory could not be put back without overwriting the writer, so it stays the
+    // recoverable copy under the Git directory.
+    await expect(fixture.preservedBytes()).resolves.toEqual(["base file"]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+  });
+
+  it("puts the index back when the branch cannot move after the index was written", async () => {
+    const collision = "collision";
+    await fs.writeFile(path.join(cwd, collision), "base file\n");
+    initialHead = await commit(cwd, "Track collision file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, collision));
+      await fs.mkdir(path.join(seed, collision));
+      await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
+    });
+
+    // `reset --mixed` writes the checkout's index before it moves the branch, so a branch ref a
+    // crashed Git left locked fails the reset with the incoming entries already staged. Taking only
+    // the working tree back would leave that mixture behind, and every later turn would read it as
+    // local work and keep skipping the fast-forward.
+    const lock = path.join(cwd, ".git", "refs", "heads", `${workerFixtureBranch}.lock`);
+    await fs.writeFile(lock, "");
+
+    await prepare();
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(await git(cwd, "diff", "--cached", "--name-only")).toBe("");
+    await expect(fs.readFile(path.join(cwd, collision), "utf8")).resolves.toBe("base file\n");
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+
+    // With the branch free again, the same fast-forward completes.
+    await fs.rm(lock);
+    warn.mockClear();
+    await prepare();
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(
+      "remote file\n",
+    );
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
     expect(warn).not.toHaveBeenCalled();
   });
 });

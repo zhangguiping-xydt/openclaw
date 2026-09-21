@@ -275,10 +275,12 @@ async function bindWorkerGitHubCheckout(
     // based, so a legal path of any length still fits the filesystem's component limit, no
     // placement writes through a directory a writer recreated as a symlink to somewhere else, and
     // a failure part way through takes the placements back and puts back what this turn moved,
-    // without overwriting a writer's bytes. The branch and the index only move once every incoming
-    // file is in place, so a turn that cannot finish leaves the checkout exactly as the next turn
-    // expects it and that turn retries the same fast-forward; a turn that lost its authority while
-    // classifying must not start the move.
+    // without overwriting a writer's bytes. A placement a writer has modified in place since is the
+    // one thing that is not taken back: those bytes are the writer's now, so they stay at the path
+    // and the incoming copy stays recoverable beside them. The branch, the index and the working
+    // tree only move once every incoming file is in place, so a turn that cannot finish leaves the
+    // checkout as the next turn expects it and that turn retries the same fast-forward; a turn that
+    // lost its authority while classifying must not start the move.
     if (signal?.aborted) {
       return;
     }
@@ -337,15 +339,18 @@ async function bindWorkerGitHubCheckout(
         ) {
           return true;
         }
-        // Replacing the directory just created is not portable, so its entries go back one by one;
-        // an entry a writer claimed in the meantime keeps its bytes where they already are.
+        // Replacing the directory just created is not portable, so its entries go back one by one
+        // through this same function: each of them refuses the name it finds occupied, and a writer
+        // that filled the new directory in the meantime keeps its bytes where they already are. An
+        // entry that could not be put back leaves the preserved copy under the Git directory, which
+        // is why the caller only discards it once every entry is back.
         let complete = true;
         for (const entry of await fs.readdir(preserved).catch(() => [])) {
-          const moved = await fs
-            .rename(path.join(preserved, entry), path.join(target, entry))
-            .then(() => true)
-            .catch(() => false);
-          complete = complete && moved;
+          const restored = await restoreIntoFreePath(
+            path.join(preserved, entry),
+            path.join(target, entry),
+          );
+          complete = restored && complete;
         }
         return complete;
       }
@@ -427,18 +432,28 @@ async function bindWorkerGitHubCheckout(
       }
     };
     const movedAside: Array<{ relative: string; preserved: string }> = [];
-    const placed: Array<{ relative: string; staged: string }> = [];
+    const placed: Array<{
+      relative: string;
+      staged: string;
+      /** Size and modification time the incoming link was created with, from the staging copy. */
+      size: number;
+      mtimeMs: number;
+    }> = [];
     /**
      * Undoes placements of a failed turn so the checkout goes back to what the next turn expects:
      * the incoming files are gone and the branch never moved, so the next turn repeats the same
      * fast-forward. Only an entry that is still exactly the one this turn placed is removed, which
      * keeps a writer's own bytes: a hard link keeps the placed inode, a placed symlink keeps its
      * destination, and a path a writer replaced is left where it is with the placed copy still
-     * recoverable under the Git directory. Directories are pruned only when this turn created them
-     * and only while they stayed empty, so a writer's files keep their directory.
+     * recoverable under the Git directory. Size and modification time are part of that comparison
+     * because a writer can append to or truncate a placed file without replacing it, and the
+     * staging copy shares its inode, so removing the checkout name would leave those bytes with no
+     * name at all. Directories are pruned only when this turn created them and only while they
+     * stayed empty, so a writer's files keep their directory.
      */
-    const undoPlacements = async () => {
-      for (const { relative, staged } of placed.toReversed()) {
+    const undoPlacements = async (): Promise<boolean> => {
+      let leftBehind = false;
+      for (const { relative, staged, size, mtimeMs } of placed.toReversed()) {
         const target = path.join(cwd, relative);
         const placedEntry = await fs.lstat(target).catch(() => undefined);
         const stagedEntry = await fs.lstat(staged).catch(() => undefined);
@@ -451,20 +466,46 @@ async function bindWorkerGitHubCheckout(
               stagedEntry.isSymbolicLink() &&
               (await fs.readlink(target).catch(() => undefined)) ===
                 (await fs.readlink(staged).catch(() => undefined))
-            : placedEntry.dev === stagedEntry.dev && placedEntry.ino === stagedEntry.ino;
+            : placedEntry.dev === stagedEntry.dev &&
+              placedEntry.ino === stagedEntry.ino &&
+              placedEntry.size === size &&
+              placedEntry.mtimeMs === mtimeMs;
         if (stillPlaced) {
           await fs.rm(target, { force: true }).catch(() => {});
+        } else {
+          // The path holds bytes this turn did not write last, so it is the writer's now: the
+          // rollback leaves it alone and the checkout keeps the incoming copy under the Git
+          // directory for recovery.
+          leftBehind = true;
         }
       }
       for (const directory of createdDirectories.toReversed()) {
         await fs.rmdir(path.join(cwd, directory)).catch(() => {});
       }
+      return leftBehind;
     };
     // The incoming history is exported and materialized from its own index, held outside the
     // checkout's index, so HEAD and the index only move after every incoming file is in place.
     const incomingIndex = path.join(gitDirectory, "github-checkout-incoming.index");
     const incomingEnv = { GIT_INDEX_FILE: incomingIndex };
+    /**
+     * `reset --mixed` writes the checkout's index before it moves the branch, so a failure after
+     * that point leaves the incoming entries staged against the head the checkout still has, and
+     * every later turn would read that mixture as local work and keep skipping the fast-forward.
+     * The index is copied before the move and put back byte for byte when the move fails.
+     */
+    const previousIndex = path.join(gitDirectory, "github-checkout-previous.index");
+    let indexCopied = false;
+    const backUpCheckoutIndex = async () => {
+      if (!indexCopied) {
+        indexCopied = await fs
+          .copyFile(path.join(gitDirectory, "index"), previousIndex)
+          .then(() => true)
+          .catch(() => false);
+      }
+    };
     let staging: string | undefined;
+    let leftPlacements = false;
     let replaced = false;
     try {
       for (const collisionPath of removableTrackedCollisions) {
@@ -560,8 +601,16 @@ async function bindWorkerGitHubCheckout(
           // bytes preserved under the Git directory.
           throw new Error(`incoming path stayed occupied while a writer kept recreating it`);
         }
-        placed.push({ relative: file, staged });
+        placed.push({
+          relative: file,
+          staged,
+          // Read from the staging copy, which only this turn can reach, so a writer that appends to
+          // the placed file later always shows up as a difference in the rollback comparison.
+          size: stats?.size ?? 0,
+          mtimeMs: stats?.mtimeMs ?? 0,
+        });
       }
+      await backUpCheckoutIndex();
       await requireMoveGit(["reset", "--mixed", "FETCH_HEAD"]);
       replaced = true;
     } catch (error) {
@@ -569,21 +618,29 @@ async function bindWorkerGitHubCheckout(
       // this turn set aside are what the next turn's fast-forward expects to classify, and the
       // incoming files this turn already placed are removed again, or the checkout would keep them
       // while HEAD still holds the paths they replaced and the next turn would read that mixture
-      // as local work. The removals are limited to the exact entries this turn placed and the
-      // restorations never overwrite a writer's bytes, so whatever is left under the Git directory
-      // is still recoverable from there.
+      // as local work. The index goes back first, because the reset that failed may have written it
+      // before it could not move the branch. The removals are limited to the exact entries this
+      // turn placed and the restorations never overwrite a writer's bytes, so whatever is left
+      // under the Git directory is still recoverable from there.
       if (!replaced) {
-        await undoPlacements();
+        if (indexCopied) {
+          await fs.rename(previousIndex, path.join(gitDirectory, "index")).catch(() => {});
+        }
+        leftPlacements = await undoPlacements();
         for (const { relative, preserved } of movedAside) {
           await restoreAside(relative, preserved);
         }
       }
       throw error;
     } finally {
-      if (staging) {
+      // The staging copy is kept whenever a placement stayed behind, because that copy is the
+      // recovery name for the bytes this turn could not take back; the incoming index is only ever
+      // this turn's own scratch file.
+      if (staging && !leftPlacements) {
         await fs.rm(staging, { recursive: true, force: true });
       }
       await fs.rm(incomingIndex, { force: true });
+      await fs.rm(previousIndex, { force: true });
     }
   } catch (error) {
     // Checkout metadata helps direct publication; a failure must not discard the coding turn.
