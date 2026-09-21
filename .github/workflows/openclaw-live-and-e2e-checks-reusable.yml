@@ -1986,6 +1986,11 @@ jobs:
             .artifacts/upgrade-survivor/*/gateway.log
             .artifacts/upgrade-survivor/*/native-systemd-*.log
             .artifacts/upgrade-survivor/*/native-systemd-*.json
+            .artifacts/upgrade-survivor/*/pairing-record-*.json
+            .artifacts/upgrade-survivor/*/startup-interruption/summary.json
+            .artifacts/upgrade-survivor/*/startup-interruption/registry.jsonl
+            .artifacts/upgrade-survivor/*/startup-interruption/*.log
+            .artifacts/upgrade-survivor/*/startup-interruption/registry/server.log
           if-no-files-found: error
 
   validate_docker_openwebui:

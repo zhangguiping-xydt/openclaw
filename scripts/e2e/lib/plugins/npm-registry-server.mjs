@@ -101,6 +101,23 @@ for (let index = 0; index < packageArgs.length; index += 3) {
   packages.set(packageName, existing);
 }
 
+const holdPackage = process.env.OPENCLAW_NPM_REGISTRY_HOLD_FIRST_TARBALL;
+const holdTraceFile = process.env.OPENCLAW_NPM_REGISTRY_HOLD_TRACE_FILE;
+if (
+  Boolean(holdPackage) !== Boolean(holdTraceFile) ||
+  (holdPackage && (!packages.has(holdPackage) || !path.isAbsolute(holdTraceFile)))
+) {
+  throw new Error("Held-download proof requires a fixture package and an absolute trace path");
+}
+const heldVersions = new Set(packages.get(holdPackage)?.versions.values());
+let heldFirstTarball = false;
+function traceHeldDownload(event) {
+  fs.appendFileSync(
+    holdTraceFile,
+    `${JSON.stringify({ event, packageName: holdPackage, atMs: Date.now() })}\n`,
+  );
+}
+
 const metadataFor = (entry, baseUrl) => ({
   name: entry.packageName,
   "dist-tags": {
@@ -258,6 +275,16 @@ async function handleRequest(request, response) {
 
   const tarballEntry = findTarballForPath(url.pathname);
   if (tarballEntry) {
+    if (heldVersions.has(tarballEntry)) {
+      if (!heldFirstTarball) {
+        heldFirstTarball = true;
+        // Keep the real npm request pending until startup cancellation disconnects it.
+        response.once("close", () => traceHeldDownload("disconnected"));
+        traceHeldDownload("held");
+        return;
+      }
+      response.once("finish", () => traceHeldDownload("served"));
+    }
     response.writeHead(200, {
       "content-type": "application/octet-stream",
       "content-length": String(tarballEntry.archive.length),

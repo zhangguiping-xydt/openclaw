@@ -1,5 +1,5 @@
 import assertStrict from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 // Assertions for upgrade-survivor E2E scenarios.
 import fs from "node:fs";
@@ -1415,7 +1415,284 @@ function assertUpdateRunSelfUpgrade([file]) {
   );
 }
 
-if (command === "list-scenarios") {
+function snapshotPairingRecord(file) {
+  const devices = Object.values(
+    readJson(path.join(requireEnv("OPENCLAW_STATE_DIR"), "devices/paired.json")),
+  ).filter((device) => device.clientId === "upgrade-survivor");
+  assertStrict.equal(devices.length, 1, "expected one seeded restart-probe device");
+  const { deviceId, publicKey, role, approvedScopes } = devices[0];
+  assertStrict.equal(role, "operator");
+  assertStrict.ok(Array.isArray(approvedScopes) && approvedScopes.includes("operator.read"));
+  writeJson(file, { deviceId, publicKey, role, approvedScopes: [...approvedScopes].sort() });
+}
+
+function assertPairingRecordSurvived(beforeFile, afterFile) {
+  const before = readJson(beforeFile);
+  const db = new DatabaseSync(
+    path.join(requireEnv("OPENCLAW_STATE_DIR"), "state/openclaw.sqlite"),
+    { readOnly: true },
+  );
+  try {
+    // Approval identity is the contract here; token contents and RPC authority are separate.
+    const row = db
+      .prepare(
+        "SELECT device_id, public_key, role, approved_scopes_json FROM device_pairing_paired WHERE device_id = ?",
+      )
+      .get(before.deviceId);
+    assertStrict.ok(row, "seeded pairing approval is missing after update and Doctor");
+    const after = {
+      deviceId: row.device_id,
+      publicKey: row.public_key,
+      role: row.role,
+      approvedScopes: JSON.parse(row.approved_scopes_json).sort(),
+    };
+    writeJson(afterFile, after);
+    assertStrict.deepEqual(after, before, "pairing identity or approved scopes changed");
+  } finally {
+    db.close();
+  }
+}
+
+async function assertStartupInterruption(root) {
+  assertStrict.equal(process.platform, "linux");
+  const stateDir = path.join(root, "state-home");
+  fs.mkdirSync(stateDir, { recursive: false });
+  const configPath = path.join(stateDir, "openclaw.json");
+  writeJson(configPath, {
+    gateway: {
+      mode: "local",
+      port: 18790,
+      bind: "loopback",
+      auth: { mode: "token", token: "interruption-proof-token" },
+    },
+    plugins: { allow: ["whatsapp"], entries: { whatsapp: { enabled: true } } },
+  });
+  const env = {
+    ...process.env,
+    OPENCLAW_STATE_DIR: stateDir,
+    OPENCLAW_CONFIG_PATH: configPath,
+    OPENCLAW_GATEWAY_PORT: "18790",
+    npm_config_cache: path.join(root, "npm-cache"),
+    NPM_CONFIG_CACHE: path.join(root, "npm-cache"),
+  };
+  for (const key of [
+    "OPENCLAW_HOME",
+    "OPENCLAW_PROFILE",
+    "OPENCLAW_AGENT_DIR",
+    "OPENCLAW_WORKSPACE_DIR",
+    "OPENCLAW_SERVICE_MARKER",
+    "OPENCLAW_SERVICE_KIND",
+    "OPENCLAW_GATEWAY_SERVICE_PID",
+    "OPENCLAW_GATEWAY_TOKEN",
+    "OPENCLAW_GATEWAY_PASSWORD",
+  ]) {
+    delete env[key];
+  }
+  const evidence = {
+    status: "running",
+    sourceSha: process.env.OPENCLAW_DOCKER_E2E_SELECTED_SHA,
+    events: [],
+  };
+  const event = (name, facts = {}) =>
+    evidence.events.push({ event: name, atMs: Date.now(), ...facts });
+  const registryEvents = () =>
+    fs.existsSync(path.join(root, "registry.jsonl"))
+      ? fs
+          .readFileSync(path.join(root, "registry.jsonl"), "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map(JSON.parse)
+      : [];
+  const leaseCount = () => {
+    const db = new DatabaseSync(path.join(stateDir, "state/openclaw.sqlite"), { readOnly: true });
+    try {
+      return db
+        .prepare("SELECT count(*) AS count FROM state_leases WHERE scope = ? AND lease_key = ?")
+        .get("core:plugin-lifecycle", "global").count;
+    } finally {
+      db.close();
+    }
+  };
+  const processIdentity = (pid) => {
+    try {
+      const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = text.slice(text.lastIndexOf(") ") + 2).split(" ");
+      return fields[0] === "Z" ? null : { startTime: fields[19], group: Number(fields[2]) };
+    } catch (error) {
+      if (error.code === "ENOENT" || error.code === "ESRCH") return null;
+      throw error;
+    }
+  };
+  const sample = (pid, observed) => {
+    const identity = processIdentity(pid);
+    if (!identity) return;
+    if (observed.has(pid) && observed.get(pid) !== identity.startTime) return;
+    observed.set(pid, identity.startTime);
+    let children;
+    try {
+      children = fs.readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8");
+    } catch (error) {
+      if (error.code === "ENOENT" || error.code === "ESRCH") return;
+      throw error;
+    }
+    for (const child of children.trim().split(/\s+/).filter(Boolean))
+      sample(Number(child), observed);
+  };
+  let interrupted = false;
+  const interrupt = () => {
+    interrupted = true;
+  };
+  process.on("SIGTERM", interrupt);
+  process.on("SIGINT", interrupt);
+  const launched = [];
+  const launch = (label) => {
+    const logPath = path.join(root, `${label}.log`);
+    const log = fs.openSync(logPath, "w");
+    const child = spawn("openclaw", ["gateway", "--port", "18790", "--bind", "loopback"], {
+      env,
+      cwd: stateDir,
+      detached: true,
+      stdio: ["ignore", log, log],
+    });
+    fs.closeSync(log);
+    const run = { child, logPath, observed: new Map(), outcome: null, error: null };
+    child.once("error", (error) => {
+      run.error = error;
+    });
+    child.once("exit", (code, signal) => {
+      run.outcome = { code, signal };
+      event(`${label}-exited`, run.outcome);
+    });
+    launched.push(run);
+    event(`${label}-spawned`, { pid: child.pid });
+    return run;
+  };
+  const until = async (label, run, check, timeoutMs, allowExit = false) => {
+    const deadline = Date.now() + timeoutMs;
+    do {
+      if (interrupted) throw new Error("Proof interrupted");
+      if (run.error) throw run.error;
+      sample(run.child.pid, run.observed);
+      if (await check()) return;
+      if (!allowExit) assertStrict.equal(run.outcome, null, `${label}: Gateway exited early`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } while (Date.now() < deadline);
+    throw new Error(`${label} exceeded ${timeoutMs}ms`);
+  };
+  const isReady = async () => {
+    try {
+      const response = await fetch("http://127.0.0.1:18790/readyz", {
+        signal: AbortSignal.timeout(1000),
+      });
+      return response.ok && (await response.json()).ready === true;
+    } catch {
+      return false;
+    }
+  };
+  try {
+    const first = launch("interrupted-gateway");
+    await until(
+      "held plugin download",
+      first,
+      () => registryEvents().some((entry) => entry.event === "held"),
+      180_000,
+    );
+    assertStrict.equal(leaseCount(), 1);
+    assertStrict.doesNotMatch(fs.readFileSync(first.logPath, "utf8"), /\[gateway\] ready/);
+    assertStrict.equal(
+      await isReady(),
+      false,
+      "interrupted Gateway became ready before cancellation",
+    );
+    event("before-signal", {
+      leaseCount: 1,
+      processes: [...first.observed].map(([pid, startTime]) => ({ pid, startTime })),
+    });
+    assertStrict.equal(first.child.kill("SIGTERM"), true);
+    event("signal-sent", { signal: "SIGTERM" });
+    await until(
+      "startup cancellation",
+      first,
+      () =>
+        first.outcome !== null && registryEvents().some((entry) => entry.event === "disconnected"),
+      60_000,
+      true,
+    );
+    assertStrict.deepEqual(first.outcome, { code: 143, signal: null });
+    assertStrict.equal(leaseCount(), 0);
+    const survivors = [...first.observed].filter(
+      ([pid, identity]) => processIdentity(pid)?.startTime === identity,
+    );
+    assertStrict.deepEqual(survivors, [], "captured Gateway descendants survived cancellation");
+    assertStrict.ok(registryEvents().some((entry) => entry.event === "disconnected"));
+    event("cancelled", { ...first.outcome, leaseCount: 0, survivingProcesses: 0 });
+    const replacement = launch("replacement-gateway");
+    await until("replacement readiness", replacement, isReady, 180_000);
+    assertStrict.equal(leaseCount(), 0);
+    assertStrict.ok(registryEvents().some((entry) => entry.event === "served"));
+    event("replacement-ready", { leaseCount: 0 });
+    evidence.status = "passed";
+  } catch (error) {
+    evidence.status = "failed";
+    evidence.error = String(error);
+    throw error;
+  } finally {
+    let cleanupError;
+    for (const run of launched) {
+      // Root-only SIGTERM above is the observation. Group termination here is cleanup only.
+      if (!run.child.pid) continue;
+      try {
+        sample(run.child.pid, run.observed);
+        const signalGroup = (signal) => {
+          const ownedGroupIsLive = [...run.observed].some(([pid, startTime]) => {
+            const current = processIdentity(pid);
+            return current?.startTime === startTime && current.group === run.child.pid;
+          });
+          if (!ownedGroupIsLive) return;
+          try {
+            process.kill(-run.child.pid, signal);
+            event("cleanup-signal", { rootPid: run.child.pid, signal });
+          } catch (error) {
+            if (error.code !== "ESRCH") throw error;
+          }
+        };
+        signalGroup("SIGTERM");
+        const deadline = Date.now() + 30_000;
+        while (!run.outcome && Date.now() < deadline)
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        signalGroup("SIGKILL");
+        const killedDeadline = Date.now() + 5000;
+        while (
+          [...run.observed].some(([pid, identity]) => processIdentity(pid)?.startTime === identity)
+        ) {
+          assertStrict.ok(Date.now() < killedDeadline, "Gateway processes survived proof cleanup");
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        event("cleanup-complete", { rootPid: run.child.pid, survivingProcesses: 0 });
+      } catch (error) {
+        cleanupError = error;
+        event("cleanup-failed", { rootPid: run.child.pid, error: String(error) });
+      }
+    }
+    if (cleanupError) {
+      evidence.status = "failed";
+      evidence.cleanupError = String(cleanupError);
+    }
+    fs.writeFileSync(path.join(root, "summary.json"), `${JSON.stringify(evidence, null, 2)}\n`);
+    process.off("SIGTERM", interrupt);
+    process.off("SIGINT", interrupt);
+    if (cleanupError) throw cleanupError;
+  }
+}
+
+if (command === "assert-startup-interruption") {
+  await assertStartupInterruption(process.argv[3]);
+} else if (command === "snapshot-pairing-record") {
+  snapshotPairingRecord(process.argv[3]);
+} else if (command === "assert-pairing-record") {
+  assertPairingRecordSurvived(process.argv[3], process.argv[4]);
+} else if (command === "list-scenarios") {
   process.stdout.write(`${JSON.stringify([...SCENARIOS])}\n`);
 } else if (command === "seed") {
   seedState();

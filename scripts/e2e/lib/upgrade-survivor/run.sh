@@ -83,6 +83,7 @@ FAILURE_PHASE=""
 FAILURE_MESSAGE=""
 gateway_pid=""
 plugin_registry_pid=""
+interruption_registry_pid=""
 clawhub_fixture_pid=""
 baseline_spec=""
 baseline_version=""
@@ -352,6 +353,7 @@ cleanup() {
   local status=0
   stop_gateway || status=$?
   openclaw_e2e_stop_process "${plugin_registry_pid:-}"
+  openclaw_e2e_stop_process "${interruption_registry_pid:-}"
   openclaw_e2e_stop_process "${clawhub_fixture_pid:-}"
   return "$status"
 }
@@ -1419,6 +1421,10 @@ phase seed-legacy-runtime-deps-symlink seed_legacy_runtime_deps_symlink
 phase resolve-candidate resolve_candidate_version
 phase configure-clawhub-fixture configure_clawhub_fixture
 phase prepare-update-restart-probe prepare_update_restart_probe
+if [ "$NATIVE_SYSTEMD" = "1" ]; then
+  phase snapshot-pairing-record node scripts/e2e/lib/upgrade-survivor/assertions.mjs \
+    snapshot-pairing-record "$ARTIFACT_ROOT/pairing-record-before.json"
+fi
 phase configure-plugin-registry configure_plugin_registry
 phase update-candidate update_candidate
 if [ "$NATIVE_SYSTEMD" = "1" ]; then
@@ -1445,6 +1451,10 @@ phase assert-legacy-plugin-dependency-debris-cleaned assert_legacy_plugin_depend
 phase assert-legacy-runtime-deps-symlink-repaired assert_legacy_runtime_deps_symlink_repaired
 phase validate-post-doctor-config validate_post_doctor_config
 phase assert-survival assert_survival
+if [ "$NATIVE_SYSTEMD" = "1" ]; then
+  phase assert-pairing-record node scripts/e2e/lib/upgrade-survivor/assertions.mjs \
+    assert-pairing-record "$ARTIFACT_ROOT/pairing-record-before.json" "$ARTIFACT_ROOT/pairing-record-after.json"
+fi
 if [ "$SCENARIO" = "sqlite-volume" ]; then
   phase assert-volume-idempotence assert_volume_idempotence
 fi
@@ -1453,6 +1463,22 @@ phase gateway-probes check_gateway_probes
 phase gateway-status check_gateway_status
 if [ "$LIVE_OPENAI" = "1" ]; then
   phase live-openai run_live_openai
+fi
+
+if [ "$NATIVE_SYSTEMD" = "1" ]; then
+  run_startup_interruption_proof() {
+    local proof_dir="$ARTIFACT_ROOT/startup-interruption"
+    local NPM_CONFIG_REGISTRY="$NPM_CONFIG_REGISTRY" npm_config_registry="$npm_config_registry"
+    mkdir -p "$proof_dir"
+    OPENCLAW_NPM_REGISTRY_HOLD_FIRST_TARBALL=@openclaw/whatsapp \
+      OPENCLAW_NPM_REGISTRY_HOLD_TRACE_FILE="$proof_dir/registry.jsonl" \
+      openclaw_prepublish_plugin_registry_start_mounted \
+      "$proof_dir/registry" interruption_registry_pid '["@openclaw/whatsapp"]'
+    node scripts/e2e/lib/upgrade-survivor/assertions.mjs assert-startup-interruption "$proof_dir"
+    openclaw_e2e_stop_process "$interruption_registry_pid"
+    interruption_registry_pid=""
+  }
+  phase startup-interruption run_startup_interruption_proof
 fi
 
 run_completed="1"
