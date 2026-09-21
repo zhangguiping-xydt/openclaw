@@ -72,6 +72,10 @@ BASELINE_RAW="${OPENCLAW_UPGRADE_SURVIVOR_BASELINE:?missing OPENCLAW_UPGRADE_SUR
 CANDIDATE_KIND="${OPENCLAW_UPGRADE_SURVIVOR_CANDIDATE_KIND:-tarball}"
 CANDIDATE_SPEC="${OPENCLAW_UPGRADE_SURVIVOR_CANDIDATE_SPEC:-${OPENCLAW_CURRENT_PACKAGE_TGZ:-}}"
 UPDATE_RESTART_MODE="${OPENCLAW_UPGRADE_SURVIVOR_UPDATE_RESTART_MODE:-manual}"
+NATIVE_SYSTEMD="${OPENCLAW_UPGRADE_SURVIVOR_NATIVE_SYSTEMD:-0}"
+native_service_created=0
+native_unit_path=""
+native_started_at=""
 ROOT_MANAGED_VPS="${OPENCLAW_UPGRADE_SURVIVOR_ROOT_MANAGED_VPS:-0}"
 COMMAND_TIMEOUT="${OPENCLAW_UPGRADE_SURVIVOR_COMMAND_TIMEOUT:-900s}"
 CURRENT_PHASE="setup"
@@ -179,6 +183,48 @@ validate_update_restart_mode() {
   esac
 }
 
+prepare_native_systemd() {
+  case "$NATIVE_SYSTEMD" in
+    0) return 0 ;;
+    1) ;;
+    *)
+      echo "OPENCLAW_UPGRADE_SURVIVOR_NATIVE_SYSTEMD must be 0 or 1." >&2
+      return 2
+      ;;
+  esac
+  if [ "$UPDATE_RESTART_MODE" != "auto-auth" ] || [ "$SCENARIO" != "base" ] ||
+    [ "$ROOT_MANAGED_VPS" != "0" ] || [ "$LIVE_OPENAI" != "0" ] ||
+    [ "$(uname -s)" != "Linux" ] || [ "$(id -u)" -eq 0 ]; then
+    echo "Native systemd proof requires synthetic non-root Linux published auto-auth base execution." >&2
+    return 2
+  fi
+  local account_home load_state
+  account_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+  native_unit_path="$account_home/.config/systemd/user/openclaw-gateway.service"
+  if [ "$HOME" != "$account_home" ] || [ -e "$account_home/.openclaw" ] || [ -L "$account_home/.openclaw" ] ||
+    [ -e "$native_unit_path" ] || [ -L "$native_unit_path" ]; then
+    echo "Native proof requires the current account's unused home and Gateway service." >&2
+    return 1
+  fi
+  systemctl --user show-environment >/dev/null
+  load_state="$(systemctl --user show openclaw-gateway.service --property=LoadState --value)" || true
+  if [ "$load_state" != "not-found" ]; then
+    echo "Native proof refuses an existing or uninspectable Gateway service." >&2
+    return 1
+  fi
+  native_started_at="$(date +%s)"
+}
+
+record_native_systemd() {
+  [ "$NATIVE_SYSTEMD" = "1" ] || return 0
+  local stage="$1"
+  systemctl --user show openclaw-gateway.service --no-pager \
+    --property=Id,FragmentPath,LoadState,ActiveState,SubState,MainPID,InvocationID,NRestarts,Result,ExecMainStatus,ExecMainCode \
+    >"$ARTIFACT_ROOT/native-systemd-$stage.log" || return "$?"
+  journalctl --user --unit=openclaw-gateway.service --since="@$native_started_at" \
+    --output=short-iso-precise --no-pager >"$ARTIFACT_ROOT/native-systemd-journal.log"
+}
+
 json_event() {
   local phase="$1"
   local status="$2"
@@ -244,6 +290,7 @@ const summary = {
   },
   installedVersion: process.env.SUMMARY_INSTALLED_VERSION || null,
   updateRestartMode: process.env.SUMMARY_UPDATE_RESTART_MODE || "manual",
+  serviceManager: process.env.OPENCLAW_UPGRADE_SURVIVOR_NATIVE_SYSTEMD === "1" ? "native-systemd" : "fixture",
   timings: {
     startupSeconds: numberOrNull(process.env.SUMMARY_START_SECONDS),
     updateRestartSeconds: numberOrNull(process.env.SUMMARY_UPDATE_RESTART_SECONDS),
@@ -267,6 +314,25 @@ NODE
 }
 
 stop_gateway() {
+  if [ "$NATIVE_SYSTEMD" = "1" ]; then
+    local native_status=0 fragment_path
+    if [ "$native_service_created" = "1" ]; then
+      record_native_systemd before-cleanup || native_status=$?
+      fragment_path="$(systemctl --user show openclaw-gateway.service --property=FragmentPath --value)" || native_status=$?
+      if [ "$fragment_path" = "$native_unit_path" ]; then
+        openclaw_e2e_maybe_timeout "$COMMAND_TIMEOUT" \
+          systemctl --user disable --now openclaw-gateway.service \
+          >"$ARTIFACT_ROOT/native-systemd-cleanup.log" 2>&1 || native_status=$?
+        record_native_systemd after-cleanup || native_status=$?
+      else
+        echo "Native Gateway identity changed; refusing to stop an unowned service." >&2
+        native_status=1
+      fi
+    fi
+    openclaw_e2e_terminate_gateways "${gateway_pid:-}"
+    gateway_pid=""
+    return "$native_status"
+  fi
   if [ -s "$SYSTEMCTL_SHIM_PID_FILE" ]; then
     systemctl --user stop openclaw-gateway.service >/dev/null 2>&1 || true
   fi
@@ -283,9 +349,11 @@ stop_gateway() {
 }
 
 cleanup() {
-  stop_gateway
+  local status=0
+  stop_gateway || status=$?
   openclaw_e2e_stop_process "${plugin_registry_pid:-}"
   openclaw_e2e_stop_process "${clawhub_fixture_pid:-}"
+  return "$status"
 }
 
 on_error() {
@@ -309,7 +377,13 @@ on_exit() {
   local status="$1"
   trap - ERR EXIT HUP INT TERM
   set +e
-  cleanup
+  local cleanup_status=0
+  cleanup || cleanup_status=$?
+  if [ "$status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+    status="$cleanup_status"
+    FAILURE_PHASE=cleanup
+    FAILURE_MESSAGE="native service cleanup or evidence capture failed"
+  fi
   if [ "$status" -eq 0 ] && [ "$run_completed" = "1" ]; then
     write_summary passed ""
   else
@@ -560,6 +634,9 @@ NODE
     "$fixture_root" \
     plugin_registry_pid \
     "${registry_args[@]}"
+  if [ "$NATIVE_SYSTEMD" = "1" ]; then
+    printf 'NPM_CONFIG_REGISTRY=%s\n' "$NPM_CONFIG_REGISTRY" >>"$OPENCLAW_STATE_DIR/.env"
+  fi
 }
 
 legacy_plugin_dependency_probe_paths() {
@@ -958,6 +1035,14 @@ write_update_restart_service_env() {
   if [ -n "${OPENCLAW_CLAWHUB_URL:-}" ]; then
     printf 'OPENCLAW_CLAWHUB_URL=%s\n' "$OPENCLAW_CLAWHUB_URL" >>"$tmp_path"
   fi
+  if [ "$NATIVE_SYSTEMD" = "1" ]; then
+    # The real user manager does not inherit the fixture process's synthetic environment.
+    local key
+    for key in CI OPENCLAW_NO_ONBOARD OPENCLAW_NO_PROMPT OPENCLAW_SKIP_PROVIDERS \
+      OPENCLAW_SKIP_CHANNELS OPENCLAW_DISABLE_BONJOUR OPENAI_API_KEY DISCORD_BOT_TOKEN TELEGRAM_BOT_TOKEN; do
+      printf '%s=%s\n' "$key" "${!key}" >>"$tmp_path"
+    done
+  fi
   chmod 600 "$tmp_path"
   mv "$tmp_path" "$dotenv_path"
 }
@@ -967,7 +1052,9 @@ prepare_update_restart_probe() {
     return 0
   fi
   echo "Preparing configured-auth gateway for automatic update restart."
-  install_update_restart_systemctl_shim
+  if [ "$NATIVE_SYSTEMD" != "1" ]; then
+    install_update_restart_systemctl_shim
+  fi
   seed_update_restart_probe_device_auth
   park_prepublish_authored_config
   local probe_status=0
@@ -985,7 +1072,22 @@ prepare_update_restart_probe() {
   fi
   assert_baseline_state
   write_update_restart_service_env
+  if [ "$NATIVE_SYSTEMD" = "1" ]; then
+    # Only the baseline bootstrap ran in the foreground. Hand it off before service installation;
+    # all candidate activation remains inside the published updater and Doctor.
+    openclaw_e2e_terminate_gateways "$gateway_pid"
+    gateway_pid=""
+    if [ -e "$native_unit_path" ] || [ -L "$native_unit_path" ]; then
+      echo "Native Gateway unit appeared before baseline installation." >&2
+      return 1
+    fi
+    native_service_created=1
+  fi
   install_update_restart_service_unit
+  if [ "$NATIVE_SYSTEMD" = "1" ]; then
+    systemctl --user is-active --quiet openclaw-gateway.service
+    record_native_systemd baseline
+  fi
 }
 
 assert_baseline_state() {
@@ -1212,7 +1314,7 @@ start_gateway() {
   start_epoch="$(node -e "process.stdout.write(String(Date.now()))")"
   env -u OPENCLAW_GATEWAY_TOKEN -u OPENCLAW_GATEWAY_PASSWORD openclaw gateway --port "$port" --bind loopback --allow-unconfigured >"$GATEWAY_LOG" 2>&1 &
   gateway_pid="$!"
-  if [ "$UPDATE_RESTART_MODE" = "auto-auth" ]; then
+  if [ "$UPDATE_RESTART_MODE" = "auto-auth" ] && [ "$NATIVE_SYSTEMD" != "1" ]; then
     printf '%s\n' "$gateway_pid" >"$SYSTEMCTL_SHIM_PID_FILE"
   fi
   openclaw_e2e_wait_gateway_ready "$gateway_pid" "$GATEWAY_LOG" 360 "$port" "${1:-strict}"
@@ -1297,6 +1399,9 @@ NODE
 
 phase storage-preflight storage_preflight
 phase validate-update-restart-mode validate_update_restart_mode
+if [ "$NATIVE_SYSTEMD" != "0" ]; then
+  phase native-systemd-preflight prepare_native_systemd
+fi
 phase reset-run-state reset_run_state
 phase install-baseline install_baseline
 phase seed-state seed_state
@@ -1316,6 +1421,9 @@ phase configure-clawhub-fixture configure_clawhub_fixture
 phase prepare-update-restart-probe prepare_update_restart_probe
 phase configure-plugin-registry configure_plugin_registry
 phase update-candidate update_candidate
+if [ "$NATIVE_SYSTEMD" = "1" ]; then
+  phase native-systemd-update-evidence record_native_systemd after-update
+fi
 if [ -n "${OPENCLAW_CLAWHUB_URL:-}" ]; then
   prepublish_plugin=whatsapp
   if configured_plugin_installs_enabled; then

@@ -1706,6 +1706,7 @@ jobs:
           install-bun: "true"
 
       - name: Hydrate live auth/profile inputs
+        if: github.repository != 'zhangguiping-xydt/openclaw' || matrix.group.docker_lanes != 'update-restart-auth'
         run: bash scripts/ci-hydrate-live-auth.sh
 
       - name: Plan targeted Docker E2E lanes
@@ -1921,6 +1922,30 @@ jobs:
           fi
           export OPENCLAW_DOCKER_ALL_BUILD=0
 
+          if [[ "$GITHUB_REPOSITORY" == "zhangguiping-xydt/openclaw" && "$DOCKER_E2E_LANES" == "update-restart-auth" ]]; then
+            test "$RUNNER_ENVIRONMENT" = github-hosted
+            test "$(ps -p 1 -o comm= | xargs)" = systemd
+            test ! -e "$HOME/.openclaw"
+            test ! -e "$HOME/.config/systemd/user/openclaw-gateway.service"
+            sudo apt-get update -qq
+            sudo apt-get install -y dbus-user-session libsystemd0
+            proof_user="$(id -un)"
+            proof_uid="$(id -u)"
+            sudo systemctl is-active --quiet systemd-logind.service
+            sudo loginctl enable-linger "$proof_user"
+            sudo systemctl start "user@${proof_uid}.service"
+            export XDG_RUNTIME_DIR="$(loginctl show-user "$proof_user" --property=RuntimePath --value)"
+            test -n "$XDG_RUNTIME_DIR"
+            test -O "$XDG_RUNTIME_DIR"
+            test -S "$XDG_RUNTIME_DIR/systemd/private"
+            systemctl --user start dbus.socket
+            test -S "$XDG_RUNTIME_DIR/bus"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+            systemctl --user show-environment >/dev/null
+            busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetId
+            export OPENCLAW_UPGRADE_SURVIVOR_NATIVE_SYSTEMD=1
+          fi
+
           node .release-harness/scripts/test-docker-all.mjs
 
       - name: Summarize targeted Docker E2E lanes
@@ -1957,6 +1982,10 @@ jobs:
             .artifacts/upgrade-survivor/*/readyz.json
             .artifacts/upgrade-survivor/*/status.json
             .artifacts/upgrade-survivor/*/status.err
+            .artifacts/upgrade-survivor/*/doctor.log
+            .artifacts/upgrade-survivor/*/gateway.log
+            .artifacts/upgrade-survivor/*/native-systemd-*.log
+            .artifacts/upgrade-survivor/*/native-systemd-*.json
           if-no-files-found: error
 
   validate_docker_openwebui:

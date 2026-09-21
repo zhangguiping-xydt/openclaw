@@ -44,6 +44,7 @@ DOCKER_RUN_TIMEOUT="${OPENCLAW_UPGRADE_SURVIVOR_DOCKER_RUN_TIMEOUT:-1200s}"
 BASELINE_SPEC="${OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPEC:-}"
 SCENARIO="${OPENCLAW_UPGRADE_SURVIVOR_SCENARIO:-base}"
 UPDATE_RESTART_MODE="${OPENCLAW_UPGRADE_SURVIVOR_UPDATE_RESTART_MODE:-manual}"
+NATIVE_SYSTEMD="${OPENCLAW_UPGRADE_SURVIVOR_NATIVE_SYSTEMD:-0}"
 COMMAND_TIMEOUT="${OPENCLAW_UPGRADE_SURVIVOR_COMMAND_TIMEOUT:-900s}"
 START_BUDGET_SECONDS="$(openclaw_e2e_read_positive_int_env OPENCLAW_UPGRADE_SURVIVOR_START_BUDGET_SECONDS 90)"
 STATUS_BUDGET_SECONDS="$(openclaw_e2e_read_positive_int_env OPENCLAW_UPGRADE_SURVIVOR_STATUS_BUDGET_SECONDS 30)"
@@ -57,6 +58,21 @@ PROBE_MAX_BODY_BYTES="$(
 ROOT_MANAGED_VPS="${OPENCLAW_UPGRADE_SURVIVOR_ROOT_MANAGED_VPS:-0}"
 LIVE_OPENAI="${OPENCLAW_UPGRADE_SURVIVOR_LIVE_OPENAI:-0}"
 LIVE_OPENAI_ENV_ARGS=()
+case "$NATIVE_SYSTEMD" in
+  0) ;;
+  1)
+    if [ "${OPENCLAW_UPGRADE_SURVIVOR_PUBLISHED_BASELINE:-0}" != "1" ] ||
+      [ "$UPDATE_RESTART_MODE" != "auto-auth" ] || [ "$SCENARIO" != "base" ] ||
+      [ "$ROOT_MANAGED_VPS" != "0" ] || [ "$LIVE_OPENAI" != "0" ]; then
+      echo "Native systemd proof requires published baseline, auto-auth, base, and synthetic non-root execution." >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "OPENCLAW_UPGRADE_SURVIVOR_NATIVE_SYSTEMD must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
 case "$LIVE_OPENAI" in
   0)
     ;;
@@ -226,6 +242,50 @@ if [ "${OPENCLAW_UPGRADE_SURVIVOR_PUBLISHED_BASELINE:-0}" = "1" ]; then
   if [ ! -f "$TRUSTED_TSX_IMPORT" ]; then
     echo "Trusted upgrade-survivor tsx loader not found: $TRUSTED_TSX_IMPORT" >&2
     exit 1
+  fi
+
+  if [ "$NATIVE_SYSTEMD" = "1" ]; then
+    if [ "$CANDIDATE_KIND" != "tarball" ]; then
+      echo "Native systemd proof requires the prepared candidate tarball." >&2
+      exit 2
+    fi
+    ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
+    NATIVE_REGISTRY_DIR="${OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR:-$AUTO_PREPUBLISH_PLUGIN_REGISTRY_ROOT/prepublish-plugin-registry}"
+    NATIVE_REGISTRY_DIR="$(cd "$NATIVE_REGISTRY_DIR" && pwd)"
+    # Reuse the registry owner's bound metadata; only filesystem paths differ on the host.
+    NATIVE_REGISTRY_ENV=()
+    for ((i = 0; i < ${#OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DOCKER_ARGS[@]}; i++)); do
+      if [ "${OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DOCKER_ARGS[i]}" = "-e" ]; then
+        i=$((i + 1))
+        NATIVE_REGISTRY_ENV+=("${OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DOCKER_ARGS[i]}")
+      fi
+    done
+    echo "Running published upgrade survivor with the native systemd user manager..."
+    (
+      cd "$HARNESS_ROOT_DIR"
+      env "${NATIVE_REGISTRY_ENV[@]}" \
+        OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR="$NATIVE_REGISTRY_DIR" \
+        OPENCLAW_TEST_STATE_FUNCTION_B64="$OPENCLAW_TEST_STATE_FUNCTION_B64" \
+        OPENCLAW_UPGRADE_SURVIVOR_BASELINE="$BASELINE_SPEC" \
+        OPENCLAW_UPGRADE_SURVIVOR_CANDIDATE_KIND=tarball \
+        OPENCLAW_UPGRADE_SURVIVOR_CANDIDATE_SPEC="$PACKAGE_TGZ" \
+        OPENCLAW_UPGRADE_SURVIVOR_SCENARIO="$SCENARIO" \
+        OPENCLAW_UPGRADE_SURVIVOR_UPDATE_RESTART_MODE="$UPDATE_RESTART_MODE" \
+        OPENCLAW_UPGRADE_SURVIVOR_COMMAND_TIMEOUT="$COMMAND_TIMEOUT" \
+        OPENCLAW_UPGRADE_SURVIVOR_TSX_IMPORT="$TRUSTED_TSX_IMPORT" \
+        OPENCLAW_UPGRADE_SURVIVOR_SUMMARY_JSON="$ARTIFACT_DIR/summary.json" \
+        OPENCLAW_UPGRADE_SURVIVOR_RUNTIME_ROOT="$ARTIFACT_DIR/runtime" \
+        OPENCLAW_UPGRADE_SURVIVOR_START_BUDGET_SECONDS="$START_BUDGET_SECONDS" \
+        OPENCLAW_UPGRADE_SURVIVOR_STATUS_BUDGET_SECONDS="$STATUS_BUDGET_SECONDS" \
+        OPENCLAW_UPGRADE_SURVIVOR_PROBE_TIMEOUT_MS="$PROBE_TIMEOUT_MS" \
+        OPENCLAW_UPGRADE_SURVIVOR_PROBE_ATTEMPT_TIMEOUT_MS="$PROBE_ATTEMPT_TIMEOUT_MS" \
+        OPENCLAW_UPGRADE_SURVIVOR_PROBE_MAX_BODY_BYTES="$PROBE_MAX_BODY_BYTES" \
+        OPENCLAW_UPGRADE_SURVIVOR_CLAWHUB_FIXTURE_SERVER="$HARNESS_ROOT_DIR/scripts/e2e/lib/clawhub-fixture-server.cjs" \
+        OPENCLAW_UPGRADE_SURVIVOR_CONFIG_PARKING_HELPER="$HARNESS_ROOT_DIR/scripts/e2e/lib/upgrade-survivor/config-parking.mjs" \
+        timeout --kill-after=30s "$DOCKER_RUN_TIMEOUT" bash scripts/e2e/lib/upgrade-survivor/run.sh
+    )
+    run_completed="1"
+    exit 0
   fi
 
   docker_e2e_build_or_reuse "$IMAGE_NAME" upgrade-survivor "$ROOT_DIR/scripts/e2e/Dockerfile" "$ROOT_DIR" "bare" "$SKIP_BUILD"
