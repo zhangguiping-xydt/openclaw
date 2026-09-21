@@ -390,6 +390,78 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     );
   });
 
+  it("keeps a file a writer adds while a restored directory is emptied", async () => {
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, collision));
+    await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track collision directory");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, collision), { recursive: true });
+      await fs.writeFile(path.join(seed, collision), "remote file\n");
+    });
+
+    await fs.writeFile(path.join(cwd, ".git", "index.lock"), "");
+    // Putting a directory back by replacing one that a writer filled inside the window is not
+    // portable, so a restore falls back to its entries one by one. This time every entry fits, which
+    // is the branch that cleans the preserved directory up afterwards. A background command whose
+    // working directory was inside the directory the replacement set aside is still there after the
+    // move, and a file it creates once the entries have been enumerated has no other name.
+    const restored = path.join(cwd, collision);
+    const rename = fs.rename;
+    const link = fs.link;
+    let preserved = "";
+    let recreated = 0;
+    let late = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (
+        recreated === 0 &&
+        String(to) === restored &&
+        String(from).includes("collision-recovery")
+      ) {
+        recreated += 1;
+        preserved = String(from);
+        await fs.writeFile(path.join(restored, "writer.txt"), "written while the move ran\n");
+      }
+      return await rename(from, to);
+    });
+    vi.spyOn(fs, "link").mockImplementation(async (from, to) => {
+      const created = await link(from, to);
+      if (late === 0 && preserved !== "" && String(from).startsWith(preserved)) {
+        late += 1;
+        await fs.writeFile(
+          path.join(preserved, "late.txt"),
+          "written while the directory was emptied\n",
+        );
+      }
+      return created;
+    });
+
+    await prepare();
+
+    expect(recreated).toBe(1);
+    expect(late).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    await expect(fs.readFile(path.join(cwd, collision, "base.txt"), "utf8")).resolves.toBe(
+      "base file\n",
+    );
+    await expect(fs.readFile(path.join(cwd, collision, "writer.txt"), "utf8")).resolves.toBe(
+      "written while the move ran\n",
+    );
+    // Every entry went back and the writer's own file was never overwritten, while the file created
+    // after the enumeration keeps the only name it has: the cleanup can only take a directory that
+    // has nothing left in it. The incoming copy the rollback moved out of the checkout is there as
+    // well, so nothing this turn wrote is deleted either.
+    await expect(replacedBytes()).resolves.toEqual([
+      "base file",
+      "remote file",
+      "written while the directory was emptied",
+    ]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+  });
+
   it("puts the index back when the branch cannot move after the index was written", async () => {
     const collision = "collision";
     await fs.writeFile(path.join(cwd, collision), "base file\n");
@@ -522,6 +594,49 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
     // The link is set aside like any other recreation, so the writer's directory stays reachable.
     await expect(fixture.preservedLinks()).resolves.toEqual([outside]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("keeps the incoming file at its own path when a parent links to another checkout path", async () => {
+    const nested = "nested";
+    const other = "other";
+    await fs.writeFile(path.join(cwd, "anchor.txt"), "anchor bytes\n");
+    initialHead = await commit(cwd, "Track anchor file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.mkdir(path.join(seed, nested));
+      await fs.writeFile(path.join(seed, nested, "remote.txt"), "remote file\n");
+    });
+
+    // A link to another path in the same checkout keeps the resolved parent inside the checkout, so
+    // a check that only asks whether the entry landed inside the root accepts it at the link's
+    // target while the path the incoming commit names stays empty, and no later turn repairs that.
+    // The parent chain has to be read again for what it is, not only for where it points.
+    const elsewhere = path.join(cwd, other);
+    await fs.mkdir(elsewhere);
+    const parent = path.join(cwd, nested);
+    const target = path.join(parent, "remote.txt");
+    const link = fs.link;
+    let redirected = 0;
+    vi.spyOn(fs, "link").mockImplementation(async (from, to) => {
+      if (String(to) === target && redirected === 0) {
+        redirected += 1;
+        await fs.rm(parent, { recursive: true, force: true });
+        await fs.symlink(elsewhere, parent);
+      }
+      return await link(from, to);
+    });
+
+    await prepare();
+
+    expect(redirected).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(target, "utf8")).resolves.toBe("remote file\n");
+    // Nothing was written at the link's target, and the link is set aside like any other
+    // recreation, so the writer's own directory stays reachable.
+    await expect(fs.readdir(elsewhere)).resolves.toEqual([]);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    await expect(fixture.preservedLinks()).resolves.toEqual([elsewhere]);
     expect(warn).not.toHaveBeenCalled();
   });
 

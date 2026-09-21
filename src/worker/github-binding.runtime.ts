@@ -370,11 +370,26 @@ async function bindWorkerGitHubCheckout(
         .catch(() => false);
     };
     const restoreAside = async (relative: string, preserved: string) => {
-      if (await restoreIntoFreePath(preserved, path.join(cwd, relative))) {
-        // Failing to unlink the preserved name only leaves the same entry reachable twice, and the
-        // copy under the Git directory is the recoverable one, so it is never an error.
-        await fs.rm(preserved, { recursive: true, force: true }).catch(() => {});
+      if (!(await restoreIntoFreePath(preserved, path.join(cwd, relative)))) {
+        return;
       }
+      // Failing to unlink the preserved name only leaves the same entry reachable twice, and the
+      // copy under the Git directory is the recoverable one, so it is never an error.
+      const entry = await fs.lstat(preserved).catch(() => undefined);
+      if (!entry) {
+        return;
+      }
+      if (!entry.isDirectory()) {
+        await fs.rm(preserved, { force: true }).catch(() => {});
+        return;
+      }
+      // A restored directory is emptied by a non-recursive `rmdir`, never by a recursive removal.
+      // A background command that kept its working directory inside the directory this turn moved
+      // can create a file there after the restoration enumerated the entries, and that file's only
+      // name is the one under the Git directory: a recursive removal would take those bytes with
+      // it. `rmdir` reports the directory as not empty instead, which leaves the name, the entries
+      // that were restored and were never deleted, and the late file all recoverable.
+      await fs.rmdir(preserved).catch(() => {});
     };
     /**
      * The path a writer's file occupies on the way to `relative`, or the path itself when the
@@ -425,6 +440,26 @@ async function bindWorkerGitHubCheckout(
       await fs.rename(target, preserved).catch(() => {});
     };
     /**
+     * Whether a checkout-relative path is still reached through the directories this turn approved,
+     * which is stricter than resolving inside the root: a writer that replaces one of them with a
+     * link to another path in the same checkout keeps the resolved parent inside the checkout while
+     * everything created below the link lands at the link's target, so the intended Git path stays
+     * empty and no later turn repairs it. Each component is read again and has to be a directory
+     * `lstat` reports as one — the same test `createRealDirectories` applies to every component it
+     * accepts — so a link, wherever it points, is not a directory this path runs through.
+     */
+    const reachesIntendedDirectories = async (relative: string) => {
+      let current = "";
+      for (const segment of relative.split(path.sep)) {
+        current = current ? path.join(current, segment) : segment;
+        const stats = await fs.lstat(path.join(cwd, current)).catch(() => undefined);
+        if (!stats?.isDirectory()) {
+          return false;
+        }
+      }
+      return true;
+    };
+    /**
      * Creates the directories an incoming path needs, refusing every ancestor that is not a real
      * directory. A recursive `mkdir` resolves a symlinked ancestor and would put the incoming file
      * wherever that link points, outside the checkout, so each component is created on its own and
@@ -463,6 +498,13 @@ async function bindWorkerGitHubCheckout(
         // occupied path, which moves the link aside before the next attempt writes through it.
         if (!(await resolvesInsideCheckout(target))) {
           throw Object.assign(new Error(`${current} is outside the checkout`), { code: "EEXIST" });
+        }
+        // A link to another path inside the checkout keeps the resolved parent inside the root, so
+        // containment alone accepts a directory that the intended path does not reach.
+        if (!(await reachesIntendedDirectories(current))) {
+          throw Object.assign(new Error(`${current} is behind a link in the checkout`), {
+            code: "EEXIST",
+          });
         }
       }
     };
@@ -658,6 +700,16 @@ async function bindWorkerGitHubCheckout(
           if (!(await resolvesInsideCheckout(target))) {
             await takeBackMisplaced(file, target);
             throw Object.assign(new Error(`${file} landed outside the checkout`), {
+              code: "EEXIST",
+            });
+          }
+          // A link to another path in the same checkout resolves inside the root, so it passes the
+          // check above while the entry sits at the link's target and the incoming path stays
+          // empty. The parent chain is read again for that: the paths this turn approved have to be
+          // the directories the entry was created through, and anything else is taken back.
+          if (!(await reachesIntendedDirectories(path.dirname(file)))) {
+            await takeBackMisplaced(file, target);
+            throw Object.assign(new Error(`${file} landed behind a link in the checkout`), {
               code: "EEXIST",
             });
           }
