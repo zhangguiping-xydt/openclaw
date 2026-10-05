@@ -698,6 +698,40 @@ describe("prepareWorkerGitHubEnvironment", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("does not start the move when the turn is fenced while the index is copied", async () => {
+    await fs.writeFile(path.join(cwd, "tracked.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track base file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.writeFile(path.join(seed, "tracked.txt"), "remote bytes\n");
+    });
+
+    // An incoming history that only rewrites files materializes nothing, so the reset that advances
+    // the branch is the first mutation of the turn — and the index copy ahead of it is a filesystem
+    // call that does not observe the abort. A turn fenced while that copy ran has changed nothing
+    // yet, so it owes the checkout an untouched working tree and an unmoved HEAD instead of the
+    // index and the branch the reset would have written.
+    const controller = new AbortController();
+    const copyFile = fs.copyFile;
+    vi.spyOn(fs, "copyFile").mockImplementation(async (from, to) => {
+      const result = await copyFile(from, to);
+      if (String(to).includes("previous.index") && !controller.signal.aborted) {
+        controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
+      }
+      return result;
+    });
+    const runner = vi.spyOn(exec, "runCommandWithTimeout");
+
+    await fixture.prepare({ signal: controller.signal });
+
+    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(remoteHead).not.toBe(initialHead);
+    await expect(fs.readFile(path.join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base file\n");
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("replaces a collision whose path exceeds the recovery name limit", async () => {
     const long = "l".repeat(140);
     const nested = `${long}/${long}`;

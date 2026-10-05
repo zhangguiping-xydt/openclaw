@@ -853,6 +853,52 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("leaves a writer's own file in place when a placement's parent is swapped for a link to it", async () => {
+    const nested = "nested";
+    await fs.writeFile(path.join(cwd, "anchor.txt"), "anchor bytes\n");
+    initialHead = await commit(cwd, "Track anchor file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.mkdir(path.join(seed, nested));
+      await fs.writeFile(path.join(seed, nested, "remote.txt"), "remote file\n");
+    });
+
+    // A take-back resolves the path it is refusing again, and the writer can change what that name
+    // means after the placement already succeeded: renaming the directory the entry was made in and
+    // putting a link to a directory of its own in its place makes the pathname name the writer's
+    // file. That file is not this turn's to move, so the entry the turn created is identified before
+    // the take-back runs: an entry that is not it keeps its name and its bytes, and the retry moves
+    // the link aside instead of taking the writer's file away with the placement.
+    const outside = path.join(fixture.root, "outside");
+    await fs.mkdir(outside);
+    const outsideFile = path.join(outside, "remote.txt");
+    await fs.writeFile(outsideFile, "outside file\n");
+    const parent = path.join(cwd, nested);
+    const target = path.join(parent, "remote.txt");
+    const link = fs.link;
+    let redirected = 0;
+    vi.spyOn(fs, "link").mockImplementation(async (from, to) => {
+      const result = await link(from, to);
+      if (String(to) === target && redirected === 0) {
+        redirected += 1;
+        await fs.rm(parent, { recursive: true, force: true });
+        await fs.symlink(outside, parent);
+      }
+      return result;
+    });
+
+    await prepare();
+
+    expect(redirected).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(target, "utf8")).resolves.toBe("remote file\n");
+    await expect(fs.readFile(outsideFile, "utf8")).resolves.toBe("outside file\n");
+    await expect(replacedBytes()).resolves.toEqual([]);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    await expect(fixture.preservedLinks()).resolves.toEqual([outside]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("keeps the incoming file at its own path when a parent links to another checkout path", async () => {
     const nested = "nested";
     const other = "other";

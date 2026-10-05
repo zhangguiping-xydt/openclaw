@@ -13,7 +13,7 @@ import { executeGitCommand } from "../infra/git-exec.js";
 import { isPathCaseInsensitive } from "../infra/path-case.js";
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import { createCheckoutPaths } from "./github-binding.checkout-paths.js";
+import { createCheckoutPaths, type CreatedEntry } from "./github-binding.checkout-paths.js";
 import type { WorkerGitHubLaunchBinding } from "./launch-descriptor.js";
 
 const log = createSubsystemLogger("worker/github");
@@ -125,22 +125,6 @@ async function bindWorkerGitHubCheckout(
     }
     const splitPaths = (stdout: string) => stdout.split("\0").filter(Boolean);
     const listPaths = async (args: string[]) => splitPaths(await requireGit(args));
-    /**
-     * The components of a Git path, which is `/`-separated on every platform: splitting on the
-     * checkout's own separator makes a nested incoming path a single component on Windows, and
-     * creating it fails with ENOENT before its parent exists. Joining back with `/` is for the same
-     * reason; `path.join` turns that into the platform's separators when an entry is created.
-     */
-    // The directory-boundary rules a placement has to satisfy live in their own module: each rule
-    // re-reads the filesystem instead of trusting an earlier check, and every creation site uses the
-    // same ones, so they are kept together rather than beside the code that calls them.
-    const {
-      blockingPath,
-      resolvesInsideCheckout,
-      reachesIntendedDirectories,
-      createdDirectories,
-      createRealDirectories,
-    } = createCheckoutPaths(cwd);
     const added = await listPaths([
       "diff",
       "--name-only",
@@ -331,6 +315,19 @@ async function bindWorkerGitHubCheckout(
       const digest = sha256HexPrefixCore(relative.split(path.sep).join("/"), 16);
       return `${recoverySequence}-${digest}${leaf.length <= 64 ? `-${leaf}` : ""}`;
     };
+    // The path rules a placement and a take-back both owe live in their own module: each one re-reads
+    // the filesystem instead of trusting an earlier check, and every creation site uses the same
+    // ones, so they are kept together rather than beside the code that calls them. The take-back
+    // writes into the recovery directory this turn just named, so it is handed the two callbacks
+    // that describe it.
+    const {
+      blockingPath,
+      resolvesInsideCheckout,
+      reachesIntendedDirectories,
+      createdDirectories,
+      createRealDirectories,
+      takeBackMisplaced,
+    } = createCheckoutPaths(cwd, { ensureRecoveryDirectory, recoveryName });
     /** Replacing a path means moving it aside, so a writer's bytes survive at one of the two. */
     const moveAside = async (relative: string) => {
       const preserved = path.join(await ensureRecoveryDirectory(), recoveryName(relative));
@@ -374,7 +371,7 @@ async function bindWorkerGitHubCheckout(
       const landed = async () =>
         (await resolvesInsideCheckout(target)) &&
         (await reachesIntendedDirectories(path.dirname(relativeTarget)));
-      const createRestored = async (create: () => Promise<unknown>) => {
+      const createRestored = async (created: CreatedEntry, create: () => Promise<unknown>) => {
         if (!(await reachesIntendedDirectories(path.dirname(relativeTarget)))) {
           return false;
         }
@@ -388,7 +385,7 @@ async function bindWorkerGitHubCheckout(
         if (await landed()) {
           return true;
         }
-        await takeBackMisplaced(relativeTarget, target);
+        await takeBackMisplaced(relativeTarget, target, created);
         return false;
       };
       const moveRestored = async () => {
@@ -406,15 +403,18 @@ async function bindWorkerGitHubCheckout(
         if (await landed()) {
           return true;
         }
-        await takeBackMisplaced(relativeTarget, target);
+        // The rename moved this turn's own copy, so its inode — read from the preserved entry, which
+        // only this turn can reach — is what a take-back compares the pathname against.
+        await takeBackMisplaced(relativeTarget, target, held);
         return false;
       };
       const stats = await fs.lstat(preserved).catch(() => undefined);
       if (!stats) {
         return false;
       }
+      const held: CreatedEntry = { kind: "inode", dev: stats.dev, ino: stats.ino };
       if (stats.isDirectory()) {
-        if (!(await createRestored(() => fs.mkdir(target)))) {
+        if (!(await createRestored({ kind: "createdDirectory" }, () => fs.mkdir(target)))) {
           return false;
         }
         if (await moveRestored()) {
@@ -440,9 +440,11 @@ async function bindWorkerGitHubCheckout(
         if (destination === undefined) {
           return false;
         }
-        return await createRestored(() => fs.symlink(destination, target));
+        return await createRestored({ kind: "symlink", destination }, () =>
+          fs.symlink(destination, target),
+        );
       }
-      return await createRestored(() => fs.link(preserved, target));
+      return await createRestored(held, () => fs.link(preserved, target));
     };
     const restoreAside = async (relative: string, preserved: string) => {
       if (!(await restoreIntoFreePath(preserved, path.join(cwd, relative)))) {
@@ -465,15 +467,6 @@ async function bindWorkerGitHubCheckout(
       // it. `rmdir` reports the directory as not empty instead, which leaves the name, the entries
       // that were restored and were never deleted, and the late file all recoverable.
       await fs.rmdir(preserved).catch(() => {});
-    };
-    /**
-     * Takes a placement that resolved outside the checkout back into the recovery directory. The
-     * entry is moved rather than removed, so bytes a writer wrote through the misdirected name are
-     * not the price of refusing the placement, and the path is free for the retry that follows.
-     */
-    const takeBackMisplaced = async (relative: string, target: string) => {
-      const preserved = path.join(await ensureRecoveryDirectory(), recoveryName(relative));
-      await fs.rename(target, preserved).catch(() => {});
     };
     const movedAside: Array<{ relative: string; preserved: string }> = [];
     const placed: Array<{
@@ -606,6 +599,21 @@ async function bindWorkerGitHubCheckout(
       );
     };
     /**
+     * Admits the first mutation of the move, and only that one. Everything before it reads the
+     * checkout or prepares scratch state under its Git directory, while a turn still honours the
+     * fence; the awaits that lead here do not observe the abort, so a fence that lands during them
+     * would otherwise be missed at the one step that makes the move observable. The fence is
+     * therefore re-read here, as late as possible, and each mutation path calls this immediately
+     * before its own first write. Once a mutation is admitted the bounded local work completes even
+     * if the fence lands later, which is what keeps the branch, the index and the working tree
+     * consistent with one another.
+     */
+    let mutationStarted = false;
+    const admitFirstMutation = () => {
+      mutationStarted ||= signal?.aborted !== true;
+      return mutationStarted;
+    };
+    /**
      * Moves the branch to the fetched commit after copying the index, which `reset --mixed` writes
      * before it moves the branch. Every reset has to go through here: a failure afterwards leaves
      * the incoming entries staged against the head the checkout still has, and a turn that cannot
@@ -617,6 +625,13 @@ async function bindWorkerGitHubCheckout(
      */
     const moveBranchToFetchedCommit = async () => {
       await backUpCheckoutIndex();
+      // An incoming history that only rewrites existing files materializes nothing, so this reset is
+      // the first mutation of the turn — and the copy above is a filesystem call that does not
+      // observe the abort. Re-reading the fence after it is what keeps a turn fenced while the index
+      // was copied from advancing HEAD and replacing the index over an untouched working tree.
+      if (!admitFirstMutation()) {
+        return;
+      }
       const result = await runGit(["reset", "--mixed", "FETCH_HEAD"], 5_000, false);
       if (result.code !== 0) {
         throw new Error(`git reset --mixed FETCH_HEAD failed (exit ${result.code})`);
@@ -685,16 +700,12 @@ async function bindWorkerGitHubCheckout(
       // directory; the loop below is the first step that changes the working tree. The fence is
       // therefore re-read here as well: the preparation above awaits commands that do not observe the
       // abort, and when no entry had to be exported none of them runs at all, so without this check a
-      // turn fenced during the preparation would still set the approved paths aside and reset the
-      // branch. A turn that is fenced up to here leaves the checkout exactly as it found it; from the
-      // first move on, the bounded local work this turn already began completes on content that is
-      // already on disk.
+      // turn fenced during the preparation would still set the approved paths aside. A turn that is
+      // fenced up to here leaves the checkout exactly as it found it; from the first move on, the
+      // bounded local work this turn already began completes on content that is already on disk.
       if (signal?.aborted) {
         return;
       }
-      // Whether the first working-tree change of the move has begun. Setting a path aside is what
-      // makes the move observable, so everything before it still leaves the checkout as it was found.
-      let mutationStarted = false;
       for (const collisionPath of removableTrackedCollisions) {
         mutationStarted = true;
         movedAside.push({ relative: collisionPath, preserved: await moveAside(collisionPath) });
@@ -706,13 +717,6 @@ async function bindWorkerGitHubCheckout(
       const missing = splitPaths(
         await requireMoveGit(["ls-files", "--deleted", "-z"], incomingEnv),
       ).filter((file) => !deletedBefore.has(file) && exportable.has(file));
-      // Re-reading the deleted paths is the last await before the first mutation when nothing was set
-      // aside, and it does not observe the abort either. A turn fenced here with an empty collision
-      // set has not changed the working tree yet, so it has no local work to finish and must leave
-      // the checkout as it found it; a turn that already moved a path aside completes what it began.
-      if (signal?.aborted && !mutationStarted) {
-        return;
-      }
       if (missing.length === 0) {
         await moveBranchToFetchedCommit();
         replaced = true;
@@ -731,6 +735,12 @@ async function bindWorkerGitHubCheckout(
           continue;
         }
         const target = path.join(cwd, file);
+        // The identity of the entry the placement makes, so taking a misdirected one back cannot act
+        // on a pathname a writer has since pointed at one of its own files.
+        const created: CreatedEntry =
+          stats?.isSymbolicLink() === true
+            ? { kind: "symlink", destination: await fs.readlink(staged) }
+            : { kind: "inode", dev: stats?.dev ?? 0, ino: stats?.ino ?? 0 };
         const place = async () => {
           // A submodule entry has no content of its own, so the directory Git expects is the whole
           // result; everything else needs its parent directories to exist first.
@@ -753,7 +763,7 @@ async function bindWorkerGitHubCheckout(
           // read back, and a placement that landed outside is taken back and refused, which moves
           // the link aside on the next attempt like any other occupied path.
           if (!(await resolvesInsideCheckout(target))) {
-            await takeBackMisplaced(file, target);
+            await takeBackMisplaced(file, target, created);
             throw Object.assign(new Error(`${file} landed outside the checkout`), {
               code: "EEXIST",
             });
@@ -763,12 +773,19 @@ async function bindWorkerGitHubCheckout(
           // empty. The parent chain is read again for that: the paths this turn approved have to be
           // the directories the entry was created through, and anything else is taken back.
           if (!(await reachesIntendedDirectories(path.dirname(file)))) {
-            await takeBackMisplaced(file, target);
+            await takeBackMisplaced(file, target, created);
             throw Object.assign(new Error(`${file} landed behind a link in the checkout`), {
               code: "EEXIST",
             });
           }
         };
+        // Reading the staging copy above is the last await before the first write of the move, and
+        // it does not observe the abort either. A turn fenced while it ran has not created anything
+        // yet, so it owes the checkout an untouched state rather than a placed file and a moved
+        // branch; a turn that already set a path aside completes what it began.
+        if (!admitFirstMutation()) {
+          return;
+        }
         let materialized = false;
         for (let attempt = 0; attempt < placementAttempts && !materialized; attempt += 1) {
           try {
@@ -787,11 +804,13 @@ async function bindWorkerGitHubCheckout(
               continue;
             }
             // Never end the loop on a move: every move has to be followed by a write into the path
-            // it freed, or the replacement is left incomplete with nothing to retry it.
+            // it freed, or the replacement is left incomplete with nothing to retry it. The blocker a
+            // retry meets is recorded like the approved paths are, so a turn that later fails puts
+            // back every path it moved and not only the ones the classification named.
             if (attempt + 1 >= placementAttempts) {
               break;
             }
-            await moveAside(blocking);
+            movedAside.push({ relative: blocking, preserved: await moveAside(blocking) });
           }
         }
         if (!materialized) {

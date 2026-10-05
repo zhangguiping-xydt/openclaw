@@ -10,13 +10,58 @@ import { hasErrnoCode } from "../infra/errno.js";
 const pathComponents = (relative: string) => relative.split("/");
 
 /**
- * The directory-boundary rules a placement has to satisfy before it may create a name in a checkout.
- * Every rule re-reads the filesystem rather than trusting an earlier answer, because each check and
- * the write it guards are separate system calls and a command that is still running as the worker
- * user can change what is between them. A path that fails one of them is an occupied path like any
- * other: the caller takes it back into the recovery directory and retries.
+ * The identity of the entry a creation made, so taking a misdirected entry back compares what the
+ * pathname now names with what this turn created instead of moving whatever is there. A link, or a
+ * copy this turn renamed into place, is proven by the inode it shares with the copy the turn holds,
+ * a symlink by the destination it was created with, and a directory — which the creation leaves
+ * empty — by being the empty directory that creation left.
  */
-export function createCheckoutPaths(cwd: string) {
+export type CreatedEntry =
+  | { kind: "inode"; dev: number; ino: number }
+  | { kind: "symlink"; destination: string }
+  | { kind: "createdDirectory" };
+
+type EntryStats = Awaited<ReturnType<typeof fs.lstat>>;
+
+/**
+ * Whether the entry a re-resolved pathname names is still the one this turn created. The comparison
+ * is what keeps a take-back off an entry that belongs to a writer: a pathname resolved again after a
+ * writer moved an ancestor can name one of the writer's files, and dev/ino, a link target or the
+ * emptiness of a freshly created directory all distinguish that entry from this turn's own.
+ */
+async function isCreatedEntry(entry: EntryStats, target: string, created: CreatedEntry) {
+  if (created.kind === "symlink") {
+    return (
+      entry.isSymbolicLink() &&
+      (await fs.readlink(target).catch(() => undefined)) === created.destination
+    );
+  }
+  if (created.kind === "createdDirectory") {
+    return entry.isDirectory() && (await fs.readdir(target).catch(() => [""])).length === 0;
+  }
+  return entry.dev === created.dev && entry.ino === created.ino;
+}
+
+/**
+ * The directory-boundary rules a placement has to satisfy before it may create a name in a checkout,
+ * and the rule a take-back has to satisfy before it may move one. Every rule re-reads the filesystem
+ * rather than trusting an earlier answer, because each check and the write it guards are separate
+ * system calls and a command that is still running as the worker user can change what is between
+ * them. A path that fails one of them is an occupied path like any other: the caller takes it back
+ * into the recovery directory and retries.
+ */
+export function createCheckoutPaths(
+  cwd: string,
+  /**
+   * Where a misplaced entry is moved so its bytes survive the refusal, and the name it keeps there.
+   * The recovery directory lives under the checkout's Git directory, so the caller that owns it also
+   * names the entries in it.
+   */
+  recovery: {
+    ensureRecoveryDirectory: () => Promise<string>;
+    recoveryName: (relative: string) => string;
+  },
+) {
   /**
    * The path a writer's file occupies on the way to `relative`, or the path itself when the
    * whole path exists as directories. Walking from the top finds the blocker whatever errno the
@@ -125,11 +170,35 @@ export function createCheckoutPaths(cwd: string) {
       }
     }
   };
+  /**
+   * Takes a placement or a restoration that resolved outside the checkout back into the recovery
+   * directory. The entry is moved rather than removed, so bytes a writer wrote through the
+   * misdirected name are not the price of refusing the placement, and the path is free for the retry
+   * that follows. The name is resolved again here, and a writer can point it at a different entry
+   * between the creation and this call: renaming the directory the entry was made in and putting a
+   * link to somewhere else in its place makes this pathname name a file that belongs to the writer,
+   * outside the checkout. Moving that entry would take an unrelated file under the Git directory and
+   * leave the placement behind, so what the pathname names is compared with the entry this turn
+   * created first and anything else is left exactly where it is — the placement retry moves the
+   * blocker aside and writes into the path it freed instead.
+   */
+  const takeBackMisplaced = async (relative: string, target: string, created: CreatedEntry) => {
+    const entry = await fs.lstat(target).catch(() => undefined);
+    if (!entry || !(await isCreatedEntry(entry, target, created))) {
+      return;
+    }
+    const preserved = path.join(
+      await recovery.ensureRecoveryDirectory(),
+      recovery.recoveryName(relative),
+    );
+    await fs.rename(target, preserved).catch(() => {});
+  };
   return {
     blockingPath,
     resolvesInsideCheckout,
     reachesIntendedDirectories,
     createdDirectories,
     createRealDirectories,
+    takeBackMisplaced,
   };
 }
