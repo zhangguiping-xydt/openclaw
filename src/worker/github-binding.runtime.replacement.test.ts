@@ -449,6 +449,66 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     );
   });
 
+  it("keeps a restored link out of the directory a writer swaps its parent for", async () => {
+    const directory = "nested";
+    const link = `${directory}/link`;
+    const linkTarget = "link-target.txt";
+    const second = "zzz-second";
+    await fs.mkdir(path.join(cwd, directory));
+    await fs.writeFile(path.join(cwd, linkTarget), "link target bytes\n");
+    await fs.symlink(linkTarget, path.join(cwd, link));
+    await fs.writeFile(path.join(cwd, second), "second bytes\n");
+    initialHead = await commit(cwd, "Track collision paths");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      for (const name of [link, second]) {
+        await fs.rm(path.join(seed, name), { force: true });
+        await fs.mkdir(path.join(seed, name), { recursive: true });
+        await fs.writeFile(path.join(seed, name, "remote.txt"), `${name} remote\n`);
+      }
+    });
+
+    // A restoration reads the parent chain before it creates the name it puts back, and the writer
+    // can replace that chain with a link while the restoration awaits the preserved entry's own
+    // destination. Creating the link then resolves the replaced directory, so the entry lands at the
+    // link's target, and a restoration that reported success would release the preserved copy that
+    // is the only name left holding it. The landing is read back, so the copy keeps its name under
+    // the Git directory instead of being placed through the writer's link.
+    const outside = path.join(fixture.root, "outside");
+    await fs.mkdir(outside);
+    const readlink = fs.readlink;
+    let redirected = 0;
+    vi.spyOn(fs, "readlink").mockImplementation(async (target) => {
+      if (redirected === 0 && String(target).includes("collision-recovery")) {
+        redirected += 1;
+        await fs.rm(path.join(cwd, directory), { recursive: true, force: true });
+        await fs.symlink(outside, path.join(cwd, directory));
+      }
+      return await readlink(target);
+    });
+    const rename = fs.rename;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(to).includes(second)) {
+        throw Object.assign(new Error("ENOENT: the approved path vanished"), { code: "ENOENT" });
+      }
+      return await rename(from, to);
+    });
+
+    await prepare();
+
+    expect(redirected).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(remoteHead).not.toBe(initialHead);
+    // Nothing was created at the link's target, the directory the writer replaced is left where it
+    // is, and the preserved link still has a name under the Git directory.
+    await expect(fs.readdir(outside)).resolves.toEqual([]);
+    await expect(fs.readlink(path.join(cwd, directory))).resolves.toBe(outside);
+    await expect(fixture.preservedLinks()).resolves.toEqual([linkTarget]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+  });
+
   it("materializes a newly added nested directory one component at a time", async () => {
     await fs.writeFile(path.join(cwd, "anchor.txt"), "anchor bytes\n");
     initialHead = await commit(cwd, "Track anchor file");

@@ -363,25 +363,61 @@ async function bindWorkerGitHubCheckout(
       if (!(await reachesIntendedDirectories(path.dirname(relativeTarget)))) {
         return false;
       }
-      const stats = await fs.lstat(preserved).catch(() => undefined);
-      if (!stats) {
-        return false;
-      }
-      if (stats.isDirectory()) {
+      // Creating a name resolves the whole pathname, so the parent chain read above can be replaced
+      // with a link while the awaits below run: the entry is then created at the link's target, the
+      // restoration reports success, and the caller releases the preserved copy, which was the only
+      // name left holding the bytes. Every creation below is therefore bracketed the way a placement
+      // is: the parent chain is read again immediately before the name is created, the landing is
+      // read back afterwards, and an entry that landed elsewhere is taken back into the recovery
+      // directory, so nothing this turn created stays outside the checkout and a restoration that
+      // reports failure never released the preserved copy.
+      const landed = async () =>
+        (await resolvesInsideCheckout(target)) &&
+        (await reachesIntendedDirectories(path.dirname(relativeTarget)));
+      const createRestored = async (create: () => Promise<unknown>) => {
+        if (!(await reachesIntendedDirectories(path.dirname(relativeTarget)))) {
+          return false;
+        }
         if (
-          !(await fs
-            .mkdir(target)
+          !(await create()
             .then(() => true)
             .catch(() => false))
         ) {
           return false;
         }
+        if (await landed()) {
+          return true;
+        }
+        await takeBackMisplaced(relativeTarget, target);
+        return false;
+      };
+      const moveRestored = async () => {
+        if (!(await reachesIntendedDirectories(path.dirname(relativeTarget)))) {
+          return false;
+        }
         if (
-          await fs
+          !(await fs
             .rename(preserved, target)
             .then(() => true)
-            .catch(() => false)
+            .catch(() => false))
         ) {
+          return false;
+        }
+        if (await landed()) {
+          return true;
+        }
+        await takeBackMisplaced(relativeTarget, target);
+        return false;
+      };
+      const stats = await fs.lstat(preserved).catch(() => undefined);
+      if (!stats) {
+        return false;
+      }
+      if (stats.isDirectory()) {
+        if (!(await createRestored(() => fs.mkdir(target)))) {
+          return false;
+        }
+        if (await moveRestored()) {
           return true;
         }
         // Replacing the directory just created is not portable, so its entries go back one by one
@@ -401,17 +437,12 @@ async function bindWorkerGitHubCheckout(
       }
       if (stats.isSymbolicLink()) {
         const destination = await fs.readlink(preserved).catch(() => undefined);
-        return destination === undefined
-          ? false
-          : await fs
-              .symlink(destination, target)
-              .then(() => true)
-              .catch(() => false);
+        if (destination === undefined) {
+          return false;
+        }
+        return await createRestored(() => fs.symlink(destination, target));
       }
-      return await fs
-        .link(preserved, target)
-        .then(() => true)
-        .catch(() => false);
+      return await createRestored(() => fs.link(preserved, target));
     };
     const restoreAside = async (relative: string, preserved: string) => {
       if (!(await restoreIntoFreePath(preserved, path.join(cwd, relative)))) {
@@ -661,7 +692,11 @@ async function bindWorkerGitHubCheckout(
       if (signal?.aborted) {
         return;
       }
+      // Whether the first working-tree change of the move has begun. Setting a path aside is what
+      // makes the move observable, so everything before it still leaves the checkout as it was found.
+      let mutationStarted = false;
       for (const collisionPath of removableTrackedCollisions) {
+        mutationStarted = true;
         movedAside.push({ relative: collisionPath, preserved: await moveAside(collisionPath) });
       }
       // Setting a path aside is what makes it absent, so the list is read again after the move: the
@@ -671,6 +706,13 @@ async function bindWorkerGitHubCheckout(
       const missing = splitPaths(
         await requireMoveGit(["ls-files", "--deleted", "-z"], incomingEnv),
       ).filter((file) => !deletedBefore.has(file) && exportable.has(file));
+      // Re-reading the deleted paths is the last await before the first mutation when nothing was set
+      // aside, and it does not observe the abort either. A turn fenced here with an empty collision
+      // set has not changed the working tree yet, so it has no local work to finish and must leave
+      // the checkout as it found it; a turn that already moved a path aside completes what it began.
+      if (signal?.aborted && !mutationStarted) {
+        return;
+      }
       if (missing.length === 0) {
         await moveBranchToFetchedCommit();
         replaced = true;

@@ -651,6 +651,53 @@ describe("prepareWorkerGitHubEnvironment", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("does not start the move when the turn is fenced with no collision to set aside", async () => {
+    await fs.writeFile(path.join(cwd, "tracked.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track base file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const incoming = "incoming.txt";
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.writeFile(path.join(seed, incoming), "remote file\n");
+    });
+
+    // With nothing to set aside, re-reading the deleted paths is the last step before the first
+    // write and the last one that can fence the turn before it: the preparation ahead awaits
+    // commands that do not observe the abort, and the check before the loop runs before this read.
+    // A turn fenced while it runs has changed nothing yet, so it owes the checkout the same
+    // untouched state instead of materializing the incoming file and moving the branch.
+    const controller = new AbortController();
+    const runCommand = exec.runCommandWithTimeout;
+    let deletions = 0;
+    const runner = vi
+      .spyOn(exec, "runCommandWithTimeout")
+      .mockImplementation(async (argv, options) => {
+        const result = await runCommand(argv, options);
+        if (argv.includes("--deleted")) {
+          deletions += 1;
+          if (deletions === 3 && !controller.signal.aborted) {
+            controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
+          }
+        }
+        return result;
+      });
+
+    await prepareWorkerGitHubEnvironment({
+      binding,
+      stateDir: path.join(root, "state"),
+      turnId: "turn",
+      cwd,
+      signal: controller.signal,
+    });
+
+    expect(deletions).toBe(3);
+    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(remoteHead).not.toBe(initialHead);
+    await expect(fs.lstat(path.join(cwd, incoming))).rejects.toThrow();
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("replaces a collision whose path exceeds the recovery name limit", async () => {
     const long = "l".repeat(140);
     const nested = `${long}/${long}`;
