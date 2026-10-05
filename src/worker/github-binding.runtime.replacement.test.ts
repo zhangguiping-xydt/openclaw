@@ -400,6 +400,55 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     );
   });
 
+  it("keeps a restored directory's entries out of a link a writer left in its place", async () => {
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, collision));
+    await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track collision directory");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, collision), { recursive: true });
+      await fs.writeFile(path.join(seed, collision), "remote file\n");
+    });
+
+    await fs.writeFile(path.join(cwd, ".git", "index.lock"), "");
+    // A restoration creates the directory it fills, so a writer that keeps running as the worker
+    // user can swap that directory for a link before the preserved copy is renamed onto it, and the
+    // rename then fails because the name is no longer an empty directory. Putting the entries back
+    // one at a time resolves the link on the way, so without reading the parent chain again every
+    // entry would be created at the link's target and the path the incoming history named would stay
+    // empty. A link is not a directory this runs through, so the preserved copy keeps its name under
+    // the Git directory instead of being placed through it.
+    const outside = path.join(fixture.root, "outside");
+    await fs.mkdir(outside);
+    const rename = fs.rename;
+    const restored = path.join(cwd, collision);
+    let redirected = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (redirected === 0 && String(to) === restored && String(from).includes(".git")) {
+        redirected += 1;
+        await fs.rm(restored, { recursive: true, force: true });
+        await fs.symlink(outside, restored);
+        throw Object.assign(new Error("ENOTDIR: not a directory"), { code: "ENOTDIR" });
+      }
+      return await rename(from, to);
+    });
+
+    await prepare();
+
+    expect(redirected).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    // Nothing was created at the link's target, the link the writer put in the directory's place is
+    // left exactly where it is, and both copies still have a name: the directory the move set aside
+    // and the incoming file the rollback took back out of the checkout.
+    await expect(fs.readdir(outside)).resolves.toEqual([]);
+    await expect(fs.readlink(restored)).resolves.toBe(outside);
+    await expect(fixture.preservedBytes()).resolves.toEqual(["base file", "remote file"]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+  });
+
   it("materializes a newly added nested directory one component at a time", async () => {
     await fs.writeFile(path.join(cwd, "anchor.txt"), "anchor bytes\n");
     initialHead = await commit(cwd, "Track anchor file");
@@ -502,6 +551,39 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     expect(warn).toHaveBeenCalledExactlyOnceWith(
       expect.stringContaining("checkout binding failed"),
     );
+
+    // The next turn prepares its own transaction through the same fixed name, so the copy above would
+    // be deleted in that turn's cleanup or overwritten while it took its own copy: the preservation
+    // would last only until the next turn reached these paths. The next turn therefore has to
+    // recognize the outstanding copy and keep it under the recovery directory, where it keeps a name
+    // of its own even though this turn then completes its own fast-forward.
+    const keptBytes = await fs.readFile(backup);
+    await fs.rm(lock);
+    vi.restoreAllMocks();
+    // The failed reset left the incoming entries staged, so a turn starting from that mixture skips
+    // the fast-forward and never prepares a transaction. Clearing it puts the checkout back on the
+    // same replacement, which is the turn that has to recognize the outstanding copy.
+    await git(cwd, "reset", "--hard", "HEAD");
+    await git(cwd, "clean", "--force", "-d");
+    await prepare();
+
+    const recoveryRoot = path.join(cwd, ".git", "github-checkout-collision-recovery");
+    const indexCopies: Buffer[] = [];
+    const collect = async (directory: string) => {
+      for (const entry of await fs.readdir(directory, { withFileTypes: true }).catch(() => [])) {
+        const child = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          await collect(child);
+        } else if (entry.name === "index") {
+          indexCopies.push(await fs.readFile(child).catch(() => Buffer.alloc(0)));
+        }
+      }
+    };
+    await collect(recoveryRoot);
+    expect(
+      indexCopies.some((bytes) => bytes.equals(keptBytes)),
+      "the index the failed restoration kept is still readable after the next turn",
+    ).toBe(true);
   });
 
   it("keeps a file a writer adds while a restored directory is emptied", async () => {

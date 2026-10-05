@@ -481,6 +481,68 @@ describe("prepareWorkerGitHubEnvironment", () => {
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
   });
 
+  it("leaves the checkout untouched when the turn is fenced just after the export", async () => {
+    const collision = "collision";
+    await fs.writeFile(path.join(cwd, collision), "base file\n");
+    initialHead = await commit(cwd, "Track collision file");
+    await git(cwd, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    await fs.rm(path.join(seed, collision));
+    await fs.mkdir(path.join(seed, collision));
+    await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
+    const remoteHead = await commit(seed, "Earlier turn");
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+    // The export is the last step that can reach the network, and the fence it honors is the one that
+    // lands while it runs. The steps between it and the first move are reads and scratch writes that
+    // do not observe the abort, so a fence that lands *after* the export has finished still has to be
+    // read again before anything is set aside: the fence below is raised once `checkout-index` has
+    // returned, which is the interval no cancellable step covers.
+    const controller = new AbortController();
+    const runCommand = exec.runCommandWithTimeout;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      const result = await runCommand(argv, options);
+      if (argv.includes("checkout-index") && !controller.signal.aborted) {
+        controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
+      }
+      return result;
+    });
+    const prepareFenced = () =>
+      prepareWorkerGitHubEnvironment({
+        binding,
+        stateDir: path.join(root, "state"),
+        runId: "turn",
+        cwd,
+        signal: controller.signal,
+      });
+
+    await prepareFenced();
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    await expect(fs.readFile(path.join(cwd, collision), "utf8")).resolves.toBe("base file\n");
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(await git(cwd, "diff", "--cached", "--name-only")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+
+    // With a live signal the same fast-forward completes.
+    vi.restoreAllMocks();
+    await prepareWorkerGitHubEnvironment({
+      binding,
+      stateDir: path.join(root, "state"),
+      runId: "turn",
+      cwd,
+      signal: new AbortController().signal,
+    });
+
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(
+      "remote file\n",
+    );
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+  });
+
   it("completes the move when the turn is fenced after the removals", async () => {
     const collision = "collision";
     await fs.writeFile(path.join(cwd, collision), "base file\n");
@@ -766,6 +828,39 @@ describe("prepareWorkerGitHubEnvironment", () => {
     expect(warn).toHaveBeenCalledExactlyOnceWith(
       expect.stringContaining("GitHub checkout fast-forward skipped"),
     );
+  });
+
+  it("replaces a clean local file whose name differs by case from an incoming directory", async () => {
+    isPathCaseInsensitive.mockReturnValueOnce(true);
+    const localSpelling = "Collision";
+    const incomingSpelling = "collision";
+    await fs.writeFile(path.join(cwd, localSpelling), "local file\n");
+    initialHead = await commit(cwd, "Track the local spelling");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, localSpelling));
+      await fs.mkdir(path.join(seed, incomingSpelling));
+      await fs.writeFile(path.join(seed, incomingSpelling, "remote.txt"), "remote file\n");
+    });
+
+    // A case-insensitive filesystem answers `lstat` for either spelling, so recording the collision
+    // under the spelling the incoming path used makes the literal Git pathspec match no index entry.
+    // The clean local file is then read as work Git cannot reproduce and the whole fast-forward is
+    // skipped, even though the replacement is provably safe. Asking Git about the entry's own name
+    // instead lets the replacement proceed.
+    await prepare();
+
+    expect(remoteHead).not.toBe(initialHead);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(path.join(cwd, incomingSpelling, "remote.txt"), "utf8")).resolves.toBe(
+      "remote file\n",
+    );
+    expect((await git(cwd, "ls-files", "-z")).split("\0").filter(Boolean)).toEqual([
+      `${incomingSpelling}/remote.txt`,
+    ]);
+    await expect(replacedBytes()).resolves.toEqual(["local file"]);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("leaves diverged local history and files untouched with one warning", async () => {

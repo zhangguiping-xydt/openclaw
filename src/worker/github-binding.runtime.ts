@@ -12,6 +12,7 @@ import { executeGitCommand } from "../infra/git-exec.js";
 import { isPathCaseInsensitive } from "../infra/path-case.js";
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { createCheckoutPaths } from "./github-binding.checkout-paths.js";
 import type { WorkerGitHubLaunchBinding } from "./launch-descriptor.js";
 
 const log = createSubsystemLogger("worker/github");
@@ -129,7 +130,16 @@ async function bindWorkerGitHubCheckout(
      * creating it fails with ENOENT before its parent exists. Joining back with `/` is for the same
      * reason; `path.join` turns that into the platform's separators when an entry is created.
      */
-    const pathComponents = (relative: string) => relative.split("/");
+    // The directory-boundary rules a placement has to satisfy live in their own module: each rule
+    // re-reads the filesystem instead of trusting an earlier check, and every creation site uses the
+    // same ones, so they are kept together rather than beside the code that calls them.
+    const {
+      blockingPath,
+      resolvesInsideCheckout,
+      reachesIntendedDirectories,
+      createdDirectories,
+      createRealDirectories,
+    } = createCheckoutPaths(cwd);
     const added = await listPaths([
       "diff",
       "--name-only",
@@ -146,14 +156,21 @@ async function bindWorkerGitHubCheckout(
       Promise<Map<string, { name: string; isDirectory: boolean }>>
     >();
     const findLocalEntry = async (directory: string, name: string) => {
-      try {
-        const stats = await fs.lstat(path.join(directory, name));
-        return { name, isDirectory: stats.isDirectory() };
-      } catch (error) {
-        if (!isMissingPathError(error)) {
-          throw error;
-        }
-        if (!caseInsensitive) {
+      // A case-insensitive filesystem answers `lstat` for any spelling of an entry it holds, so the
+      // fast path would hand back the spelling the caller asked for instead of the one on disk. The
+      // collision is then recorded under that spelling and classified with the literal Git pathspec
+      // it produces, which matches no index entry, so a replacement that is provably clean stays
+      // blocked under whatever spelling the incoming history happens to use. The entry's own name is
+      // therefore read from the directory listing, which is cached per directory and is what the
+      // caller records as the collision path.
+      if (!caseInsensitive) {
+        try {
+          const stats = await fs.lstat(path.join(directory, name));
+          return { name, isDirectory: stats.isDirectory() };
+        } catch (error) {
+          if (!isMissingPathError(error)) {
+            throw error;
+          }
           return undefined;
         }
       }
@@ -328,6 +345,23 @@ async function bindWorkerGitHubCheckout(
      * checked first: a check is not atomic, and a rename would overwrite what appeared after it.
      */
     const restoreIntoFreePath = async (preserved: string, target: string): Promise<boolean> => {
+      // A restoration creates names in the checkout, so it owes the same parent guarantee a placement
+      // owes: the directory this turn created can be replaced with a link by a writer, and after that
+      // every entry restored below would be created at the link's target instead of at the path the
+      // next turn reads. Each call re-reads its own parent chain, so the recursive call that fills a
+      // restored directory catches a link that appears while its entries are going back, and the
+      // preserved copy simply stays under the Git directory rather than being placed through it.
+      const relativeTarget = path.relative(cwd, target);
+      if (
+        path.isAbsolute(relativeTarget) ||
+        relativeTarget === ".." ||
+        relativeTarget.startsWith(`..${path.sep}`)
+      ) {
+        return false;
+      }
+      if (!(await reachesIntendedDirectories(path.dirname(relativeTarget)))) {
+        return false;
+      }
       const stats = await fs.lstat(preserved).catch(() => undefined);
       if (!stats) {
         return false;
@@ -401,45 +435,6 @@ async function bindWorkerGitHubCheckout(
       await fs.rmdir(preserved).catch(() => {});
     };
     /**
-     * The path a writer's file occupies on the way to `relative`, or the path itself when the
-     * whole path exists as directories. Walking from the top finds the blocker whatever errno the
-     * filesystem chose: `mkdir` of a path that is a file reports `EEXIST`, while a `mkdir` or
-     * `link` below a file reports `ENOTDIR`.
-     */
-    const blockingPath = async (relative: string) => {
-      let current = "";
-      for (const segment of pathComponents(relative)) {
-        current = current ? `${current}/${segment}` : segment;
-        const stats = await fs.lstat(path.join(cwd, current)).catch(() => undefined);
-        if (!stats) {
-          // Nothing is in the way below this point, so the retry can create the rest itself.
-          return undefined;
-        }
-        if (!stats.isDirectory()) {
-          return current;
-        }
-      }
-      return relative;
-    };
-    /**
-     * Whether a path resolves inside the checkout. Creating or reading an entry resolves the whole
-     * pathname at once, so an ancestor a writer swapped for a symlink after this turn checked it can
-     * only be observed afterwards, and only the resolved path shows it. The leaf is never followed:
-     * a placed symlink points wherever the incoming entry points, which is not a place this decides.
-     * The checkout root is resolved the same way, so a checkout under a symlinked temporary
-     * directory is not a mismatch.
-     */
-    let checkoutRoot: string | undefined;
-    const resolvesInsideCheckout = async (target: string) => {
-      checkoutRoot ??= await fs.realpath(cwd).catch(() => undefined);
-      const parent = await fs.realpath(path.dirname(target)).catch(() => undefined);
-      return (
-        checkoutRoot !== undefined &&
-        parent !== undefined &&
-        (parent === checkoutRoot || parent.startsWith(`${checkoutRoot}${path.sep}`))
-      );
-    };
-    /**
      * Takes a placement that resolved outside the checkout back into the recovery directory. The
      * entry is moved rather than removed, so bytes a writer wrote through the misdirected name are
      * not the price of refusing the placement, and the path is free for the retry that follows.
@@ -447,75 +442,6 @@ async function bindWorkerGitHubCheckout(
     const takeBackMisplaced = async (relative: string, target: string) => {
       const preserved = path.join(await ensureRecoveryDirectory(), recoveryName(relative));
       await fs.rename(target, preserved).catch(() => {});
-    };
-    /**
-     * Whether a checkout-relative path is still reached through the directories this turn approved,
-     * which is stricter than resolving inside the root: a writer that replaces one of them with a
-     * link to another path in the same checkout keeps the resolved parent inside the checkout while
-     * everything created below the link lands at the link's target, so the intended Git path stays
-     * empty and no later turn repairs it. Each component is read again and has to be a directory
-     * `lstat` reports as one — the same test `createRealDirectories` applies to every component it
-     * accepts — so a link, wherever it points, is not a directory this path runs through.
-     */
-    const reachesIntendedDirectories = async (relative: string) => {
-      let current = "";
-      for (const segment of pathComponents(relative)) {
-        current = current ? `${current}/${segment}` : segment;
-        const stats = await fs.lstat(path.join(cwd, current)).catch(() => undefined);
-        if (!stats?.isDirectory()) {
-          return false;
-        }
-      }
-      return true;
-    };
-    /**
-     * Creates the directories an incoming path needs, refusing every ancestor that is not a real
-     * directory. A recursive `mkdir` resolves a symlinked ancestor and would put the incoming file
-     * wherever that link points, outside the checkout, so each component is created on its own and
-     * has to be a directory that `lstat` reports as one. A symlink a writer recreated in place of
-     * the directory this turn set aside is an occupied path, so the placement retry moves it aside
-     * like any other recreation instead of writing through it. Only the components this turn
-     * creates are recorded, so a rollback cannot remove a directory the checkout already had.
-     */
-    const createdDirectories: string[] = [];
-    const createRealDirectories = async (relative: string) => {
-      let current = "";
-      for (const segment of pathComponents(relative)) {
-        current = current ? `${current}/${segment}` : segment;
-        const target = path.join(cwd, current);
-        const existing = await fs.lstat(target).catch(() => undefined);
-        if (existing) {
-          if (!existing.isDirectory()) {
-            throw Object.assign(new Error(`${current} is not a directory`), { code: "EEXIST" });
-          }
-          continue;
-        }
-        try {
-          await fs.mkdir(target);
-        } catch (error) {
-          // Only a real directory created by someone else makes this attempt safe to continue.
-          const created = await fs.lstat(target).catch(() => undefined);
-          if (!created?.isDirectory() || !hasErrnoCode(error, "EEXIST")) {
-            throw error;
-          }
-          continue;
-        }
-        createdDirectories.push(current);
-        // The `mkdir` resolved the whole pathname, so a component a writer replaced with a link
-        // after its own check would have created this directory wherever that link points. The path
-        // is read back and a directory created outside the checkout is refused like any other
-        // occupied path, which moves the link aside before the next attempt writes through it.
-        if (!(await resolvesInsideCheckout(target))) {
-          throw Object.assign(new Error(`${current} is outside the checkout`), { code: "EEXIST" });
-        }
-        // A link to another path inside the checkout keeps the resolved parent inside the root, so
-        // containment alone accepts a directory that the intended path does not reach.
-        if (!(await reachesIntendedDirectories(current))) {
-          throw Object.assign(new Error(`${current} is behind a link in the checkout`), {
-            code: "EEXIST",
-          });
-        }
-      }
     };
     const movedAside: Array<{ relative: string; preserved: string }> = [];
     const placed: Array<{
@@ -603,6 +529,19 @@ async function bindWorkerGitHubCheckout(
      */
     const previousIndex = path.join(gitDirectory, "github-checkout-previous.index");
     let indexBackup: "absent" | "live" | "spent" = "absent";
+    /**
+     * A turn that could not put the index back keeps its copy, because it is then the only description
+     * of the head the checkout still has. The name it keeps is fixed, so the next turn would discard
+     * it in its own cleanup or overwrite it while preparing its copy, and the preservation would last
+     * only until that turn reached these paths. An outstanding copy is therefore moved under the
+     * recovery directory first, where it keeps a name of its own and no later turn reuses it; a copy
+     * that cannot be moved aside stops the turn before it mutates anything.
+     */
+    const outstandingIndex = await fs.lstat(previousIndex).catch(() => undefined);
+    if (outstandingIndex) {
+      const kept = await fs.mkdtemp(path.join(await ensureRecoveryDirectory(), "previous-index-"));
+      await fs.rename(previousIndex, path.join(kept, "index"));
+    }
     const backUpCheckoutIndex = async () => {
       if (indexBackup === "absent") {
         await fs.copyFile(path.join(gitDirectory, "index"), previousIndex);
@@ -709,6 +648,17 @@ async function bindWorkerGitHubCheckout(
           }
           throw error;
         }
+      }
+      // Everything above this line only reads the checkout or prepares scratch state under its Git
+      // directory; the loop below is the first step that changes the working tree. The fence is
+      // therefore re-read here as well: the preparation above awaits commands that do not observe the
+      // abort, and when no entry had to be exported none of them runs at all, so without this check a
+      // turn fenced during the preparation would still set the approved paths aside and reset the
+      // branch. A turn that is fenced up to here leaves the checkout exactly as it found it; from the
+      // first move on, the bounded local work this turn already began completes on content that is
+      // already on disk.
+      if (signal?.aborted) {
+        return;
       }
       for (const collisionPath of removableTrackedCollisions) {
         movedAside.push({ relative: collisionPath, preserved: await moveAside(collisionPath) });
