@@ -8,7 +8,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { PreparedGitHubToolEnvironment } from "../agents/github-tool-identity.js";
+import type { PreparedGitHubToolEnvironment } from "../agents/github-tool-identity.types.js";
 import * as exec from "../process/exec.js";
 import { prepareWorkerGitHubEnvironment } from "./github-binding.runtime.js";
 import type { WorkerGitHubLaunchBinding } from "./launch-descriptor.js";

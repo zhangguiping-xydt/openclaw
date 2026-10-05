@@ -450,7 +450,7 @@ describe("prepareWorkerGitHubEnvironment", () => {
       prepareWorkerGitHubEnvironment({
         binding,
         stateDir: path.join(root, "state"),
-        runId: "turn",
+        turnId: "turn",
         cwd,
         signal: controller.signal,
       });
@@ -469,7 +469,7 @@ describe("prepareWorkerGitHubEnvironment", () => {
     await prepareWorkerGitHubEnvironment({
       binding,
       stateDir: path.join(root, "state"),
-      runId: "turn",
+      turnId: "turn",
       cwd,
       signal: new AbortController().signal,
     });
@@ -513,7 +513,7 @@ describe("prepareWorkerGitHubEnvironment", () => {
       prepareWorkerGitHubEnvironment({
         binding,
         stateDir: path.join(root, "state"),
-        runId: "turn",
+        turnId: "turn",
         cwd,
         signal: controller.signal,
       });
@@ -531,7 +531,7 @@ describe("prepareWorkerGitHubEnvironment", () => {
     await prepareWorkerGitHubEnvironment({
       binding,
       stateDir: path.join(root, "state"),
-      runId: "turn",
+      turnId: "turn",
       cwd,
       signal: new AbortController().signal,
     });
