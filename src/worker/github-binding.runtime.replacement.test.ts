@@ -996,6 +996,53 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     );
   });
 
+  it("keeps an outside directory at its own name when an approved path's ancestor becomes a link at the move", async () => {
+    const nested = "nested";
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, nested, collision), { recursive: true });
+    await fs.writeFile(path.join(cwd, nested, collision, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track nested collision directory");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, nested, collision), { recursive: true });
+      await fs.writeFile(path.join(seed, nested, collision), "remote file\n");
+    });
+
+    // The entry this move takes is a directory rather than a file: the redirect puts the writer's
+    // own directory under the Git directory, and the name it came from has to come back. A repair
+    // that can only link leaves that name empty and the bytes under a checkout the worker discards,
+    // which is a name the writer had and nothing this turn can restore.
+    const outside = path.join(fixture.root, "outside");
+    const writerFile = path.join(outside, collision, "writer.txt");
+    const parent = path.join(cwd, nested);
+    const source = path.join(parent, collision);
+    const rename = fs.rename;
+    let swapped = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(from) === source && swapped === 0) {
+        swapped += 1;
+        await fs.rm(parent, { recursive: true, force: true });
+        await fs.mkdir(path.join(outside, collision), { recursive: true });
+        await fs.writeFile(writerFile, "writer file\n");
+        await fs.symlink(outside, parent);
+      }
+      return await rename(from, to);
+    });
+
+    await prepare();
+
+    expect(swapped).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(remoteHead).not.toBe(initialHead);
+    // The writer's directory keeps the name it had outside the checkout, as well as its bytes.
+    await expect(fs.readFile(writerFile, "utf8")).resolves.toBe("writer file\n");
+    await expect(replacedBytes()).resolves.toEqual([]);
+    expect((await fs.lstat(parent)).isSymbolicLink()).toBe(true);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+  });
+
   it("keeps the incoming file at its own path when a parent links to another checkout path", async () => {
     const nested = "nested";
     const other = "other";

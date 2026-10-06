@@ -129,4 +129,120 @@ describe("checkout path rules beside a writer that moves the name", () => {
       "outside file\n",
     );
   });
+
+  /**
+   * Moves an approved path aside while a writer replaces the directory it is named through with a
+   * link to one of its own, so the move takes that directory's entry instead. `prepare` fills the
+   * writer's directory inside that swap, and `afterMove` refills a name once the move has taken it.
+   */
+  const redirectMoveOntoOutsideDirectory = async (hooks: {
+    prepare: (outside: string) => Promise<void>;
+    afterMove?: (outside: string) => Promise<void>;
+  }) => {
+    const nested = path.join(cwd, "nested");
+    await fs.mkdir(nested, { recursive: true });
+    const collision = path.join(nested, "collision");
+    await fs.writeFile(collision, "base file\n");
+    const outside = path.join(root, "outside");
+    const rename = fs.rename;
+    let swapped = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(from) === collision && swapped === 0) {
+        swapped = 1;
+        await fs.rm(nested, { recursive: true, force: true });
+        await fs.mkdir(outside, { recursive: true });
+        await hooks.prepare(outside);
+        await fs.symlink(outside, nested);
+      }
+      const result = await rename(from, to);
+      if (String(from) === collision && hooks.afterMove) {
+        await hooks.afterMove(outside);
+      }
+      return result;
+    });
+    const { directory, recovery } = recoveryBeside(async () => {});
+    const paths = createCheckoutPaths(cwd, recovery);
+    return { collision, directory, outside, paths, swapped: () => swapped };
+  };
+
+  const writerDirectory = async (outside: string) => {
+    await fs.mkdir(path.join(outside, "collision"));
+    await fs.writeFile(path.join(outside, "collision", "writer.txt"), "writer bytes\n");
+  };
+
+  it("puts a directory a redirected move took back at the outside name it came from", async () => {
+    // The entry the rename takes is a directory, and the name it came from is free again once the
+    // move has taken it. A directory cannot be linked, so a repair that only knows how to link
+    // leaves that name empty and the directory under the disposable checkout's Git directory — a
+    // name the writer had, which nothing this turn can restore.
+    const scenario = await redirectMoveOntoOutsideDirectory({ prepare: writerDirectory });
+
+    await expect(
+      scenario.paths.moveIntoRecovery("nested/collision", scenario.collision),
+    ).resolves.toBeUndefined();
+
+    expect(scenario.swapped()).toBe(1);
+    await expect(
+      fs.readFile(path.join(scenario.outside, "collision", "writer.txt"), "utf8"),
+    ).resolves.toBe("writer bytes\n");
+    await expect(fs.readdir(scenario.directory)).resolves.toEqual([]);
+  });
+
+  it("leaves a directory a writer refilled the name with where the writer put it", async () => {
+    const scenario = await redirectMoveOntoOutsideDirectory({
+      prepare: writerDirectory,
+      // The move took the writer's directory, so refilling the name means putting it back.
+      afterMove: async (outside) => {
+        await fs.mkdir(path.join(outside, "collision"));
+        await fs.writeFile(path.join(outside, "collision", "writer.txt"), "refilled bytes\n");
+      },
+    });
+
+    await expect(
+      scenario.paths.moveIntoRecovery("nested/collision", scenario.collision),
+    ).resolves.toBeUndefined();
+
+    // The repair cannot take a name that holds a directory, so it refuses and both copies stay: the
+    // writer keeps the name it refilled and the directory the move took stays under the Git
+    // directory rather than replacing what appeared.
+    await expect(
+      fs.readFile(path.join(scenario.outside, "collision", "writer.txt"), "utf8"),
+    ).resolves.toBe("refilled bytes\n");
+    await expect(fs.readdir(path.join(scenario.directory, "preserved-collision"))).resolves.toEqual(
+      ["writer.txt"],
+    );
+  });
+
+  it("gives back a directory it created through an ancestor a writer swapped for a link", async () => {
+    const nested = path.join(cwd, "nested");
+    await fs.mkdir(nested);
+    const outside = path.join(root, "outside");
+    await fs.mkdir(outside);
+    // Creating a component resolves the whole pathname, so a writer that replaces an ancestor with
+    // a link while the `mkdir` runs has this turn create the directory at the link's target. The
+    // name taken is this turn's own, so a refusal that ends the attempt has to give it back: a
+    // retry that succeeds afterwards would otherwise leave a directory this turn made, at a path
+    // outside the checkout, behind it.
+    const target = path.join(cwd, "nested", "deep");
+    const mkdir = fs.mkdir;
+    let swapped = 0;
+    vi.spyOn(fs, "mkdir").mockImplementation(async (directory, options) => {
+      if (String(directory) === target && swapped === 0) {
+        swapped = 1;
+        await fs.rm(nested, { recursive: true, force: true });
+        await fs.symlink(outside, nested);
+      }
+      return await mkdir(directory, options);
+    });
+    const { recovery } = recoveryBeside(async () => {});
+    const paths = createCheckoutPaths(cwd, recovery);
+
+    await expect(paths.createRealDirectories("nested/deep")).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+
+    expect(swapped).toBe(1);
+    await expect(fs.readdir(outside)).resolves.toEqual([]);
+    expect(paths.createdDirectories).toEqual([]);
+  });
 });

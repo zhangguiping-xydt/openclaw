@@ -44,19 +44,47 @@ async function isCreatedEntry(entry: EntryStats, target: string, created: Create
 
 /**
  * Puts a preserved entry back at a name a move took it from without replacing whatever is there
- * now. `link` refuses a name that already exists instead of taking it over, where the `rename` this
- * replaces would replace the destination silently, so a writer that refilled the outside name while
- * the move ran keeps its bytes and the preserved copy stays under the Git directory where its
- * caller can still reach it. A directory cannot be linked, and a repair is not what makes the move
- * safe, so a directory stays in the recovery directory as well.
+ * now. A file or a symlink is linked, which refuses a name that already exists instead of taking it
+ * over, where the `rename` this replaces would replace the destination silently; the recovery name
+ * is released once the entry is back at the other, so the entry is moved rather than copied.
+ *
+ * A directory cannot be linked, so its name is taken by `mkdir` — which refuses an occupied path on
+ * its own — and the preserved directory is then renamed onto the empty directory that just took the
+ * name. That empty directory is the only one a rename can replace, and a writer that filled it in
+ * the meantime makes the rename fail with nothing lost. A repair that could not be completed gives
+ * the name back and leaves the preserved entry under the Git directory, where its caller can still
+ * reach it: a refused repair costs the outside name, never the bytes.
  */
 async function putBackWithoutReplacing(preserved: string, destination: string) {
-  const placed = await fs
-    .link(preserved, destination)
+  const entry = await fs.lstat(preserved).catch(() => undefined);
+  if (!entry) {
+    return;
+  }
+  if (!entry.isDirectory()) {
+    const placed = await fs
+      .link(preserved, destination)
+      .then(() => true)
+      .catch(() => false);
+    if (placed) {
+      await fs.unlink(preserved).catch(() => {});
+    }
+    return;
+  }
+  const taken = await fs
+    .mkdir(destination)
     .then(() => true)
     .catch(() => false);
-  if (placed) {
-    await fs.unlink(preserved).catch(() => {});
+  if (!taken) {
+    return;
+  }
+  const restored = await fs
+    .rename(preserved, destination)
+    .then(() => true)
+    .catch(() => false);
+  if (!restored) {
+    // `rmdir` only succeeds while the name still holds the empty directory this call made, so a
+    // directory a writer filled keeps the name that holds it.
+    await fs.rmdir(destination).catch(() => {});
   }
 }
 
@@ -157,6 +185,25 @@ export function createCheckoutPaths(
    * creates are recorded, so a rollback cannot remove a directory the checkout already had.
    */
   const createdDirectories: string[] = [];
+  /**
+   * Gives back a name a directory creation just took, and drops the turn's record of it so a
+   * rollback cannot act on a path this turn no longer holds. The path is resolved the same way the
+   * creation resolved it, so the name removed is the one this turn made, wherever the link a writer
+   * swapped in points; `rmdir` reports a directory that is no longer empty instead of removing it,
+   * so anything a writer put there in the meantime keeps the name that holds it.
+   */
+  const giveBackCreatedDirectory = async (relative: string) => {
+    const given = await fs
+      .rmdir(path.join(cwd, relative))
+      .then(() => true)
+      .catch(() => false);
+    if (given) {
+      const recorded = createdDirectories.indexOf(relative);
+      if (recorded !== -1) {
+        createdDirectories.splice(recorded, 1);
+      }
+    }
+  };
   const createRealDirectories = async (
     relative: string,
     admit?: () => boolean,
@@ -193,13 +240,18 @@ export function createCheckoutPaths(
       // The `mkdir` resolved the whole pathname, so a component a writer replaced with a link
       // after its own check would have created this directory wherever that link points. The path
       // is read back and a directory created outside the checkout is refused like any other
-      // occupied path, which moves the link aside before the next attempt writes through it.
+      // occupied path, which moves the link aside before the next attempt writes through it. The
+      // name this turn took is given back first: the refusal is what ends this attempt, and a retry
+      // that succeeded afterwards would otherwise leave a directory this turn made, at a path
+      // outside the checkout, behind it.
       if (!(await resolvesInsideCheckout(target))) {
+        await giveBackCreatedDirectory(current);
         throw Object.assign(new Error(`${current} is outside the checkout`), { code: "EEXIST" });
       }
       // A link to another path inside the checkout keeps the resolved parent inside the root, so
       // containment alone accepts a directory that the intended path does not reach.
       if (!(await reachesIntendedDirectories(current))) {
+        await giveBackCreatedDirectory(current);
         throw Object.assign(new Error(`${current} is behind a link in the checkout`), {
           code: "EEXIST",
         });
