@@ -84,23 +84,31 @@ export function createCheckoutPaths(
     return relative;
   };
   /**
-   * Whether a path resolves inside the checkout. Creating or reading an entry resolves the whole
-   * pathname at once, so an ancestor a writer swapped for a symlink after this turn checked it can
-   * only be observed afterwards, and only the resolved path shows it. The leaf is never followed:
-   * a placed symlink points wherever the incoming entry points, which is not a place this decides.
-   * The checkout root is resolved the same way, so a checkout under a symlinked temporary
-   * directory is not a mismatch.
+   * The directory a path's parent resolves to, or `undefined` when that directory is not inside the
+   * checkout. Creating or reading an entry resolves the whole pathname at once, so an ancestor a
+   * writer swapped for a symlink after this turn checked it can only be observed afterwards, and
+   * only the resolved path shows it. The leaf is never followed: a placed symlink points wherever
+   * the incoming entry points, which is not a place this decides. The checkout root is resolved the
+   * same way, so a checkout under a symlinked temporary directory is not a mismatch. Callers that
+   * then change the checkout keep the answer, so the same read can be taken again afterwards and the
+   * two compared.
    */
   let checkoutRoot: string | undefined;
-  const resolvesInsideCheckout = async (target: string) => {
+  const resolvedCheckoutParent = async (target: string) => {
     checkoutRoot ??= await fs.realpath(cwd).catch(() => undefined);
     const parent = await fs.realpath(path.dirname(target)).catch(() => undefined);
-    return (
-      checkoutRoot !== undefined &&
-      parent !== undefined &&
-      (parent === checkoutRoot || parent.startsWith(`${checkoutRoot}${path.sep}`))
-    );
+    if (
+      checkoutRoot === undefined ||
+      parent === undefined ||
+      (parent !== checkoutRoot && !parent.startsWith(`${checkoutRoot}${path.sep}`))
+    ) {
+      return undefined;
+    }
+    return parent;
   };
+  /** Whether a path resolves inside the checkout, which is all a placement asks of it. */
+  const resolvesInsideCheckout = async (target: string) =>
+    (await resolvedCheckoutParent(target)) !== undefined;
   /**
    * Whether a checkout-relative path is still reached through the directories this turn approved,
    * which is stricter than resolving inside the root: a writer that replaces one of them with a
@@ -210,28 +218,46 @@ export function createCheckoutPaths(
    * instant it runs, so a writer that replaced an ancestor of an approved path with a link would have
    * this turn move a file that lives outside the checkout under the Git directory and destroy the
    * name it had there — and the placement checks that follow cannot put back a source name they
-   * never saw. The resolved parent and the intended chain are therefore both read again immediately
-   * before the move, exactly as a placement reads them, and a path that fails either is left where
-   * it is so the caller can refuse the replacement instead.
+   * never saw.
+   *
+   * Reading the parent before the move is not enough on its own: the read and the rename are
+   * separate system calls, and the writer owns the interval between them. The move therefore takes
+   * the parent the rename would resolve through, and takes it again once the rename has run — a
+   * parent that now resolves somewhere else is one the rename followed out of the checkout, and the
+   * entry it took is put back at the name it had outside. Nothing this turn holds records that name,
+   * so the answer from before the move is the only thing that can restore it. The destination is
+   * resolved first and the caller's fence is read last, so the syscall is the first thing this turn
+   * does after it learned both that the path still reaches the checkout and that it still owns it.
    */
   const moveIntoRecovery = async (
     relative: string,
     source: string,
+    admit?: () => boolean,
   ): Promise<string | undefined> => {
-    if (
-      !(await resolvesInsideCheckout(source)) ||
-      !(await reachesIntendedDirectories(path.dirname(relative)))
-    ) {
-      return undefined;
-    }
     const preserved = path.join(
       await recovery.ensureRecoveryDirectory(),
       recovery.recoveryName(relative),
     );
-    return await fs
+    const parent = await resolvedCheckoutParent(source);
+    if (parent === undefined || !(await reachesIntendedDirectories(path.dirname(relative)))) {
+      return undefined;
+    }
+    if (admit && !admit()) {
+      return undefined;
+    }
+    const moved = await fs
       .rename(source, preserved)
-      .then(() => preserved)
-      .catch(() => undefined);
+      .then(() => true)
+      .catch(() => false);
+    if (!moved) {
+      return undefined;
+    }
+    const afterwards = await fs.realpath(path.dirname(source)).catch(() => undefined);
+    if (afterwards === parent) {
+      return preserved;
+    }
+    await fs.rename(preserved, path.join(parent, path.basename(source))).catch(() => {});
+    return undefined;
   };
   return {
     blockingPath,

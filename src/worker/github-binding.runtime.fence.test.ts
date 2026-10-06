@@ -405,4 +405,89 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
     expect(warn).not.toHaveBeenCalled();
   });
+
+  it("does not start the move when the turn is fenced while the move reads its source", async () => {
+    const nested = "nested";
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, nested));
+    await fs.writeFile(path.join(cwd, nested, collision), "base file\n");
+    initialHead = await commit(cwd, "Track nested collision file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, nested, collision));
+      await fs.mkdir(path.join(seed, nested, collision));
+      await fs.writeFile(path.join(seed, nested, collision, "remote.txt"), "remote file\n");
+    });
+
+    // Setting the approved path aside is the first mutation of the move, and the reads that decide
+    // whether the path still reaches the checkout do not observe the abort. Marking the transaction
+    // started before them would let a fence that landed while they ran still set the path aside under
+    // the Git directory and advance the branch; the move therefore reads the fence itself, at the
+    // rename those reads lead to, and a turn fenced during them owes the checkout the untouched state
+    // every earlier fence owes it.
+    const parent = path.join(cwd, nested);
+    const controller = new AbortController();
+    const realpath = fs.realpath;
+    vi.spyOn(fs, "realpath").mockImplementation(async (...args: Parameters<typeof fs.realpath>) => {
+      if (String(args[0]) === parent && !controller.signal.aborted) {
+        controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
+      }
+      return await realpath(...args);
+    });
+    const runner = vi.spyOn(exec, "runCommandWithTimeout");
+
+    await fixture.prepare({ signal: controller.signal });
+
+    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(remoteHead).not.toBe(initialHead);
+    await expect(fs.readFile(path.join(parent, collision), "utf8")).resolves.toBe("base file\n");
+    await expect(replacedBytes()).resolves.toEqual([]);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("does not create a placed link when the turn is fenced while its destination is read", async () => {
+    await fs.writeFile(path.join(cwd, "tracked.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track base file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const link = "link";
+    const destination = "tracked.txt";
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.symlink(destination, path.join(seed, link));
+    });
+
+    // A symlink entry is materialized from the destination its staging copy holds, and that read is
+    // the placement's last await. The fence is read after it, so a turn that lost the checkout while
+    // the destination was read has created nothing, rather than a link whose path the next turn would
+    // otherwise read as a checkout state it did not make.
+    const controller = new AbortController();
+    const readlink = fs.readlink;
+    let destinationReads = 0;
+    vi.spyOn(fs, "readlink").mockImplementation(async (...args: Parameters<typeof fs.readlink>) => {
+      if (String(args[0]).includes("incoming-")) {
+        destinationReads += 1;
+        if (destinationReads === 2 && !controller.signal.aborted) {
+          controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
+        }
+      }
+      return await readlink(...args);
+    });
+    const runner = vi.spyOn(exec, "runCommandWithTimeout");
+
+    await fixture.prepare({ signal: controller.signal });
+
+    expect(destinationReads).toBe(2);
+    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(remoteHead).not.toBe(initialHead);
+    await expect(
+      fs.lstat(path.join(cwd, link)).then(
+        () => true,
+        () => false,
+      ),
+    ).resolves.toBe(false);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
 });

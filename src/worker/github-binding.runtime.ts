@@ -334,10 +334,13 @@ async function bindWorkerGitHubCheckout(
      * Replacing a path means moving it aside, so a writer's bytes survive at one of the two. The
      * move itself is guarded where the path rules live: a rename resolves the whole pathname at the
      * instant it runs, so an ancestor a writer swapped for a link would otherwise move a file from
-     * outside the checkout into the recovery directory. An undefined answer means the path no longer
-     * reaches this checkout's own directories, and the replacement is refused rather than performed.
+     * outside the checkout into the recovery directory. An undefined answer means the move was
+     * refused, which is either the path no longer reaching this checkout's own directories or the
+     * caller's fence landing first, and the caller tells those two apart. A caller whose move is the
+     * turn's first mutation hands its own fence read down to the site, so the fence is read there.
      */
-    const moveAside = (relative: string) => moveIntoRecovery(relative, path.join(cwd, relative));
+    const moveAside = (relative: string, admit?: () => boolean) =>
+      moveIntoRecovery(relative, path.join(cwd, relative), admit);
     /**
      * Every restoration refuses an occupied path instead of replacing what is there, so a writer
      * that recreated the path in the meantime keeps its bytes and the preserved entry stays
@@ -578,6 +581,13 @@ async function bindWorkerGitHubCheckout(
       return mutationStarted;
     };
     /**
+     * Whether a refused mutation site was refused by the fence rather than by a path rule. The fence
+     * that lands before this turn's first mutation leaves the checkout as the turn found it, so a
+     * caller that only reads the refusal can tell the two apart by asking whether anything was ever
+     * admitted: the site reads the fence itself and marks the transaction started only there.
+     */
+    const refusedByFence = () => !mutationStarted && signal?.aborted === true;
+    /**
      * Moves the branch to the fetched commit after copying the index, which `reset --mixed` writes
      * before it moves the branch. Every reset has to go through here: a failure afterwards leaves
      * the incoming entries staged against the head the checkout still has, and a turn that cannot
@@ -671,12 +681,20 @@ async function bindWorkerGitHubCheckout(
         return;
       }
       for (const collisionPath of removableTrackedCollisions) {
-        mutationStarted = true;
-        const preserved = await moveAside(collisionPath);
-        // The classification approved this path from the directory chain it read; a path that no
-        // longer reaches that chain must not be moved at all, or the rename would take whatever the
-        // pathname now names — a file outside the checkout included — under the Git directory.
+        // Setting the first path aside is this turn's first mutation, and the move's own reads do not
+        // observe the abort, so it reads the fence itself at its rename; marking the transaction
+        // started before those reads would let a fence that landed during them still set the path
+        // aside, which is the opposite of leaving the checkout as the turn found it.
+        const preserved = await moveAside(collisionPath, admitFirstMutation);
         if (preserved === undefined) {
+          // A fence that landed before this turn mutated anything has left the checkout as it was
+          // found, so the branch stays where it is and the next turn repeats the same fast-forward.
+          if (refusedByFence()) {
+            return;
+          }
+          // The classification approved this path from the directory chain it read; a path that no
+          // longer reaches that chain must not be moved at all, or the rename would take whatever
+          // the pathname now names — a file outside the checkout included — under the Git directory.
           throw new Error(`approved path no longer reaches the checkout: ${collisionPath}`);
         }
         movedAside.push({ relative: collisionPath, preserved });
@@ -728,15 +746,20 @@ async function bindWorkerGitHubCheckout(
           if (gitlink) {
             return true;
           }
-          // A top-level entry has no directory to create, so the entry itself is the first write.
+          // A symlink entry is created from the destination its staging copy holds. Reading it here,
+          // rather than reusing the identity read above, is what makes it the placement's last await:
+          // the fence below is then the last thing before the syscall, and a turn that lost the
+          // checkout while the read ran has created nothing. A top-level entry has no directory to
+          // create, so the write below is the first one for it either way.
+          const destination = created.kind === "symlink" ? await fs.readlink(staged) : undefined;
           if (!admitFirstMutation()) {
             return false;
           }
-          if (stats?.isSymbolicLink()) {
-            await fs.symlink(await fs.readlink(staged), target);
-          } else {
+          if (destination === undefined) {
             // Linking refuses an occupied path, so a writer's bytes are never overwritten.
             await fs.link(staged, target);
+          } else {
+            await fs.symlink(destination, target);
           }
           // Creating the entry resolved the whole pathname, so a writer that swapped an ancestor for
           // a link after `createRealDirectories` checked it would have put the incoming file outside
@@ -796,10 +819,16 @@ async function bindWorkerGitHubCheckout(
             if (attempt + 1 >= placementAttempts) {
               break;
             }
-            const preserved = await moveAside(blocking);
-            // A blocker the move refuses is one this turn cannot free without reaching outside the
-            // checkout, so the placement stays occupied and the turn refuses it below.
+            // This move can be the turn's first mutation too — a placement that met an occupied
+            // directory has not written anything yet — so it reads the fence at its own rename.
+            const preserved = await moveAside(blocking, admitFirstMutation);
             if (preserved === undefined) {
+              // A fence that landed before this turn mutated anything leaves the checkout as it was
+              // found; a blocker this turn cannot free without reaching outside the checkout stays
+              // occupied, and the placement is refused below.
+              if (refusedByFence()) {
+                return;
+              }
               break;
             }
             movedAside.push({ relative: blocking, preserved });
