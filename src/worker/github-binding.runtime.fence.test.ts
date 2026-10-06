@@ -490,4 +490,57 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
     expect(warn).not.toHaveBeenCalled();
   });
+
+  it("leaves a fenced turn untouched when the writer occupies its first write", async () => {
+    const incoming = "new-file.txt";
+    await git(cwd, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    await fs.writeFile(path.join(seed, incoming), "remote file\n");
+    const remoteHead = await commit(seed, "Earlier turn");
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+
+    // The writer takes the incoming path while the placement's first `link` is in flight, so that
+    // `link` fails with `EEXIST` and nothing has been written yet; the fence lands in the same call.
+    // The turn never mutated the checkout, so it still owes the fence the decision: reading the
+    // admission once and remembering it before the syscall would let this retry move the writer's
+    // file aside and advance the branch under a turn that had already been revoked.
+    const controller = new AbortController();
+    const link = fs.link;
+    let occupied = 0;
+    let fenced = true;
+    vi.spyOn(fs, "link").mockImplementation(async (from, to) => {
+      if (occupied === 0 && String(to).endsWith(incoming)) {
+        occupied += 1;
+        await fs.writeFile(to, "writer bytes\n");
+        if (fenced) {
+          controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
+        }
+      }
+      return await link(from, to);
+    });
+
+    await fixture.prepare({ signal: controller.signal });
+
+    expect(occupied).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    await expect(fs.readFile(path.join(cwd, incoming), "utf8")).resolves.toBe("writer bytes\n");
+    // Nothing was set aside, because the only write the turn attempted is the one that failed.
+    await expect(replacedBytes()).resolves.toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+
+    // The same placement under a live signal is not a dead end: the retry moves the writer's file
+    // aside and the incoming file lands, which is what tells the refusal apart from a path rule.
+    await fs.rm(path.join(cwd, incoming), { force: true });
+    occupied = 0;
+    fenced = false;
+    await fixture.prepare({ signal: new AbortController().signal });
+
+    expect(occupied).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(path.join(cwd, incoming), "utf8")).resolves.toBe("remote file\n");
+    await expect(replacedBytes()).resolves.toEqual(["writer bytes"]);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
 });

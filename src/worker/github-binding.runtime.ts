@@ -177,35 +177,43 @@ async function bindWorkerGitHubCheckout(
       }
       return (await entries).get(name.toLowerCase());
     };
-    const removableTrackedCollisions = new Set<string>();
+    const removableTrackedCollisions = new Map<string, string>();
     let hasPathPrefixCollision = false;
     // Inspect only incoming path components; unrelated workspace inventories can exceed output caps.
     for (const addedPath of added) {
       const segments = addedPath.split("/");
       let directory = cwd;
-      let collisionPath: string | undefined;
+      // The local spelling and the incoming one for the same blocking path. Everything asked of the
+      // incoming index has to be asked with the incoming spelling: a literal pathspec built from the
+      // local spelling of a path whose case differs matches no index entry at all, so the export
+      // would come back empty, nothing would be materialized, and the branch would advance over the
+      // path the move had just emptied.
+      let collision: { local: string; incoming: string } | undefined;
       for (const [index, segment] of segments.entries()) {
         const entry = await findLocalEntry(directory, segment);
         if (!entry) {
           break;
         }
         const isExactPath = index === segments.length - 1;
-        if (!entry.isDirectory) {
-          if (!isExactPath) {
-            collisionPath = path.relative(cwd, path.join(directory, entry.name));
-          }
-          break;
+        if (entry.isDirectory && !isExactPath) {
+          directory = path.join(directory, entry.name);
+          continue;
         }
-        if (isExactPath) {
-          collisionPath = path.relative(cwd, path.join(directory, entry.name));
-          break;
+        // A local entry that is not a directory where the incoming path continues below it is a
+        // collision too; a local file the incoming path ends at is the same entry under one spelling
+        // of it and blocks nothing.
+        if (entry.isDirectory || !isExactPath) {
+          collision = {
+            local: path.relative(cwd, path.join(directory, entry.name)),
+            incoming: segments.slice(0, index + 1).join("/"),
+          };
         }
-        directory = path.join(directory, entry.name);
+        break;
       }
-      if (!collisionPath) {
+      if (!collision) {
         continue;
       }
-      const gitPath = collisionPath.split(path.sep).join("/");
+      const gitPath = collision.local.split(path.sep).join("/");
       const status = await requireGit([
         "--literal-pathspecs",
         "status",
@@ -261,12 +269,12 @@ async function bindWorkerGitHubCheckout(
         }
         return false;
       };
-      const collisionIsDirectory = (await fs.lstat(path.join(cwd, collisionPath))).isDirectory();
+      const collisionIsDirectory = (await fs.lstat(path.join(cwd, collision.local))).isDirectory();
       if (collisionIsDirectory && (await holdsUnreproducibleEntry(gitPath))) {
         hasPathPrefixCollision = true;
         break;
       }
-      removableTrackedCollisions.add(collisionPath);
+      removableTrackedCollisions.set(collision.local, collision.incoming);
     }
     if (hasPathPrefixCollision) {
       log.warn(`GitHub checkout fast-forward skipped: local path conflicts with ${binding.branch}`);
@@ -337,10 +345,13 @@ async function bindWorkerGitHubCheckout(
      * outside the checkout into the recovery directory. An undefined answer means the move was
      * refused, which is either the path no longer reaching this checkout's own directories or the
      * caller's fence landing first, and the caller tells those two apart. A caller whose move is the
-     * turn's first mutation hands its own fence read down to the site, so the fence is read there.
+     * turn's first mutation hands its own fence read down to the site, so the fence is read there,
+     * and hands its own mutation report down as well: the move changes the checkout the moment its
+     * rename succeeds, so a turn whose first mutation was this move owes the rest of its bounded work
+     * even though no placement ran yet.
      */
-    const moveAside = (relative: string, admit?: () => boolean) =>
-      moveIntoRecovery(relative, path.join(cwd, relative), admit);
+    const moveAside = (relative: string, admit?: () => boolean, markMutated?: () => void) =>
+      moveIntoRecovery(relative, path.join(cwd, relative), admit, markMutated);
     /**
      * Every restoration refuses an occupied path instead of replacing what is there, so a writer
      * that recreated the path in the meantime keeps its bytes and the preserved entry stays
@@ -571,22 +582,27 @@ async function bindWorkerGitHubCheckout(
      * fence; the awaits that lead here do not observe the abort, so a fence that lands during them
      * would otherwise be missed at the one step that makes the move observable. The fence is
      * therefore re-read here, as late as possible, and each mutation path calls this immediately
-     * before its own first write. Once a mutation is admitted the bounded local work completes even
-     * if the fence lands later, which is what keeps the branch, the index and the working tree
-     * consistent with one another.
+     * before its own first write.
+     *
+     * What makes the turn owe the rest of its bounded work is a write that *succeeded*, not one that
+     * was admitted: an attempt that a writer's file refused — an occupied destination, a directory a
+     * link redirected — has changed nothing, so a fence that landed while it was failing still finds
+     * a checkout the turn never touched and must be able to end the turn. The admission is therefore
+     * answered from whether a mutation has been reported, and every syscall that changes the checkout
+     * reports itself the moment it succeeds.
      */
-    let mutationStarted = false;
-    const admitFirstMutation = () => {
-      mutationStarted ||= signal?.aborted !== true;
-      return mutationStarted;
+    let mutationCommitted = false;
+    const admitFirstMutation = () => mutationCommitted || signal?.aborted !== true;
+    const noteCommittedMutation = () => {
+      mutationCommitted = true;
     };
     /**
      * Whether a refused mutation site was refused by the fence rather than by a path rule. The fence
      * that lands before this turn's first mutation leaves the checkout as the turn found it, so a
      * caller that only reads the refusal can tell the two apart by asking whether anything was ever
-     * admitted: the site reads the fence itself and marks the transaction started only there.
+     * committed: the site reads the fence itself and reports a write only once it succeeded.
      */
-    const refusedByFence = () => !mutationStarted && signal?.aborted === true;
+    const refusedByFence = () => !mutationCommitted && signal?.aborted === true;
     /**
      * Moves the branch to the fetched commit after copying the index, which `reset --mixed` writes
      * before it moves the branch. Every reset has to go through here: a failure afterwards leaves
@@ -610,6 +626,7 @@ async function bindWorkerGitHubCheckout(
       if (result.code !== 0) {
         throw new Error(`git reset --mixed FETCH_HEAD failed (exit ${result.code})`);
       }
+      noteCommittedMutation();
       // The index the reset wrote is the one the checkout now has, so the backup is not needed.
       indexTransaction.markSpent();
     };
@@ -629,7 +646,11 @@ async function bindWorkerGitHubCheckout(
       // approved paths are exported too, because setting them aside makes them absent: the export
       // covers every path the move below can need, and everything after it only moves and links
       // content that is already on disk.
-      const candidates = [...new Set([...absent, ...removableTrackedCollisions])];
+      // The approved paths are asked of the incoming index under the *incoming* spelling: a literal
+      // pathspec built from the local spelling of a path whose case differs matches no index entry,
+      // so the export would come back empty, nothing would be materialized, and the branch would
+      // advance over the path the move had just emptied.
+      const candidates = [...new Set([...absent, ...removableTrackedCollisions.values()])];
       // A submodule entry has no content to materialize; Git expects the directory to exist and
       // reports its absence as a deletion of the entry, so those paths are created as directories.
       const stagedEntries =
@@ -680,12 +701,12 @@ async function bindWorkerGitHubCheckout(
       if (signal?.aborted) {
         return;
       }
-      for (const collisionPath of removableTrackedCollisions) {
+      for (const collisionPath of removableTrackedCollisions.keys()) {
         // Setting the first path aside is this turn's first mutation, and the move's own reads do not
-        // observe the abort, so it reads the fence itself at its rename; marking the transaction
-        // started before those reads would let a fence that landed during them still set the path
-        // aside, which is the opposite of leaving the checkout as the turn found it.
-        const preserved = await moveAside(collisionPath, admitFirstMutation);
+        // observe the abort, so it reads the fence itself at its rename; reporting the mutation
+        // before those reads would let a fence that landed during them still set the path aside,
+        // which is the opposite of leaving the checkout as the turn found it.
+        const preserved = await moveAside(collisionPath, admitFirstMutation, noteCommittedMutation);
         if (preserved === undefined) {
           // A fence that landed before this turn mutated anything has left the checkout as it was
           // found, so the branch stays where it is and the next turn repeats the same fast-forward.
@@ -739,7 +760,9 @@ async function bindWorkerGitHubCheckout(
             // itself, immediately before each `mkdir`, after the parent read that does not observe
             // the abort; a refusal there has created nothing, so the turn can still be left as it
             // was found. For an entry with no directory to create, the write below is the first one.
-            if (!(await createRealDirectories(directories, admitFirstMutation))) {
+            if (
+              !(await createRealDirectories(directories, admitFirstMutation, noteCommittedMutation))
+            ) {
               return false;
             }
           }
@@ -761,6 +784,9 @@ async function bindWorkerGitHubCheckout(
           } else {
             await fs.symlink(destination, target);
           }
+          // The entry is in the working tree, so the placement is the turn's mutation even when
+          // nothing before it was, and the turn owes the rest of its bounded work from here on.
+          noteCommittedMutation();
           // Creating the entry resolved the whole pathname, so a writer that swapped an ancestor for
           // a link after `createRealDirectories` checked it would have put the incoming file outside
           // the checkout, where nothing owns it and no later turn repairs it. The resolved parent is
@@ -821,7 +847,7 @@ async function bindWorkerGitHubCheckout(
             }
             // This move can be the turn's first mutation too — a placement that met an occupied
             // directory has not written anything yet — so it reads the fence at its own rename.
-            const preserved = await moveAside(blocking, admitFirstMutation);
+            const preserved = await moveAside(blocking, admitFirstMutation, noteCommittedMutation);
             if (preserved === undefined) {
               // A fence that landed before this turn mutated anything leaves the checkout as it was
               // found; a blocker this turn cannot free without reaching outside the checkout stays

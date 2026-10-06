@@ -245,4 +245,58 @@ describe("checkout path rules beside a writer that moves the name", () => {
     await expect(fs.readdir(outside)).resolves.toEqual([]);
     expect(paths.createdDirectories).toEqual([]);
   });
+
+  it("keeps an unrelated file out of the Git directory when the link moves at the rename", async () => {
+    const verified = path.join(root, "verified");
+    const redirected = path.join(root, "redirected");
+    await fs.mkdir(verified);
+    await fs.mkdir(redirected);
+    const nested = path.join(cwd, "nested");
+    await fs.symlink(verified, nested);
+    const staged = path.join(root, "staged.txt");
+    await fs.writeFile(staged, "incoming bytes\n");
+    const target = path.join(nested, "remote.txt");
+    await fs.link(staged, target);
+    const stats = await fs.stat(staged);
+    const created: CreatedEntry = { kind: "inode", dev: stats.dev, ino: stats.ino };
+    // A file of the writer's own, in the directory the same link is aimed at afterwards.
+    const writerFile = path.join(redirected, "remote.txt");
+    await fs.writeFile(writerFile, "writer bytes\n");
+
+    // Redirecting the link *inside the rename* is the interval the identity comparison cannot cover:
+    // the comparison answered about the directory the link named when it ran, and the rename consumes
+    // the name its own pathname resolves to at the instant it runs. Taking the parent's resolved name
+    // as the source instead leaves the syscall nothing to resolve, so it can only move the entry this
+    // turn compared. The writer then refills the outside name the redirected move would have emptied,
+    // which is what the repair a redirected move triggers runs into: a repair that follows the
+    // pathname again asks the writer's own file for the name, is refused, and leaves the unrelated
+    // entry it took under the disposable checkout's Git directory.
+    const rename = fs.rename;
+    let swapped = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (swapped === 0 && String(to).endsWith("preserved-remote.txt")) {
+        swapped = 1;
+        await fs.rm(nested, { force: true });
+        await fs.symlink(redirected, nested);
+        const result = await rename(from, to);
+        await fs.writeFile(writerFile, "refilled bytes\n");
+        return result;
+      }
+      return await rename(from, to);
+    });
+    const { directory, recovery } = recoveryBeside(async () => {});
+    const paths = createCheckoutPaths(cwd, recovery);
+
+    await paths.takeBackMisplaced("nested/remote.txt", target, created);
+
+    expect(swapped).toBe(1);
+    // The entry the take-back was after is the one that moved. The redirect took the move out of the
+    // directory it was compared in, so the repair gave that entry back and the writer's directory was
+    // never touched: nothing of the writer's is under the Git directory.
+    await expect(fs.readFile(path.join(verified, "remote.txt"), "utf8")).resolves.toBe(
+      "incoming bytes\n",
+    );
+    await expect(fs.readFile(writerFile, "utf8")).resolves.toBe("refilled bytes\n");
+    await expect(fs.readdir(directory)).resolves.toEqual([]);
+  });
 });

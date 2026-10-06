@@ -632,6 +632,39 @@ describe("prepareWorkerGitHubEnvironment", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("replaces a clean local directory whose name differs by case from an incoming file", async () => {
+    isPathCaseInsensitive.mockReturnValueOnce(true);
+    const localSpelling = "Collision";
+    const incomingSpelling = "collision";
+    await fs.mkdir(path.join(cwd, localSpelling));
+    await fs.writeFile(path.join(cwd, localSpelling, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track the local spelling");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, localSpelling), { recursive: true });
+      await fs.writeFile(path.join(seed, incomingSpelling), "remote file\n");
+    });
+
+    // The other half of the same alias: the local entry is a directory this time, so the incoming
+    // file's whole path is the collision and the deletion scan reports nothing missing for it — the
+    // name is present under the local spelling. Asking the incoming index with the local spelling
+    // matches no index entry at all, so the export would come back empty, the move would set the
+    // path aside and nothing would be put back, and the branch would advance over it.
+    await prepare();
+
+    expect(remoteHead).not.toBe(initialHead);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(path.join(cwd, incomingSpelling), "utf8")).resolves.toBe(
+      "remote file\n",
+    );
+    expect((await git(cwd, "ls-files", "-z")).split("\0").filter(Boolean)).toEqual([
+      incomingSpelling,
+    ]);
+    await expect(replacedBytes()).resolves.toEqual(["base file"]);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("leaves diverged local history and files untouched with one warning", async () => {
     const remoteHead = await publishEarlierTurn();
     await fs.writeFile(path.join(cwd, "local.txt"), "local commit\n");
