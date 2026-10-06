@@ -131,7 +131,10 @@ export function createCheckoutPaths(
    * creates are recorded, so a rollback cannot remove a directory the checkout already had.
    */
   const createdDirectories: string[] = [];
-  const createRealDirectories = async (relative: string) => {
+  const createRealDirectories = async (
+    relative: string,
+    admit?: () => boolean,
+  ): Promise<boolean> => {
     let current = "";
     for (const segment of pathComponents(relative)) {
       current = current ? `${current}/${segment}` : segment;
@@ -142,6 +145,13 @@ export function createCheckoutPaths(
           throw Object.assign(new Error(`${current} is not a directory`), { code: "EEXIST" });
         }
         continue;
+      }
+      // Creating this directory is the caller's first write, and the `lstat` above is an await that
+      // does not observe the abort, so the caller's fence is read here — immediately before the
+      // syscall that changes the checkout — rather than at the call that led here. A refusal returns
+      // before anything was created, so the caller can leave the checkout as the turn found it.
+      if (admit && !admit()) {
+        return false;
       }
       try {
         await fs.mkdir(target);
@@ -169,6 +179,7 @@ export function createCheckoutPaths(
         });
       }
     }
+    return true;
   };
   /**
    * Takes a placement or a restoration that resolved outside the checkout back into the recovery
@@ -193,6 +204,35 @@ export function createCheckoutPaths(
     );
     await fs.rename(target, preserved).catch(() => {});
   };
+  /**
+   * Moves a path inside the checkout into the recovery directory, and refuses when the pathname no
+   * longer reaches the directories this checkout owns. A rename resolves the whole pathname at the
+   * instant it runs, so a writer that replaced an ancestor of an approved path with a link would have
+   * this turn move a file that lives outside the checkout under the Git directory and destroy the
+   * name it had there — and the placement checks that follow cannot put back a source name they
+   * never saw. The resolved parent and the intended chain are therefore both read again immediately
+   * before the move, exactly as a placement reads them, and a path that fails either is left where
+   * it is so the caller can refuse the replacement instead.
+   */
+  const moveIntoRecovery = async (
+    relative: string,
+    source: string,
+  ): Promise<string | undefined> => {
+    if (
+      !(await resolvesInsideCheckout(source)) ||
+      !(await reachesIntendedDirectories(path.dirname(relative)))
+    ) {
+      return undefined;
+    }
+    const preserved = path.join(
+      await recovery.ensureRecoveryDirectory(),
+      recovery.recoveryName(relative),
+    );
+    return await fs
+      .rename(source, preserved)
+      .then(() => preserved)
+      .catch(() => undefined);
+  };
   return {
     blockingPath,
     resolvesInsideCheckout,
@@ -200,5 +240,6 @@ export function createCheckoutPaths(
     createdDirectories,
     createRealDirectories,
     takeBackMisplaced,
+    moveIntoRecovery,
   };
 }

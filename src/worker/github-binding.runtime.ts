@@ -14,6 +14,7 @@ import { isPathCaseInsensitive } from "../infra/path-case.js";
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { createCheckoutPaths, type CreatedEntry } from "./github-binding.checkout-paths.js";
+import { createIndexTransaction } from "./github-binding.index-transaction.js";
 import type { WorkerGitHubLaunchBinding } from "./launch-descriptor.js";
 
 const log = createSubsystemLogger("worker/github");
@@ -327,13 +328,16 @@ async function bindWorkerGitHubCheckout(
       createdDirectories,
       createRealDirectories,
       takeBackMisplaced,
+      moveIntoRecovery,
     } = createCheckoutPaths(cwd, { ensureRecoveryDirectory, recoveryName });
-    /** Replacing a path means moving it aside, so a writer's bytes survive at one of the two. */
-    const moveAside = async (relative: string) => {
-      const preserved = path.join(await ensureRecoveryDirectory(), recoveryName(relative));
-      await fs.rename(path.join(cwd, relative), preserved);
-      return preserved;
-    };
+    /**
+     * Replacing a path means moving it aside, so a writer's bytes survive at one of the two. The
+     * move itself is guarded where the path rules live: a rename resolves the whole pathname at the
+     * instant it runs, so an ancestor a writer swapped for a link would otherwise move a file from
+     * outside the checkout into the recovery directory. An undefined answer means the path no longer
+     * reaches this checkout's own directories, and the replacement is refused rather than performed.
+     */
+    const moveAside = (relative: string) => moveIntoRecovery(relative, path.join(cwd, relative));
     /**
      * Every restoration refuses an occupied path instead of replacing what is there, so a writer
      * that recreated the path in the meantime keeps its bytes and the preserved entry stays
@@ -505,13 +509,11 @@ async function bindWorkerGitHubCheckout(
         if (!stagedEntry) {
           continue;
         }
-        const preserved = path.join(await ensureRecoveryDirectory(), recoveryName(relative));
-        if (
-          !(await fs
-            .rename(target, preserved)
-            .then(() => true)
-            .catch(() => false))
-        ) {
+        // The rollback resolves this pathname again as well, so it owes the same guarantee the move
+        // aside owes: an ancestor a writer swapped for a link would make this rename take a file
+        // from outside the checkout. A refused move leaves the placement exactly where it is.
+        const preserved = await moveIntoRecovery(relative, target);
+        if (preserved === undefined) {
           continue;
         }
         const moved = await fs.lstat(preserved).catch(() => undefined);
@@ -541,50 +543,12 @@ async function bindWorkerGitHubCheckout(
     // checkout's index, so HEAD and the index only move after every incoming file is in place.
     const incomingIndex = path.join(gitDirectory, "github-checkout-incoming.index");
     const incomingEnv = { GIT_INDEX_FILE: incomingIndex };
-    /**
-     * `reset --mixed` writes the checkout's index before it moves the branch, so a failure after
-     * that point leaves the incoming entries staged against the head the checkout still has, and
-     * every later turn would read that mixture as local work and keep skipping the fast-forward.
-     * The index is copied before the move and put back byte for byte when the move fails, and a
-     * checkout whose index cannot be copied is not one this turn advances: the reset writes the
-     * index anyway, and a branch ref that then refused would leave the mixture behind with no copy
-     * to put back. The copy is discarded only once it is not the checkout's own index — after the
-     * reset it describes, or after it was put back — and an unsuccessful restoration keeps it,
-     * because it then holds the only copy of the index the checkout still describes.
-     */
-    const previousIndex = path.join(gitDirectory, "github-checkout-previous.index");
-    let indexBackup: "absent" | "live" | "spent" = "absent";
-    /**
-     * A turn that could not put the index back keeps its copy, because it is then the only description
-     * of the head the checkout still has. The name it keeps is fixed, so the next turn would discard
-     * it in its own cleanup or overwrite it while preparing its copy, and the preservation would last
-     * only until that turn reached these paths. An outstanding copy is therefore moved under the
-     * recovery directory first, where it keeps a name of its own and no later turn reuses it; a copy
-     * that cannot be moved aside stops the turn before it mutates anything.
-     */
-    const outstandingIndex = await fs.lstat(previousIndex).catch(() => undefined);
-    if (outstandingIndex) {
-      const kept = await fs.mkdtemp(path.join(await ensureRecoveryDirectory(), "previous-index-"));
-      await fs.rename(previousIndex, path.join(kept, "index"));
-    }
-    const backUpCheckoutIndex = async () => {
-      if (indexBackup === "absent") {
-        await fs.copyFile(path.join(gitDirectory, "index"), previousIndex);
-        indexBackup = "live";
-      }
-    };
-    const putBackCheckoutIndex = async () => {
-      if (indexBackup !== "live") {
-        return;
-      }
-      const putBack = await fs
-        .rename(previousIndex, path.join(gitDirectory, "index"))
-        .then(() => true)
-        .catch(() => false);
-      if (putBack) {
-        indexBackup = "spent";
-      }
-    };
+    // The index copy that has to precede the reset is a concern of its own: it is taken once, put
+    // back when the move it describes fails, and kept when putting it back did not work.
+    const indexTransaction = await createIndexTransaction({
+      gitDirectory,
+      ensureRecoveryDirectory,
+    });
     /**
      * Whether the branch already sits at the fetched commit. The rollback follows the branch that is
      * actually there instead of inferring it from a command's exit: a reset that failed can still
@@ -624,7 +588,7 @@ async function bindWorkerGitHubCheckout(
      * the rollback re-reads the branch instead of trusting or second-guessing the exit.
      */
     const moveBranchToFetchedCommit = async () => {
-      await backUpCheckoutIndex();
+      await indexTransaction.backUp();
       // An incoming history that only rewrites existing files materializes nothing, so this reset is
       // the first mutation of the turn — and the copy above is a filesystem call that does not
       // observe the abort. Re-reading the fence after it is what keeps a turn fenced while the index
@@ -637,7 +601,7 @@ async function bindWorkerGitHubCheckout(
         throw new Error(`git reset --mixed FETCH_HEAD failed (exit ${result.code})`);
       }
       // The index the reset wrote is the one the checkout now has, so the backup is not needed.
-      indexBackup = "spent";
+      indexTransaction.markSpent();
     };
     let staging: string | undefined;
     let replaced = false;
@@ -708,7 +672,14 @@ async function bindWorkerGitHubCheckout(
       }
       for (const collisionPath of removableTrackedCollisions) {
         mutationStarted = true;
-        movedAside.push({ relative: collisionPath, preserved: await moveAside(collisionPath) });
+        const preserved = await moveAside(collisionPath);
+        // The classification approved this path from the directory chain it read; a path that no
+        // longer reaches that chain must not be moved at all, or the rename would take whatever the
+        // pathname now names — a file outside the checkout included — under the Git directory.
+        if (preserved === undefined) {
+          throw new Error(`approved path no longer reaches the checkout: ${collisionPath}`);
+        }
+        movedAside.push({ relative: collisionPath, preserved });
       }
       // Setting a path aside is what makes it absent, so the list is read again after the move: the
       // paths this turn just emptied are exactly the ones the move below has to put back. A path a
@@ -741,15 +712,25 @@ async function bindWorkerGitHubCheckout(
           stats?.isSymbolicLink() === true
             ? { kind: "symlink", destination: await fs.readlink(staged) }
             : { kind: "inode", dev: stats?.dev ?? 0, ino: stats?.ino ?? 0 };
-        const place = async () => {
+        const place = async (): Promise<boolean> => {
           // A submodule entry has no content of its own, so the directory Git expects is the whole
           // result; everything else needs its parent directories to exist first.
           const directories = gitlink ? file : path.dirname(file);
           if (directories !== ".") {
-            await createRealDirectories(directories);
+            // The directory creation is the first write for a nested entry, and it reads the fence
+            // itself, immediately before each `mkdir`, after the parent read that does not observe
+            // the abort; a refusal there has created nothing, so the turn can still be left as it
+            // was found. For an entry with no directory to create, the write below is the first one.
+            if (!(await createRealDirectories(directories, admitFirstMutation))) {
+              return false;
+            }
           }
           if (gitlink) {
-            return;
+            return true;
+          }
+          // A top-level entry has no directory to create, so the entry itself is the first write.
+          if (!admitFirstMutation()) {
+            return false;
           }
           if (stats?.isSymbolicLink()) {
             await fs.symlink(await fs.readlink(staged), target);
@@ -778,18 +759,23 @@ async function bindWorkerGitHubCheckout(
               code: "EEXIST",
             });
           }
+          return true;
         };
-        // Reading the staging copy above is the last await before the first write of the move, and
-        // it does not observe the abort either. A turn fenced while it ran has not created anything
-        // yet, so it owes the checkout an untouched state rather than a placed file and a moved
-        // branch; a turn that already set a path aside completes what it began.
-        if (!admitFirstMutation()) {
-          return;
-        }
+        // The fence is not read here: reading the staging copy above is only the last await before
+        // the first write for an entry that needs no directory, and a nested entry still has the
+        // parent `lstat` between this point and its write. Each placement reads the fence itself,
+        // immediately before the write it is about to make, which is the last point at which the
+        // checkout can still be left exactly as the turn found it. A turn that already set a path
+        // aside completes what it began, because that move is what makes the replacement
+        // observable and the admission is remembered.
         let materialized = false;
         for (let attempt = 0; attempt < placementAttempts && !materialized; attempt += 1) {
           try {
-            await place();
+            if (!(await place())) {
+              // The fence landed before this placement's first write and nothing was created, so
+              // the checkout is left as the turn found it and the branch does not move.
+              return;
+            }
             materialized = true;
           } catch (error) {
             if (!isOccupiedPathError(error)) {
@@ -810,7 +796,13 @@ async function bindWorkerGitHubCheckout(
             if (attempt + 1 >= placementAttempts) {
               break;
             }
-            movedAside.push({ relative: blocking, preserved: await moveAside(blocking) });
+            const preserved = await moveAside(blocking);
+            // A blocker the move refuses is one this turn cannot free without reaching outside the
+            // checkout, so the placement stays occupied and the turn refuses it below.
+            if (preserved === undefined) {
+              break;
+            }
+            movedAside.push({ relative: blocking, preserved });
           }
         }
         if (!materialized) {
@@ -836,7 +828,7 @@ async function bindWorkerGitHubCheckout(
       replaced ||= await branchReachedFetchedCommit();
       if (replaced) {
         // The branch is at the fetched commit, so the index the reset wrote is the checkout's own.
-        indexBackup = "spent";
+        indexTransaction.markSpent();
       }
       // Nothing has moved, so put the checkout back exactly as this turn found it: the paths this
       // turn set aside are what the next turn's fast-forward expects to classify, and the incoming
@@ -847,7 +839,7 @@ async function bindWorkerGitHubCheckout(
       // never overwrite a writer's bytes, so whatever is left under the Git directory is still
       // recoverable from there.
       if (!replaced) {
-        await putBackCheckoutIndex();
+        await indexTransaction.putBack();
         await undoPlacements();
         for (const { relative, preserved } of movedAside) {
           await restoreAside(relative, preserved);
@@ -864,11 +856,9 @@ async function bindWorkerGitHubCheckout(
         await fs.rm(staging, { recursive: true, force: true });
       }
       await fs.rm(incomingIndex, { force: true });
-      // "live" is the one state that must survive: it is the index the checkout still describes,
-      // reached when the reset ran and putting the copy back did not work.
-      if (indexBackup === "absent" || indexBackup === "spent") {
-        await fs.rm(previousIndex, { force: true });
-      }
+      // The copy is discarded in every state except the one that must survive: the index the
+      // checkout still describes, reached when the reset ran and putting it back did not work.
+      await indexTransaction.discardUnused();
     }
   } catch (error) {
     // Checkout metadata helps direct publication; a failure must not discard the coding turn.
