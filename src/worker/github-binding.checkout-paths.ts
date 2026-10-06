@@ -43,6 +43,24 @@ async function isCreatedEntry(entry: EntryStats, target: string, created: Create
 }
 
 /**
+ * Puts a preserved entry back at a name a move took it from without replacing whatever is there
+ * now. `link` refuses a name that already exists instead of taking it over, where the `rename` this
+ * replaces would replace the destination silently, so a writer that refilled the outside name while
+ * the move ran keeps its bytes and the preserved copy stays under the Git directory where its
+ * caller can still reach it. A directory cannot be linked, and a repair is not what makes the move
+ * safe, so a directory stays in the recovery directory as well.
+ */
+async function putBackWithoutReplacing(preserved: string, destination: string) {
+  const placed = await fs
+    .link(preserved, destination)
+    .then(() => true)
+    .catch(() => false);
+  if (placed) {
+    await fs.unlink(preserved).catch(() => {});
+  }
+}
+
+/**
  * The directory-boundary rules a placement has to satisfy before it may create a name in a checkout,
  * and the rule a take-back has to satisfy before it may move one. Every rule re-reads the filesystem
  * rather than trusting an earlier answer, because each check and the write it guards are separate
@@ -200,17 +218,37 @@ export function createCheckoutPaths(
    * leave the placement behind, so what the pathname names is compared with the entry this turn
    * created first and anything else is left exactly where it is — the placement retry moves the
    * blocker aside and writes into the path it freed instead.
+   *
+   * The recovery directory this moves the entry into may not exist yet, and creating it is an await
+   * like any other, so the writer owns that interval too. The parent the rename would resolve
+   * through is therefore read after the directory exists, and the identity is compared again as the
+   * last read before the syscall: a writer that moved the name onto one of its own files while the
+   * directory was being made is refused here rather than having its file taken under the Git
+   * directory. A parent that resolves somewhere else once the rename has run is the same writer
+   * working later, and the entry the rename took goes back to the name it had outside, which the
+   * answer from before the move is the only record of.
    */
   const takeBackMisplaced = async (relative: string, target: string, created: CreatedEntry) => {
-    const entry = await fs.lstat(target).catch(() => undefined);
-    if (!entry || !(await isCreatedEntry(entry, target, created))) {
-      return;
-    }
     const preserved = path.join(
       await recovery.ensureRecoveryDirectory(),
       recovery.recoveryName(relative),
     );
-    await fs.rename(target, preserved).catch(() => {});
+    const parent = await fs.realpath(path.dirname(target)).catch(() => undefined);
+    const entry = await fs.lstat(target).catch(() => undefined);
+    if (parent === undefined || !entry || !(await isCreatedEntry(entry, target, created))) {
+      return;
+    }
+    const moved = await fs
+      .rename(target, preserved)
+      .then(() => true)
+      .catch(() => false);
+    if (!moved) {
+      return;
+    }
+    const afterwards = await fs.realpath(path.dirname(target)).catch(() => undefined);
+    if (afterwards !== parent) {
+      await putBackWithoutReplacing(preserved, path.join(parent, path.basename(target)));
+    }
   };
   /**
    * Moves a path inside the checkout into the recovery directory, and refuses when the pathname no
@@ -225,9 +263,13 @@ export function createCheckoutPaths(
    * the parent the rename would resolve through, and takes it again once the rename has run — a
    * parent that now resolves somewhere else is one the rename followed out of the checkout, and the
    * entry it took is put back at the name it had outside. Nothing this turn holds records that name,
-   * so the answer from before the move is the only thing that can restore it. The destination is
-   * resolved first and the caller's fence is read last, so the syscall is the first thing this turn
-   * does after it learned both that the path still reaches the checkout and that it still owns it.
+   * so the answer from before the move is the only thing that can restore it. Putting the entry back
+   * is a write of its own, and the writer that redirected the move owns the name it came from by
+   * then: the compensation refuses a name that is occupied rather than replacing what appeared
+   * there, so a file the writer refilled the name with keeps its bytes and the entry the move took
+   * stays reachable under the Git directory. The destination is resolved first and the caller's
+   * fence is read last, so the syscall is the first thing this turn does after it learned both that
+   * the path still reaches the checkout and that it still owns it.
    */
   const moveIntoRecovery = async (
     relative: string,
@@ -256,7 +298,7 @@ export function createCheckoutPaths(
     if (afterwards === parent) {
       return preserved;
     }
-    await fs.rename(preserved, path.join(parent, path.basename(source))).catch(() => {});
+    await putBackWithoutReplacing(preserved, path.join(parent, path.basename(source)));
     return undefined;
   };
   return {
