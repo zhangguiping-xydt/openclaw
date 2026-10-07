@@ -151,9 +151,11 @@ async function putBackWithoutReplacing(preserved: string, destination: string) {
  * therefore created on its own and has to be a directory `lstat` reports as one, every name below
  * the root is made by `mkdtemp` so that a writer cannot place anything at it in advance, and each
  * created name is read back and has to resolve inside the Git directory. What acts through the tree
- * afterwards — a rename that carries an entry into it, a recursive removal that releases it —
- * re-reads that boundary rather than trusting the creation, because each creation and the call it
- * leads to are separate system calls.
+ * afterwards — a rename that carries an entry into it, a recursive removal that releases it, and the
+ * export that writes the incoming content below one of its names — re-reads that boundary rather than
+ * trusting the creation, because each creation and the call it leads to are separate system calls.
+ * The export is the one that writes rather than moves, so the name it is handed is checked to be the
+ * very directory that was made, both before and after the command.
  */
 export function createGitScratch(gitDirectory: string) {
   /**
@@ -161,6 +163,12 @@ export function createGitScratch(gitDirectory: string) {
    * checkout reached through a symlinked temporary directory is not a mismatch.
    */
   let boundary: string | undefined;
+  /**
+   * The directory each created scratch name was when it was made. A name is only this turn's to act
+   * through while it still denotes that directory, and a step that acts through one asks that of the
+   * recorded pair rather than trusting the creation.
+   */
+  const identity = new Map<string, { dev: number; ino: number }>();
   const resolvedBoundary = async () =>
     (boundary ??= await fs.realpath(gitDirectory).catch(() => undefined));
   /** Whether a name resolves to the Git directory itself or to a directory below it. */
@@ -197,7 +205,34 @@ export function createGitScratch(gitDirectory: string) {
     if (!(await insideGitDirectory(created))) {
       throw Object.assign(new Error(`${created} is outside the git directory`), { code: "EEXIST" });
     }
+    // The identity the name carried when this turn made it, kept for `holds` below.
+    const stats = await fs.lstat(created);
+    identity.set(created, { dev: stats.dev, ino: stats.ino });
     return created;
+  };
+  /**
+   * Whether a scratch directory this turn created still denotes the directory it created, and still
+   * resolves inside the Git directory. A scratch name reaches commands that act through a pathname —
+   * the incoming content is exported by `git checkout-index --prefix`, which resolves the whole
+   * prefix and writes every entry below it — and a creation and the command it leads to are separate
+   * system calls, so a writer that replaced the name in between would have the command act where the
+   * link points instead. The name is read again here, at the point of use, and it has to be the
+   * directory that was made: `lstat` reports a link as a link, never as the directory it names, so
+   * the identity pair is only ever found on a name the writer has left alone.
+   */
+  const holds = async (target: string) => {
+    const recorded = identity.get(target);
+    if (recorded === undefined) {
+      return false;
+    }
+    const entry = await fs.lstat(target).catch(() => undefined);
+    return (
+      entry !== undefined &&
+      entry.isDirectory() &&
+      entry.dev === recorded.dev &&
+      entry.ino === recorded.ino &&
+      (await insideGitDirectory(target))
+    );
   };
   /**
    * Releases a scratch directory. The tree is removed recursively only while its name still resolves
@@ -207,6 +242,8 @@ export function createGitScratch(gitDirectory: string) {
    * rather than removing it, so whatever a redirect reaches keeps the entries it was aimed at.
    */
   const remove = async (target: string) => {
+    // A name this turn has released is no longer one it may claim, whatever it holds afterwards.
+    identity.delete(target);
     if (await insideGitDirectory(target)) {
       await fs.rm(target, { recursive: true, force: true });
       return;
@@ -220,7 +257,7 @@ export function createGitScratch(gitDirectory: string) {
    * recovery tree owes, and it is read again here rather than remembered from the creation.
    */
   const insideRecovery = async (target: string) => insideGitDirectory(path.dirname(target));
-  return { make, remove, insideRecovery };
+  return { make, holds, remove, insideRecovery };
 }
 
 /** The scratch tree a checkout turn keeps under its Git directory. */

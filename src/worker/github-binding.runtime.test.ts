@@ -9,6 +9,8 @@ import {
 } from "./github-binding.runtime.js";
 import {
   createWorkerCheckoutFixture,
+  isBranchMove,
+  isCompletionPhaseCommand,
   workerFixtureBinding,
   type WorkerCheckoutFixture,
 } from "./github-binding.test-support.js";
@@ -543,6 +545,51 @@ describe("prepareWorkerGitHubEnvironment", () => {
       "remote file\n",
     );
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+  });
+
+  it("keeps a commit a worker command makes while the branch is being moved", async () => {
+    await fs.writeFile(path.join(cwd, "modified.txt"), "local bytes\n");
+    initialHead = await commit(cwd, "Track modified file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const remoteHead = await fixture.publishIncoming(async (seed) => {
+      await fs.writeFile(path.join(seed, "modified.txt"), "incoming bytes\n");
+    });
+
+    // An incoming history that only rewrites a tracked file materializes nothing, so this turn is the
+    // two commands of the completion phase and nothing else. The index and the branch are separate
+    // commands, and a worker command that still runs can commit on the session branch between them:
+    // the commit is a child of the head the checkout had, and it exists only here until the session
+    // pushes it. Moving the branch is therefore done against the head this turn read, so an update
+    // that no longer matches it fails into the rollback rather than rewinding the commit the session
+    // itself made. What the worker committed stays what the session has.
+    const runCommand = exec.runCommandWithTimeout;
+    let workerCommit = "";
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      // The branch move is the completion phase's last command. The commit is made just before it, so
+      // it lands in the window the index write opened — the one place an update that ignores the head
+      // the turn read would undo work the session never pushed.
+      if (workerCommit === "" && isBranchMove(argv) && isCompletionPhaseCommand(options)) {
+        await fs.writeFile(path.join(cwd, "worker.txt"), "worker bytes\n");
+        workerCommit = await commit(cwd, "Worker commit");
+      }
+      return await runCommand(argv, options);
+    });
+
+    await prepare();
+
+    expect(workerCommit).not.toBe("");
+    expect(workerCommit).not.toBe(remoteHead);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(workerCommit);
+    expect(await git(cwd, "ls-tree", "--name-only", "HEAD")).toContain("worker.txt");
+    // The turn gave its fast-forward up rather than undo what the worker did, so the file the
+    // incoming commit rewrote still holds the worker's bytes and nothing it placed is left behind.
+    await expect(fs.readFile(path.join(cwd, "modified.txt"), "utf8")).resolves.toBe(
+      "local bytes\n",
+    );
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
   });
 
   it("preserves a tracked dirty directory that blocks an incoming file", async () => {

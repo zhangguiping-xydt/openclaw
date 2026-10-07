@@ -173,6 +173,44 @@ describe("prepareWorkerGitHubEnvironment beside a writer that owns a scratch nam
     );
   });
 
+  it("does not export the incoming content through a link a writer left at its directory", async () => {
+    const { collision, remoteHead } = await collisionScenario();
+
+    // The incoming content is exported by `git checkout-index --prefix`, which resolves the whole
+    // pathname it is given and writes every entry it names below the directory that name reaches. The
+    // directory is created a system call earlier, so the name is read again at the point of use: a
+    // writer that replaced it in between has the export written where its link points, and the copies
+    // the turn would go on to place come from there rather than from the directory it made — outside
+    // the checkout, under a name no turn can describe.
+    const recoveryRoot = path.join(cwd, ".git", "github-checkout-collision-recovery");
+    const outside = path.join(fixture.root, "outside");
+    await fs.mkdir(outside);
+    const runCommand = exec.runCommandWithTimeout;
+    let redirected = 0;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      if (redirected === 0 && argv.includes("checkout-index")) {
+        redirected += 1;
+        const move = only(await fs.readdir(recoveryRoot), "move-");
+        const below = path.join(recoveryRoot, move);
+        const exported = path.join(below, only(await fs.readdir(below), "incoming-"));
+        await fs.rm(exported, { recursive: true, force: true });
+        await fs.symlink(outside, exported);
+      }
+      return await runCommand(argv, options);
+    });
+
+    await prepare();
+
+    // The name was no longer the directory this turn created when the export came back, so the turn
+    // refused it rather than place from a copy reached through the link: the approved path still holds
+    // the bytes the next turn expects to classify, and the branch is where it was for that turn to
+    // repeat the same fast-forward.
+    expect(redirected).toBe(1);
+    await expect(fs.readFile(path.join(cwd, collision), "utf8")).resolves.toBe("base file\n");
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(remoteHead).not.toBe(initialHead);
+  });
+
   it("does not read an index a writer left at the name the turn could be predicted to use", async () => {
     await fs.writeFile(path.join(cwd, "tracked.txt"), "base file\n");
     initialHead = await commit(cwd, "Track base file");

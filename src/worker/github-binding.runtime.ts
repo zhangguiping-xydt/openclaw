@@ -642,7 +642,12 @@ async function bindWorkerGitHubCheckout(
       // and a failure that reaches the restoration.
       await indexTransaction.noteIndexWritten();
       noteCommittedMutation();
-      await requireMoveGit(["update-ref", branch, "FETCH_HEAD"], noLazyFetchEnv);
+      // The branch moves only while it is still the one this turn read before the move: a command
+      // still running as the worker user can commit between the index write above and this call, and
+      // an unconditional update would rewind that commit to the fetched head and orphan history the
+      // session never pushed. The expected value makes the update fail instead, and the rollback
+      // leaves the writer's branch and index alone.
+      await requireMoveGit(["update-ref", branch, "FETCH_HEAD", local], noLazyFetchEnv);
       // The index this wrote is the one the checkout now has, so the backup is not needed.
       indexTransaction.markSpent();
     };
@@ -689,6 +694,16 @@ async function bindWorkerGitHubCheckout(
       );
       if (exportable.size > 0) {
         staging = await scratch.make(await ensureRecoveryDirectory(), "incoming-");
+        // The export acts through a pathname: `--prefix` is resolved by the command, and every entry
+        // it writes is placed below the directory that name reaches. The name is a system call old,
+        // so it is read again immediately before the command and has to still be the directory this
+        // turn made — a writer that replaced it with a link would otherwise have the incoming content
+        // written where the link points, outside the checkout, under names no turn can describe.
+        if (!(await scratch.holds(staging))) {
+          throw Object.assign(new Error("the export directory is not this turn's"), {
+            code: "EEXIST",
+          });
+        }
         try {
           await requireGitWith(
             [
@@ -701,6 +716,15 @@ async function bindWorkerGitHubCheckout(
             true,
             incomingEnv,
           );
+          // The command resolved that same name a second time, so it is read back once more: a
+          // directory that changed under the export is a redirect the content may have been written
+          // through, or a name that no longer holds what was exported, and neither is a copy this
+          // turn may place from below.
+          if (!(await scratch.holds(staging))) {
+            throw Object.assign(new Error("the export directory is not this turn's"), {
+              code: "EEXIST",
+            });
+          }
         } catch (error) {
           // The export is the last cancellable step and the first one to touch the network, and
           // nothing has been mutated under it: a fenced turn leaves the checkout as it found it.
