@@ -26,6 +26,11 @@ import path from "node:path";
  * have the checkout's index replaced by whatever the writer left there. A turn that cannot take the
  * name is a turn that cannot describe the index it would have to restore, so it does not advance the
  * branch at all.
+ *
+ * Both ends of the restoration are read for that reason: the name the copy came from, and the
+ * checkout's own index, which is the destination of the move and a name a retained command writes as
+ * well. An index that no longer holds the entry this turn last knew — the one its own write left, or
+ * the one the copy was taken from when nothing was written — is left to whoever wrote it.
  */
 type IndexEntry = Awaited<ReturnType<typeof fs.lstat>>;
 
@@ -41,6 +46,12 @@ export const createIndexTransaction = async ({
   let state: "absent" | "live" | "spent" = "absent";
   /** The entry this turn's copy is, so putting it back never moves what a writer left there instead. */
   let copy: IndexEntry | undefined;
+  /**
+   * The last entry this turn knows the checkout's index itself to be: the one the copy was taken
+   * from, and then the one this turn's own write left. A restoration only ever replaces that entry,
+   * so a command that staged something in between keeps what it staged.
+   */
+  let known: IndexEntry | undefined;
   // A copy an earlier turn could not put back is moved under the recovery directory first, where it
   // keeps a name of its own and no later turn reuses it.
   if (await fs.lstat(previousIndex).catch(() => undefined)) {
@@ -53,6 +64,16 @@ export const createIndexTransaction = async ({
       await fs.copyFile(index, previousIndex, fs.constants.COPYFILE_EXCL);
       state = "live";
       copy = await fs.lstat(previousIndex).catch(() => undefined);
+      known = await fs.lstat(index).catch(() => undefined);
+    }
+  };
+  /**
+   * Records the index this turn's own write left, so a restoration is held to the entry this turn
+   * last knew the index to be rather than to whatever holds the name at the time it runs.
+   */
+  const noteIndexWritten = async () => {
+    if (state === "live") {
+      known = await fs.lstat(index).catch(() => undefined);
     }
   };
   /** Puts the copy back over the index, which is the one state in which it is still needed. */
@@ -66,6 +87,22 @@ export const createIndexTransaction = async ({
       held === undefined ||
       held.dev !== copy.dev ||
       held.ino !== copy.ino
+    ) {
+      return;
+    }
+    // The destination is read last, because a rename replaces whatever holds it and the index is a
+    // name a command still running as the worker user writes: `git add` from a retained exec stages
+    // into it after this turn's own write and before a failure reaches this restoration, and putting
+    // the copy back over that update would silently discard what it staged. Only the entry this turn
+    // last knew the index to be is replaced; anything else is left to whoever wrote it, and the copy
+    // stays where the next turn can still reach it. Git replaces the index through a lock file and a
+    // rename, so a staged change is a different entry and never the one compared here.
+    const current = await fs.lstat(index).catch(() => undefined);
+    if (
+      known === undefined ||
+      current === undefined ||
+      current.dev !== known.dev ||
+      current.ino !== known.ino
     ) {
       return;
     }
@@ -94,5 +131,5 @@ export const createIndexTransaction = async ({
       await fs.rm(previousIndex, { force: true });
     }
   };
-  return { backUp, putBack, markSpent, discardUnused };
+  return { backUp, noteIndexWritten, putBack, markSpent, discardUnused };
 };

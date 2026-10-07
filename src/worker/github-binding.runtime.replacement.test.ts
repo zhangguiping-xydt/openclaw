@@ -369,21 +369,20 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     });
 
     await fs.writeFile(path.join(cwd, ".git", "index.lock"), "");
-    // Putting a directory back by replacing the one a restore just created is not portable, so a
-    // restore falls back to its entries one by one. A writer that fills the new directory inside
-    // that window owns the name it wrote: putting the entry back over it would delete those bytes.
-    const rename = fs.rename;
+    // A directory is put back by filling the directory the restore created, one entry at a time: no
+    // step of a restore renames a directory onto a name. A writer that fills that directory in the
+    // window before the entries go back owns the name it wrote, and putting an entry back over it
+    // would delete those bytes.
+    const mkdir = fs.mkdir;
     const restored = path.join(cwd, collision);
     let filled = 0;
-    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
-      if (String(to) === restored && filled === 0 && String(from).includes(".git")) {
+    vi.spyOn(fs, "mkdir").mockImplementation(async (target, options) => {
+      const made = await mkdir(target, options);
+      if (String(target) === restored && filled === 0) {
         filled += 1;
         await fs.writeFile(path.join(restored, "base.txt"), "written while the move ran\n");
-        throw Object.assign(new Error("ENOTEMPTY: the restored directory is not empty"), {
-          code: "ENOTEMPTY",
-        });
       }
-      return await rename(from, to);
+      return made;
     });
 
     await prepare();
@@ -415,25 +414,24 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
 
     await fs.writeFile(path.join(cwd, ".git", "index.lock"), "");
     // A restoration creates the directory it fills, so a writer that keeps running as the worker
-    // user can swap that directory for a link before the preserved copy is renamed onto it, and the
-    // rename then fails because the name is no longer an empty directory. Putting the entries back
-    // one at a time resolves the link on the way, so without reading the parent chain again every
-    // entry would be created at the link's target and the path the incoming history named would stay
-    // empty. A link is not a directory this runs through, so the preserved copy keeps its name under
-    // the Git directory instead of being placed through it.
+    // user can swap that directory for a link before the entries go back into it, and each entry
+    // creation would then resolve the link on the way. Reading the parent chain again before every
+    // entry is what keeps them out: a link is not a directory this runs through, so the entries stay
+    // where they are and the preserved copy keeps its name under the Git directory instead of being
+    // placed through it.
     const outside = path.join(fixture.root, "outside");
     await fs.mkdir(outside);
-    const rename = fs.rename;
+    const mkdir = fs.mkdir;
     const restored = path.join(cwd, collision);
     let redirected = 0;
-    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
-      if (redirected === 0 && String(to) === restored && String(from).includes(".git")) {
+    vi.spyOn(fs, "mkdir").mockImplementation(async (target, options) => {
+      const made = await mkdir(target, options);
+      if (String(target) === restored && redirected === 0) {
         redirected += 1;
         await fs.rm(restored, { recursive: true, force: true });
         await fs.symlink(outside, restored);
-        throw Object.assign(new Error("ENOTDIR: not a directory"), { code: "ENOTDIR" });
       }
-      return await rename(from, to);
+      return made;
     });
 
     await prepare();
@@ -446,6 +444,55 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     await expect(fs.readdir(outside)).resolves.toEqual([]);
     await expect(fs.readlink(restored)).resolves.toBe(outside);
     await expect(fixture.preservedBytes()).resolves.toEqual(["base file", "remote file"]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
+  });
+
+  it("keeps a writer's own directory at the name a restored directory is filled into", async () => {
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, collision));
+    await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track collision directory");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, collision), { recursive: true });
+      await fs.writeFile(path.join(seed, collision), "remote file\n");
+    });
+
+    await fs.writeFile(path.join(cwd, ".git", "index.lock"), "");
+    // Putting a directory back creates the name it needs before it fills it, and the directory that
+    // name holds is a writer's to take: a background command still running as the worker user can
+    // remove the directory this turn just created and make one of its own there. A rename onto that
+    // name replaces whatever holds it, so the writer's directory would be discarded — the one
+    // operation a restoration promises never to perform. Filling the name entry by entry keeps it:
+    // the entries go back beside whatever holds the name rather than the name being taken over.
+    const mkdir = fs.mkdir;
+    const restored = path.join(cwd, collision);
+    let taken = 0;
+    let writerIno: number | undefined;
+    vi.spyOn(fs, "mkdir").mockImplementation(async (target, options) => {
+      const made = await mkdir(target, options);
+      if (taken === 0 && String(target) === restored) {
+        taken += 1;
+        await fs.rm(restored, { recursive: true, force: true });
+        await fs.mkdir(restored);
+        writerIno = (await fs.lstat(restored)).ino;
+      }
+      return made;
+    });
+
+    await prepare();
+
+    expect(taken).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    // The directory that holds the name afterwards is the writer's own, not the directory this turn
+    // moved aside and put back there.
+    expect((await fs.lstat(restored)).ino).toBe(writerIno);
+    await expect(fs.readFile(path.join(cwd, collision, "base.txt"), "utf8")).resolves.toBe(
+      "base file\n",
+    );
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
     expect(warn).toHaveBeenCalledExactlyOnceWith(
       expect.stringContaining("checkout binding failed"),
     );
@@ -660,31 +707,34 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     });
 
     await fs.writeFile(path.join(cwd, ".git", "index.lock"), "");
-    // Putting a directory back by replacing one that a writer filled inside the window is not
-    // portable, so a restore falls back to its entries one by one. This time every entry fits, which
-    // is the branch that cleans the preserved directory up afterwards. A background command whose
-    // working directory was inside the directory the replacement set aside is still there after the
-    // move, and a file it creates once the entries have been enumerated has no other name.
+    // Putting a directory back fills the directory a restore created, one entry at a time. This time
+    // every entry fits, which is the branch that cleans the preserved directory up afterwards. A
+    // background command whose working directory was inside the directory the replacement set aside
+    // is still there after the move, and a file it creates once the entries have been enumerated has
+    // no other name.
     const restored = path.join(cwd, collision);
-    const rename = fs.rename;
+    const mkdir = fs.mkdir;
     const link = fs.link;
     let preserved = "";
     let recreated = 0;
     let late = 0;
-    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
-      if (
-        recreated === 0 &&
-        String(to) === restored &&
-        String(from).includes("collision-recovery")
-      ) {
+    vi.spyOn(fs, "mkdir").mockImplementation(async (target, options) => {
+      const made = await mkdir(target, options);
+      if (recreated === 0 && String(target) === restored) {
         recreated += 1;
-        preserved = String(from);
         await fs.writeFile(path.join(restored, "writer.txt"), "written while the move ran\n");
       }
-      return await rename(from, to);
+      return made;
     });
     vi.spyOn(fs, "link").mockImplementation(async (from, to) => {
       const created = await link(from, to);
+      // The first entry that goes back into the restored directory names the direction: the preserved
+      // copy is what it came from. Matching the destination rather than the source matters, because
+      // the staging directory the incoming file was exported to lives under the same recovery
+      // directory and is released by this turn.
+      if (preserved === "" && String(to).startsWith(`${restored}${path.sep}`)) {
+        preserved = path.dirname(String(from));
+      }
       if (late === 0 && preserved !== "" && String(from).startsWith(preserved)) {
         late += 1;
         await fs.writeFile(
@@ -758,6 +808,78 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     );
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("keeps what a writer staged when the rollback restores the index", async () => {
+    const collision = "collision";
+    await fs.writeFile(path.join(cwd, collision), "base file\n");
+    initialHead = await commit(cwd, "Track collision file");
+    await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    await fixture.publishIncoming(async (seed) => {
+      await fs.rm(path.join(seed, collision));
+      await fs.mkdir(path.join(seed, collision));
+      await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
+    });
+
+    const lock = path.join(cwd, ".git", "refs", "heads", `${workerFixtureBranch}.lock`);
+    await fs.writeFile(lock, "");
+    const index = path.join(cwd, ".git", "index");
+    const previousIndex = path.join(cwd, ".git", "github-checkout-previous.index");
+    const staged = "staged-by-writer.txt";
+    await fs.writeFile(path.join(cwd, staged), "staged while the move ran\n");
+    const before = await fs.readFile(index);
+
+    // The index is a name a command still running as the worker user writes: `git add` from a
+    // retained exec stages into it after the move wrote it and before the locked branch ref fails
+    // into the rollback. The restoration replaces its destination with a rename, so it may only ever
+    // replace the entry this turn last knew the index to be — anything else is what the writer just
+    // wrote, and putting the copy back over it would discard that staging.
+    //
+    // The writer lands in the one interval that tells the two behaviours apart: after the move's own
+    // index write, which is the entry the rollback knows about, and before the rollback reads the
+    // destination it is about to replace. The restoration reads the copy's name first and the index
+    // second, so the rollback's read of the copy is the last event before that compare: the staging
+    // is injected there. The index is confirmed to have been rewritten by the move at that point, so
+    // an injection that landed earlier — and would therefore be undone by the move and prove nothing
+    // — reports itself instead of passing.
+    const beforeIno = (await fs.lstat(index)).ino;
+    const lstat = fs.lstat;
+    let reads = 0;
+    let rewritten = false;
+    let injected = false;
+    let stagedIndex: Buffer | undefined;
+    vi.spyOn(fs, "lstat").mockImplementation(async (target, options) => {
+      if (String(target) === previousIndex) {
+        reads += 1;
+        // The constructor's stale-copy check, then the copy's own read while it is taken, then the
+        // rollback's read of it. Only the last one is inside the window the writer needs.
+        if (reads === 3) {
+          rewritten = (await lstat(index)).ino !== beforeIno;
+          injected = true;
+          await git(cwd, "add", staged);
+          stagedIndex = await fs.readFile(index);
+        }
+      }
+      return await lstat(target, options);
+    });
+
+    await prepare();
+
+    expect(rewritten).toBe(true);
+    expect(injected).toBe(true);
+    // A restoration that ran would have replaced the index with the copy, so the bytes compared here
+    // are the ones the writer's own staging left. Nothing the turn does afterwards writes the index,
+    // which is why the comparison comes before any of the reads below.
+    await expect(fs.readFile(index)).resolves.toEqual(stagedIndex);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    // What the writer staged is still what the checkout's index holds.
+    expect((await git(cwd, "diff", "--cached", "--name-only")).split("\n")).toContain(staged);
+    // The copy the turn was going to put back was not consumed by a restoration that would have
+    // destroyed the staging, so the index the checkout still describes is readable beside it.
+    await expect(fs.readFile(previousIndex)).resolves.toEqual(before);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("checkout binding failed"),
+    );
   });
 
   it("keeps bytes a writer adds after the rollback took its snapshot", async () => {

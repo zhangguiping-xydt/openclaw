@@ -199,6 +199,41 @@ describe("checkout path rules beside a writer that moves the name", () => {
     await expect(fs.readdir(scenario.directory)).resolves.toEqual([]);
   });
 
+  it("keeps a writer's own directory at the name a repaired move fills", async () => {
+    const scenario = await redirectMoveOntoOutsideDirectory({ prepare: writerDirectory });
+    // The repair takes the name with `mkdir` — which refuses an occupied path on its own — and then
+    // puts the directory's entries back through the same refusal. Taking the name is not owning it:
+    // a writer can remove the directory this call just made and create one of its own in the
+    // interval before the entries go back, and the single `rename` this replaces would discard that
+    // directory, because a rename replaces whatever holds its destination. Filling the name one
+    // entry at a time leaves the writer's directory where the writer put it.
+    const mkdir = fs.mkdir;
+    let taken = 0;
+    let writerIno: number | undefined;
+    vi.spyOn(fs, "mkdir").mockImplementation(async (directory, options) => {
+      const made = await mkdir(directory, options);
+      if (taken === 0 && String(directory) === scenario.collision) {
+        taken += 1;
+        await fs.rmdir(scenario.collision);
+        await fs.mkdir(scenario.collision);
+        writerIno = (await fs.lstat(scenario.collision)).ino;
+      }
+      return made;
+    });
+
+    await expect(
+      scenario.paths.moveIntoRecovery("nested/collision", scenario.collision),
+    ).resolves.toBeUndefined();
+
+    expect(taken).toBe(1);
+    // The name still holds the writer's own directory, with the entry the repair put back beside it.
+    expect((await fs.lstat(scenario.collision)).ino).toBe(writerIno);
+    await expect(
+      fs.readFile(path.join(scenario.outside, "collision", "writer.txt"), "utf8"),
+    ).resolves.toBe("writer bytes\n");
+    await expect(fs.readdir(scenario.directory)).resolves.toEqual([]);
+  });
+
   it("leaves a directory a writer refilled the name with where the writer put it", async () => {
     const scenario = await redirectMoveOntoOutsideDirectory({
       prepare: writerDirectory,

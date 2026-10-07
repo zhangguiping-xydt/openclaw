@@ -43,17 +43,68 @@ async function isCreatedEntry(entry: EntryStats, target: string, created: Create
 }
 
 /**
+ * Moves every entry of `preserved` into `destination` without replacing a name. A file or a symlink
+ * is linked, which refuses a name that already exists; a directory is created and then filled the
+ * same way, and its name is released once it holds nothing. Nothing here renames an entry onto a
+ * name, so whatever holds one of those names keeps it: a name a writer took over is skipped and the
+ * copy under the Git directory keeps the entry that could not be put back.
+ */
+async function moveEntriesWithoutReplacing(
+  preserved: string,
+  destination: string,
+): Promise<boolean> {
+  let complete = true;
+  for (const name of await fs.readdir(preserved).catch(() => [])) {
+    const from = path.join(preserved, name);
+    const to = path.join(destination, name);
+    const entry = await fs.lstat(from).catch(() => undefined);
+    if (!entry) {
+      complete = false;
+      continue;
+    }
+    if (!entry.isDirectory()) {
+      if (
+        !(await fs
+          .link(from, to)
+          .then(() => true)
+          .catch(() => false))
+      ) {
+        complete = false;
+        continue;
+      }
+      await fs.unlink(from).catch(() => {});
+      continue;
+    }
+    if (
+      !(await fs
+        .mkdir(to)
+        .then(() => true)
+        .catch(() => false))
+    ) {
+      complete = false;
+      continue;
+    }
+    complete = (await moveEntriesWithoutReplacing(from, to)) && complete;
+    await fs.rmdir(from).catch(() => {});
+  }
+  return complete;
+}
+
+/**
  * Puts a preserved entry back at a name a move took it from without replacing whatever is there
  * now. A file or a symlink is linked, which refuses a name that already exists instead of taking it
  * over, where the `rename` this replaces would replace the destination silently; the recovery name
  * is released once the entry is back at the other, so the entry is moved rather than copied.
  *
  * A directory cannot be linked, so its name is taken by `mkdir` — which refuses an occupied path on
- * its own — and the preserved directory is then renamed onto the empty directory that just took the
- * name. That empty directory is the only one a rename can replace, and a writer that filled it in
- * the meantime makes the rename fail with nothing lost. A repair that could not be completed gives
- * the name back and leaves the preserved entry under the Git directory, where its caller can still
- * reach it: a refused repair costs the outside name, never the bytes.
+ * its own — and its entries then go back through the same refusal. That is deliberately not the
+ * single `rename` onto the empty directory this replaces: a rename replaces whatever holds its
+ * destination, and the empty directory this call just made is not the only thing that can hold this
+ * name — a writer can remove the placeholder and create a directory of its own in the interval
+ * before the entries go back, and a rename would then discard it. Filling the name one entry at a
+ * time can leave a writer's own entries in place beside the ones being restored, which is what the
+ * refusal is for: a refused repair costs the outside name, never the bytes, and the entry that could
+ * not be put back stays under the Git directory.
  */
 async function putBackWithoutReplacing(preserved: string, destination: string) {
   const entry = await fs.lstat(preserved).catch(() => undefined);
@@ -77,15 +128,13 @@ async function putBackWithoutReplacing(preserved: string, destination: string) {
   if (!taken) {
     return;
   }
-  const restored = await fs
-    .rename(preserved, destination)
-    .then(() => true)
-    .catch(() => false);
-  if (!restored) {
-    // `rmdir` only succeeds while the name still holds the empty directory this call made, so a
-    // directory a writer filled keeps the name that holds it.
+  if (!(await moveEntriesWithoutReplacing(preserved, destination))) {
+    // `rmdir` only succeeds while the name still holds an empty directory, so a name a writer filled
+    // keeps whatever holds it.
     await fs.rmdir(destination).catch(() => {});
+    return;
   }
+  await fs.rmdir(preserved).catch(() => {});
 }
 
 /**

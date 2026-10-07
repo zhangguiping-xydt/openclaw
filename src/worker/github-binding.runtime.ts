@@ -373,10 +373,11 @@ async function bindWorkerGitHubCheckout(
     /**
      * Every restoration refuses an occupied path instead of replacing what is there, so a writer
      * that recreated the path in the meantime keeps its bytes and the preserved entry stays
-     * recoverable under the Git directory. Creating a link or a symlink reports the occupant on
-     * its own, and a directory is created before it is filled so the only directory a restore can
-     * ever replace is the empty one this function just made. Nothing here renames onto a path it
-     * checked first: a check is not atomic, and a rename would overwrite what appeared after it.
+     * recoverable under the Git directory. Creating a link or a symlink reports the occupant on its
+     * own, and a directory is created and then filled entry by entry, so no step here ever replaces a
+     * directory: the only operation that could is a rename onto this name, and the directory holding
+     * it is not necessarily this turn's to take. Nothing here renames onto a path it checked first: a
+     * check is not atomic, and a rename would overwrite what appeared after it.
      */
     const restoreIntoFreePath = async (preserved: string, target: string): Promise<boolean> => {
       // A restoration creates names in the checkout, so it owes the same parent guarantee a placement
@@ -424,26 +425,6 @@ async function bindWorkerGitHubCheckout(
         await takeBackMisplaced(relativeTarget, target, created);
         return false;
       };
-      const moveRestored = async () => {
-        if (!(await reachesIntendedDirectories(path.dirname(relativeTarget)))) {
-          return false;
-        }
-        if (
-          !(await fs
-            .rename(preserved, target)
-            .then(() => true)
-            .catch(() => false))
-        ) {
-          return false;
-        }
-        if (await landed()) {
-          return true;
-        }
-        // The rename moved this turn's own copy, so its inode — read from the preserved entry, which
-        // only this turn can reach — is what a take-back compares the pathname against.
-        await takeBackMisplaced(relativeTarget, target, held);
-        return false;
-      };
       const stats = await fs.lstat(preserved).catch(() => undefined);
       if (!stats) {
         return false;
@@ -453,14 +434,16 @@ async function bindWorkerGitHubCheckout(
         if (!(await createRestored({ kind: "createdDirectory" }, () => fs.mkdir(target)))) {
           return false;
         }
-        if (await moveRestored()) {
-          return true;
-        }
-        // Replacing the directory just created is not portable, so its entries go back one by one
-        // through this same function: each of them refuses the name it finds occupied, and a writer
-        // that filled the new directory in the meantime keeps its bytes where they already are. An
-        // entry that could not be put back leaves the preserved copy under the Git directory, which
-        // is why the caller only discards it once every entry is back.
+        // A directory cannot be linked, so the only way to put one back in a single step is a rename
+        // onto this name — and a rename replaces whatever holds it. The empty directory just created
+        // is not the only thing that can hold this name: a writer can remove the placeholder and
+        // create a directory of its own before the rename runs, and that directory would then be
+        // discarded, which is exactly what this function promises never to do. The entries go back
+        // one at a time through this same function instead, where every creation refuses the name it
+        // finds occupied and nothing ever replaces a directory, so a writer's own directory at this
+        // name is filled beside its own entries rather than taken over. An entry that could not be
+        // put back leaves the preserved copy under the Git directory, which is why the caller only
+        // discards it once every entry is back.
         let complete = true;
         for (const entry of await fs.readdir(preserved).catch(() => [])) {
           const restored = await restoreIntoFreePath(
@@ -654,6 +637,10 @@ async function bindWorkerGitHubCheckout(
         return;
       }
       await requireMoveGit(["read-tree", "FETCH_HEAD"], noLazyFetchEnv);
+      // The index this turn's own write left, so the rollback below only ever puts the copy back over
+      // the entry it knows about. A retained command can stage into the same name between this write
+      // and a failure that reaches the restoration.
+      await indexTransaction.noteIndexWritten();
       noteCommittedMutation();
       await requireMoveGit(["update-ref", branch, "FETCH_HEAD"], noLazyFetchEnv);
       // The index this wrote is the one the checkout now has, so the backup is not needed.
