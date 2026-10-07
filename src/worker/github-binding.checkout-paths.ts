@@ -198,6 +198,9 @@ export function createGitScratch(gitDirectory: string) {
       (resolved === root || resolved.startsWith(`${root}${path.sep}`))
     );
   };
+  /** The refusal every creation outside the boundary ends in, whether it was read or made there. */
+  const outsideGitDirectory = (target: string) =>
+    Object.assign(new Error(`${target} is outside the git directory`), { code: "EEXIST" });
   /**
    * Creates one uniquely named directory inside a scratch directory, and the scratch directory
    * itself when it does not exist yet. `directory` is the Git directory or one of its children, so
@@ -205,25 +208,37 @@ export function createGitScratch(gitDirectory: string) {
    * a writer left at that name instead of resolving through it. Both the directory and the name just
    * created are read back: a creation resolves the whole pathname, so a component a writer swapped
    * for a link while it ran would have put the tree at the link's target.
+   *
+   * Reading the name back cannot prevent that creation — the syscall has already run by then — so
+   * what it decides is whether it stands. The one thing this turn made at that point is a single
+   * empty directory, and it is released again when the name it made does not land inside the Git
+   * directory: the writer's directory is left holding exactly what it held before the turn arrived,
+   * and the turn refuses the name rather than building anything below it. A directory a writer fills
+   * in the meantime keeps the name it holds — `rmdir` reports a directory that is not empty — so
+   * that residue is bounded to one empty directory and disclosed rather than hidden.
    */
   const make = async (directory: string, prefix: string) => {
     const existing = await fs.lstat(directory).catch(() => undefined);
     if (!existing) {
       await fs.mkdir(directory);
+      if (!(await insideGitDirectory(directory))) {
+        await fs.rmdir(directory).catch(() => {});
+        throw outsideGitDirectory(directory);
+      }
     } else if (!existing.isDirectory()) {
       throw Object.assign(new Error(`${directory} is not a directory`), { code: "EEXIST" });
     }
     if (!(await insideGitDirectory(directory))) {
-      throw Object.assign(new Error(`${directory} is outside the git directory`), {
-        code: "EEXIST",
-      });
+      throw outsideGitDirectory(directory);
     }
     const created = await fs.mkdtemp(path.join(directory, prefix));
-    if (!(await insideGitDirectory(created))) {
-      throw Object.assign(new Error(`${created} is outside the git directory`), { code: "EEXIST" });
+    // The identity the name has to carry for `holds` below, read with the boundary in the same pass
+    // that decides whether the name stands.
+    const stats = await fs.lstat(created).catch(() => undefined);
+    if (stats === undefined || !stats.isDirectory() || !(await insideGitDirectory(created))) {
+      await fs.rmdir(created).catch(() => {});
+      throw outsideGitDirectory(created);
     }
-    // The identity the name carried when this turn made it, kept for `holds` below.
-    const stats = await fs.lstat(created);
     identity.set(created, { dev: stats.dev, ino: stats.ino, birthtimeMs: stats.birthtimeMs });
     return created;
   };

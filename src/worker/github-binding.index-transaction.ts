@@ -35,9 +35,10 @@ import { isSameEntry, type GitScratch } from "./github-binding.checkout-paths.js
  *
  * The copy's own name is read for the same reason in both remaining directions. Discarding it after
  * a successful move removes the entry this turn copied, not whatever holds the name by then; and an
- * outstanding copy an earlier turn left is moved under the recovery directory through that
- * directory's own scratch rules, so the name it is moved into is one this turn made and re-read
- * rather than a path a retained command could have redirected.
+ * outstanding copy an earlier turn left is kept under the recovery directory by giving it a second
+ * name there, made through that directory's own scratch rules: the copy stays at the fixed name until
+ * the new one has been read back, so a name a writer redirects in between costs one entry the turn
+ * removes again rather than the only copy of the index the checkout still describes.
  */
 type IndexEntry = Awaited<ReturnType<typeof fs.lstat>>;
 
@@ -61,16 +62,42 @@ export const createIndexTransaction = async ({
    * so a command that staged something in between keeps what it staged.
    */
   let known: IndexEntry | undefined;
-  // A copy an earlier turn could not put back is moved under the recovery directory first, where it
+  // A copy an earlier turn could not put back is kept under the recovery directory first, where it
   // keeps a name of its own and no later turn reuses it.
-  if (await fs.lstat(previousIndex).catch(() => undefined)) {
-    // The name the copy is moved into is made through the scratch tree's own rules — every component
-    // created on its own and the created name read back inside the Git directory — and read again
-    // here, immediately before the move, because a rename resolves the whole destination pathname and
-    // the recovery directory is a name a command still running as the worker user can replace.
+  const outstanding = await fs.lstat(previousIndex).catch(() => undefined);
+  if (outstanding !== undefined) {
+    if (!outstanding.isFile()) {
+      throw new Error(`${previousIndex} does not hold the plain file the copy is expected to be`);
+    }
+    // The name the copy is kept at is made through the scratch tree's own rules — every component
+    // created on its own and the created name read back inside the Git directory — and asked for
+    // again here, immediately before the copy is named there, because the recovery directory is a
+    // name a command still running as the worker user can replace.
     const kept = await scratch.make(await ensureRecoveryDirectory(), "previous-index-");
+    if (!(await scratch.holds(kept))) {
+      throw new Error(`${kept} is not the directory this turn made`);
+    }
+    // The copy is given a second name rather than renamed to it. A rename resolves the whole
+    // destination pathname and carries the index with it, so a writer that replaces the name above
+    // it between the read and the call would have the only copy of the index moved wherever that
+    // name reaches; a link leaves the copy at the name it came from, so the same redirect costs a
+    // single entry — the one this turn just made, removed again from wherever it landed — and the
+    // copy stays where the next turn can reach it. That is what this turn then refuses on: a turn
+    // that cannot take the fixed name for its own copy cannot describe the index it would restore.
+    const destination = path.join(kept, "index");
+    await fs.link(previousIndex, destination);
+    const stillHeld = await fs.lstat(previousIndex).catch(() => undefined);
     if (await scratch.holds(kept)) {
-      await fs.rename(previousIndex, path.join(kept, "index"));
+      // The fixed name is released only while it still holds the entry this turn found there: a
+      // command that replaced it while the second name was being made keeps what it wrote, and the
+      // turn refuses rather than taking a name a writer had already taken.
+      if (!isSameEntry(outstanding, stillHeld)) {
+        throw new Error(`${previousIndex} changed while the outstanding index copy was kept`);
+      }
+      await fs.rm(previousIndex, { force: true });
+    } else {
+      await fs.rm(destination, { force: true }).catch(() => {});
+      throw new Error(`${kept} was redirected while the outstanding index copy was kept`);
     }
   }
   /** Copies the index once, and only when the checkout does not already have a copy of its own. */

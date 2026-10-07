@@ -467,4 +467,33 @@ describe("checkout path rules beside a writer that moves the name", () => {
     expect(outcome).toBeUndefined();
     await fs.rm(outside, { recursive: true, force: true });
   });
+
+  it("releases the directory a redirected creation made outside the Git directory", async () => {
+    const outside = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "outside-")));
+    const recovery = path.join(root, "recovery");
+    await fs.mkdir(recovery);
+
+    // The boundary is read on the directory the creation resolves, and the creation is the next
+    // system call: swapping that directory for a link in between makes the name `mkdtemp` chooses
+    // land at the link's target. The read that follows cannot prevent that creation, so it releases
+    // it instead — the directory the redirect reached holds nothing of this turn's afterwards — and
+    // the turn refuses the name rather than building anything below it.
+    const mkdtemp = fs.mkdtemp;
+    let swapped = 0;
+    vi.spyOn(fs, "mkdtemp").mockImplementation(async (template, options) => {
+      if (swapped === 0 && template.startsWith(recovery)) {
+        swapped += 1;
+        await fs.rename(recovery, `${recovery}-set-aside`);
+        await fs.symlink(outside, recovery);
+      }
+      return await mkdtemp(template, options);
+    });
+
+    const scratch = createGitScratch(root);
+
+    await expect(scratch.make(recovery, "move-")).rejects.toMatchObject({ code: "EEXIST" });
+    expect(swapped).toBe(1);
+    await expect(fs.readdir(outside)).resolves.toEqual([]);
+    await fs.rm(outside, { recursive: true, force: true });
+  });
 });

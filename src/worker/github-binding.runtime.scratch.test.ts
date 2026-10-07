@@ -367,4 +367,55 @@ describe("prepareWorkerGitHubEnvironment beside a writer that owns a scratch nam
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
     expect(remoteHead).not.toBe(initialHead);
   });
+
+  it("keeps an earlier turn's index copy when the name it is kept at moves after it is read", async () => {
+    const { remoteHead } = await collisionScenario();
+
+    // The copy is kept by giving it a second name under a directory this turn made, and the name that
+    // directory was read as is the one a writer replaces here: the second name then lands wherever the
+    // replacement points. Whether that second name was made by a rename or by a link, the copy has to
+    // be back at the fixed name it came from when the turn gives up, because it is the only
+    // description of the index the checkout still has.
+    const previousIndex = path.join(cwd, ".git", "github-checkout-previous.index");
+    const outside = path.join(fixture.root, "outside");
+    const setAside = path.join(fixture.root, "recovery-set-aside");
+    await fs.writeFile(previousIndex, "preserved index bytes\n");
+    await fs.mkdir(outside);
+    const link = fs.link;
+    const rename = fs.rename;
+    let redirected = 0;
+    /** Replaces the directory a second name for the copy is about to be made under. */
+    const redirectOnce = async (to: Parameters<typeof fs.link>[1]) => {
+      const destination = String(to);
+      const directory = path.dirname(destination);
+      if (
+        redirected === 0 &&
+        path.basename(destination) === "index" &&
+        path.basename(directory).startsWith("previous-index-")
+      ) {
+        redirected += 1;
+        await rename(directory, setAside);
+        await fs.symlink(outside, directory);
+      }
+    };
+    vi.spyOn(fs, "link").mockImplementation(async (from, to) => {
+      await redirectOnce(to);
+      return await link(from, to);
+    });
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      await redirectOnce(to);
+      return await rename(from, to);
+    });
+
+    await prepare();
+
+    expect(redirected).toBe(1);
+
+    // The entry the turn made outside the checkout is the name it made for the copy and nothing else,
+    // so it is taken back; the copy itself was never carried anywhere.
+    await expect(filesBelow(outside)).resolves.toEqual([]);
+    await expect(fs.readFile(previousIndex, "utf8")).resolves.toBe("preserved index bytes\n");
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(remoteHead).not.toBe(initialHead);
+  });
 });
