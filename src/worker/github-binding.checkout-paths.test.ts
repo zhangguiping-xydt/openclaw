@@ -122,12 +122,18 @@ describe("checkout path rules beside a writer that moves the name", () => {
     await expect(paths.moveIntoRecovery("nested/collision", collision)).resolves.toBeUndefined();
 
     expect(swapped).toBe(1);
-    // Both entries stay reachable: the writer keeps the name it refilled, and the bytes the move
-    // took stay under the Git directory instead of being spent on a repair.
+    // The redirect took the move's source out of the directory the turn had read and put it in the
+    // writer's own, so the entry that left is not the one the move was approved for. The read-back
+    // finds that and gives the move up; the writer has refilled the name by then, so the entry it
+    // owns keeps the name the move gave it — inside the writer's own directory, which is where a
+    // rename confined to that directory can leave it. Both entries stay reachable and neither is
+    // spent on the other: the writer's refill keeps the name it took, and nothing of the writer's is
+    // under the Git directory, the one outcome no later turn can repair.
     await expect(fs.readFile(outsideFile, "utf8")).resolves.toBe("recreated file\n");
-    await expect(fs.readFile(path.join(directory, "preserved-collision"), "utf8")).resolves.toBe(
+    await expect(fs.readFile(path.join(outside, "preserved-collision"), "utf8")).resolves.toBe(
       "outside file\n",
     );
+    await expect(fs.readdir(directory)).resolves.toEqual([]);
   });
 
   /**
@@ -202,15 +208,17 @@ describe("checkout path rules beside a writer that moves the name", () => {
       scenario.paths.moveIntoRecovery("nested/collision", scenario.collision),
     ).resolves.toBeUndefined();
 
-    // The repair cannot take a name that holds a directory, so it refuses and both copies stay: the
-    // writer keeps the name it refilled and the directory the move took stays under the Git
-    // directory rather than replacing what appeared.
+    // The repair cannot take a name that holds a directory, so it refuses: the writer keeps the name
+    // it refilled, and the directory the move took stays where the redirected rename left it — inside
+    // the writer's own directory, under the intermediate name, rather than under the Git directory
+    // where no later turn could tell it apart from a preserved checkout path.
     await expect(
       fs.readFile(path.join(scenario.outside, "collision", "writer.txt"), "utf8"),
     ).resolves.toBe("refilled bytes\n");
-    await expect(fs.readdir(path.join(scenario.directory, "preserved-collision"))).resolves.toEqual(
-      ["writer.txt"],
-    );
+    await expect(fs.readdir(path.join(scenario.outside, "preserved-collision"))).resolves.toEqual([
+      "writer.txt",
+    ]);
+    await expect(fs.readdir(scenario.directory)).resolves.toEqual([]);
   });
 
   it("gives back a directory it created through an ancestor a writer swapped for a link", async () => {
@@ -267,10 +275,10 @@ describe("checkout path rules beside a writer that moves the name", () => {
     // the comparison answered about the directory the link named when it ran, and the rename consumes
     // the name its own pathname resolves to at the instant it runs. Taking the parent's resolved name
     // as the source instead leaves the syscall nothing to resolve, so it can only move the entry this
-    // turn compared. The writer then refills the outside name the redirected move would have emptied,
-    // which is what the repair a redirected move triggers runs into: a repair that follows the
-    // pathname again asks the writer's own file for the name, is refused, and leaves the unrelated
-    // entry it took under the disposable checkout's Git directory.
+    // turn compared — and the read-back at the intermediate name confirms that is what happened. The
+    // writer refills the outside name the redirected move would have emptied, which is what a repair
+    // that follows the pathname again would run into: it would ask the writer's own file for the name,
+    // be refused, and leave the unrelated entry it took under the Git directory.
     const rename = fs.rename;
     let swapped = 0;
     vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
@@ -290,13 +298,65 @@ describe("checkout path rules beside a writer that moves the name", () => {
     await paths.takeBackMisplaced("nested/remote.txt", target, created);
 
     expect(swapped).toBe(1);
-    // The entry the take-back was after is the one that moved. The redirect took the move out of the
-    // directory it was compared in, so the repair gave that entry back and the writer's directory was
-    // never touched: nothing of the writer's is under the Git directory.
-    await expect(fs.readFile(path.join(verified, "remote.txt"), "utf8")).resolves.toBe(
+    // The entry the take-back was after is the one that moved: the syscall had nothing left to
+    // resolve, so the walk found the entry it had read and the move finished. The misplaced placement
+    // is out of the working tree, and the writer's directory was never touched — nothing of the
+    // writer's is under the Git directory, which is the one outcome no later turn can repair.
+    await expect(fs.readdir(directory)).resolves.toEqual(["preserved-remote.txt"]);
+    await expect(fs.readFile(path.join(directory, "preserved-remote.txt"), "utf8")).resolves.toBe(
       "incoming bytes\n",
     );
+    await expect(fs.readdir(verified)).resolves.toEqual([]);
     await expect(fs.readFile(writerFile, "utf8")).resolves.toBe("refilled bytes\n");
+  });
+
+  it("keeps an outside file in its own directory when the link is put back before the move is read", async () => {
+    const nested = path.join(cwd, "nested");
+    await fs.mkdir(nested);
+    const collision = path.join(nested, "collision");
+    await fs.writeFile(collision, "base file\n");
+    const saved = path.join(cwd, "nested-saved");
+    const outside = path.join(root, "outside");
+    await fs.mkdir(outside);
+    const outsideFile = path.join(outside, "collision");
+    await fs.writeFile(outsideFile, "outside file\n");
+
+    // The writer spends the interval between the reads that approve the path and the rename they
+    // lead to pointing the pathname at a directory of its own, and puts the directory back before
+    // this turn reads anything again. Both the read before the move and the read after it therefore
+    // answer about the checkout's own directory, while the rename answered about the writer's — the
+    // interval no comparison of the two ends can see. Only the entry the rename actually moved tells
+    // the two apart, and it is the entry the move owes an answer about: the move gives it up rather
+    // than carrying an entry it never read under the Git directory.
+    const rename = fs.rename;
+    let swapped = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(from) === collision && swapped === 0) {
+        swapped = 1;
+        await rename(nested, saved);
+        await fs.symlink(outside, nested);
+        const result = await rename(from, to);
+        await fs.unlink(nested);
+        await rename(saved, nested);
+        return result;
+      }
+      return await rename(from, to);
+    });
+    const { directory, recovery } = recoveryBeside(async () => {});
+    const paths = createCheckoutPaths(cwd, recovery);
+
+    const outcome = await paths.moveIntoRecovery("nested/collision", collision);
+
+    expect(swapped).toBe(1);
+    // The entry the move was approved for is still where the checkout has it, and the writer's own
+    // entry is still inside the writer's own directory — under the name the move gave it, which is
+    // all a rename inside that directory can be asked to leave. Nothing of the writer's is under the
+    // Git directory, which is the one outcome that cannot be repaired.
     await expect(fs.readdir(directory)).resolves.toEqual([]);
+    await expect(fs.readFile(collision, "utf8")).resolves.toBe("base file\n");
+    await expect(fs.readFile(path.join(outside, "preserved-collision"), "utf8")).resolves.toBe(
+      "outside file\n",
+    );
+    expect(outcome).toBeUndefined();
   });
 });

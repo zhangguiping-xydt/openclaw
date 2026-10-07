@@ -4,19 +4,19 @@ import path from "node:path";
 /**
  * The copy of the checkout's index this turn made, and what it is still needed for.
  *
- * `reset --mixed` writes the checkout's index before it moves the branch, so a failure after that
+ * The move writes the checkout's incoming index before it moves the branch, so a failure after that
  * point leaves the incoming entries staged against the head the checkout still has, and every later
  * turn would read that mixture as local work and keep skipping the fast-forward. The index is
  * therefore copied before the move and put back byte for byte when the move fails, and a checkout
- * whose index cannot be copied is not one a turn advances: the reset writes the index anyway, and a
+ * whose index cannot be copied is not one a turn advances: the move writes the index anyway, and a
  * branch ref that then refused would leave the mixture behind with no copy to put back.
  *
- * The copy is discarded only once it is not the checkout's own index — after the reset it describes,
- * or after it was put back — and an unsuccessful restoration keeps it, because it then holds the
- * only copy of the index the checkout still describes. That last state is the reason a turn also
- * looks for an outstanding copy before it makes its own: the name is fixed, so a later turn would
- * discard it in its own cleanup or overwrite it while preparing its copy, and the preservation would
- * last only until that turn reached these paths.
+ * The copy is discarded only once it is not the checkout's own index — after the index write it
+ * describes, or after it was put back — and an unsuccessful restoration keeps it, because it then
+ * holds the only copy of the index the checkout still describes. That last state is the reason a turn
+ * also looks for an outstanding copy before it makes its own: the name is fixed, so a later turn
+ * would discard it in its own cleanup or overwrite it while preparing its copy, and the preservation
+ * would last only until that turn reached these paths.
  */
 export const createIndexTransaction = async ({
   gitDirectory,
@@ -55,7 +55,7 @@ export const createIndexTransaction = async ({
     }
   };
   /**
-   * Records that the index the copy describes has been replaced by the reset that describes the same
+   * Records that the index the copy describes has been replaced by the write that describes the same
    * head, so the copy is no longer any turn's only record of it.
    */
   const markSpent = () => {
@@ -63,7 +63,7 @@ export const createIndexTransaction = async ({
   };
   /**
    * Discards the copy in every state except the one that must survive: `live` is reached when the
-   * reset ran and putting the copy back did not work, and it then holds the only description of the
+   * move ran and putting the copy back did not work, and it then holds the only description of the
    * index the checkout still has.
    */
   const discardUnused = async () => {

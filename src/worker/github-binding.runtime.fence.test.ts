@@ -5,6 +5,7 @@ import * as exec from "../process/exec.js";
 import { prepareWorkerGitHubEnvironment } from "./github-binding.runtime.js";
 import {
   createWorkerCheckoutFixture,
+  isBranchMove,
   workerFixtureBinding,
   type WorkerCheckoutFixture,
 } from "./github-binding.test-support.js";
@@ -207,6 +208,9 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
 
     await prepareFenced();
 
+    // The hook is the fence: without it landing mid-move the assertions below would hold for a turn
+    // that was never fenced at all.
+    expect(controller.signal.aborted).toBe(true);
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
     await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(
       "remote file\n",
@@ -267,7 +271,7 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
 
     // The move advances the branch before it materializes the replacements, so a fenced turn that
     // started it would leave the workspace half applied with no later recovery.
-    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect(runner.mock.calls.some(([argv]) => isBranchMove(argv))).toBe(false);
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
     expect(remoteHead).not.toBe(initialHead);
     await expect(fs.readFile(path.join(cwd, collision, "base.txt"), "utf8")).resolves.toBe(
@@ -317,7 +321,7 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
     });
 
     expect(deletions).toBe(3);
-    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect(runner.mock.calls.some(([argv]) => isBranchMove(argv))).toBe(false);
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
     expect(remoteHead).not.toBe(initialHead);
     await expect(fs.lstat(path.join(cwd, incoming))).rejects.toThrow();
@@ -333,11 +337,11 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
       await fs.writeFile(path.join(seed, "tracked.txt"), "remote bytes\n");
     });
 
-    // An incoming history that only rewrites files materializes nothing, so the reset that advances
-    // the branch is the first mutation of the turn — and the index copy ahead of it is a filesystem
-    // call that does not observe the abort. A turn fenced while that copy ran has changed nothing
-    // yet, so it owes the checkout an untouched working tree and an unmoved HEAD instead of the
-    // index and the branch the reset would have written.
+    // An incoming history that only rewrites files materializes nothing, so the index write that
+    // starts the completion phase is the first mutation of the turn — and the index copy ahead of it
+    // is a filesystem call that does not observe the abort. A turn fenced while that copy ran has
+    // changed nothing yet, so it owes the checkout an untouched working tree and an unmoved HEAD
+    // instead of the index and the branch the move would have written.
     const controller = new AbortController();
     const copyFile = fs.copyFile;
     vi.spyOn(fs, "copyFile").mockImplementation(async (from, to) => {
@@ -351,7 +355,7 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
 
     await fixture.prepare({ signal: controller.signal });
 
-    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect(runner.mock.calls.some(([argv]) => isBranchMove(argv))).toBe(false);
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
     expect(remoteHead).not.toBe(initialHead);
     await expect(fs.readFile(path.join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base file\n");
@@ -393,7 +397,7 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
 
     await fixture.prepare({ signal: controller.signal });
 
-    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect(runner.mock.calls.some(([argv]) => isBranchMove(argv))).toBe(false);
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
     expect(remoteHead).not.toBe(initialHead);
     await expect(
@@ -438,7 +442,7 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
 
     await fixture.prepare({ signal: controller.signal });
 
-    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect(runner.mock.calls.some(([argv]) => isBranchMove(argv))).toBe(false);
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
     expect(remoteHead).not.toBe(initialHead);
     await expect(fs.readFile(path.join(parent, collision), "utf8")).resolves.toBe("base file\n");
@@ -478,7 +482,7 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
     await fixture.prepare({ signal: controller.signal });
 
     expect(destinationReads).toBe(2);
-    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect(runner.mock.calls.some(([argv]) => isBranchMove(argv))).toBe(false);
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
     expect(remoteHead).not.toBe(initialHead);
     await expect(

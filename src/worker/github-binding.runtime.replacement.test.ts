@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as exec from "../process/exec.js";
 import {
   createWorkerCheckoutFixture,
+  isCompletionPhaseCommand,
   workerFixtureBranch,
   type WorkerCheckoutFixture,
 } from "./github-binding.test-support.js";
@@ -99,7 +100,7 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
       if (
         written === 0 &&
         String(from) === path.join(cwd, collision) &&
-        String(to).includes("collision-recovery")
+        path.dirname(String(to)) === cwd
       ) {
         written += 1;
         await fs.writeFile(path.join(cwd, collision), "written while the move ran\n");
@@ -176,8 +177,8 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
 
     const before = await git(cwd, "status", "--porcelain", "-z");
     // A Git process that crashed leaves its lock behind. It lets the classification and the
-    // placements run and fails only the reset that moves the branch, which is the one failure that
-    // lands after the incoming files are already in place.
+    // placements run and fails only the index write that starts the completion phase, which is the
+    // one failure that lands after the incoming files are already in place.
     const lock = path.join(cwd, ".git", "index.lock");
     await fs.writeFile(lock, "");
 
@@ -277,8 +278,9 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     });
 
     // A background command from an earlier turn recreates the approved path as a link to another
-    // directory. Creating the incoming file's parent directory recursively would resolve that link
-    // and put the file outside the checkout, where nothing would own it.
+    // directory, at the rename that frees the path — the moment the name is free for it. Creating the
+    // incoming file's parent directory recursively would resolve that link and put the file outside
+    // the checkout, where nothing would own it.
     const outside = path.join(fixture.root, "outside");
     await fs.mkdir(outside);
     const rename = fs.rename;
@@ -288,7 +290,7 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
       if (
         redirected === 0 &&
         String(from) === path.join(cwd, collision) &&
-        String(to).includes("collision-recovery")
+        path.dirname(String(to)) === cwd
       ) {
         redirected += 1;
         await fs.symlink(outside, path.join(cwd, collision));
@@ -311,7 +313,7 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("keeps a writer's bytes when a placed file is modified before the reset fails", async () => {
+  it("keeps a writer's bytes when a placed file is modified before the move writes the index", async () => {
     const collision = "collision";
     await fs.mkdir(path.join(cwd, collision));
     await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
@@ -330,7 +332,7 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     const runCommand = exec.runCommandWithTimeout;
     let appended = 0;
     vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
-      if (argv.includes("reset") && appended === 0) {
+      if (isCompletionPhaseCommand(options) && appended === 0) {
         appended += 1;
         await fs.appendFile(path.join(cwd, collision), "appended by the writer\n");
       }
@@ -541,7 +543,7 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
       await fs.writeFile(path.join(seed, "later.txt"), "remote later\n");
     });
 
-    // `reset --mixed` writes the index before it moves the branch, so a reset without a backup has
+    // The move writes the index before it moves the branch, so a move without a backup has
     // no copy to put back when the branch ref then refuses: the incoming entries would stay staged
     // against the head the checkout still has, and every later turn would read that mixture as its
     // own local work. A checkout whose index cannot be copied is not one this turn advances.
@@ -587,7 +589,7 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
       await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
     });
 
-    // The reset fails with the incoming entries staged against the head the checkout still has, so
+    // The branch step fails with the incoming entries staged against the head the checkout still has, so
     // the backup is the only copy of the index that head describes. Putting it back can fail too,
     // and then the cleanup may not delete what is left of it: the checkout keeps the name.
     const lock = path.join(cwd, ".git", "refs", "heads", `${workerFixtureBranch}.lock`);
@@ -620,7 +622,7 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     const keptBytes = await fs.readFile(backup);
     await fs.rm(lock);
     vi.restoreAllMocks();
-    // The failed reset left the incoming entries staged, so a turn starting from that mixture skips
+    // The failed move left the incoming entries staged, so a turn starting from that mixture skips
     // the fast-forward and never prepares a transaction. Clearing it puts the checkout back on the
     // same replacement, which is the turn that has to recognize the outstanding copy.
     await git(cwd, "reset", "--hard", "HEAD");
@@ -729,8 +731,8 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
       await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
     });
 
-    // `reset --mixed` writes the checkout's index before it moves the branch, so a branch ref a
-    // crashed Git left locked fails the reset with the incoming entries already staged. Taking only
+    // The move writes the checkout's index before it moves the branch, so a branch ref a crashed Git
+    // left locked fails the branch step with the incoming entries already staged. Taking only
     // the working tree back would leave that mixture behind, and every later turn would read it as
     // local work and keep skipping the fast-forward.
     const lock = path.join(cwd, ".git", "refs", "heads", `${workerFixtureBranch}.lock`);
@@ -780,7 +782,7 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     let rollbackStarted = false;
     let appended = 0;
     vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
-      if (argv.includes("reset")) {
+      if (isCompletionPhaseCommand(options)) {
         rollbackStarted = true;
       }
       return await runCommand(argv, options);
@@ -1086,44 +1088,52 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("does not take a move back when only its report was truncated", async () => {
-    const collision = "collision";
-    await fs.writeFile(path.join(cwd, collision), "base file\n");
-    initialHead = await commit(cwd, "Track collision file");
+  it("finishes the fast-forward when the origin is gone before the completion phase", async () => {
+    await fixture.blobless();
+    await fs.writeFile(path.join(cwd, "existing.txt"), "local bytes\n");
+    initialHead = await commit(cwd, "Track an existing file");
     await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
     const remoteHead = await fixture.publishIncoming(async (seed) => {
-      await fs.rm(path.join(seed, collision));
-      await fs.mkdir(path.join(seed, collision));
-      await fs.writeFile(path.join(seed, collision, "remote.txt"), "remote file\n");
+      await fs.writeFile(path.join(seed, "existing.txt"), "incoming bytes\n");
+      await fs.writeFile(path.join(seed, "added.txt"), "added bytes\n");
     });
 
-    // `reset --mixed` prints one line per path it changes, so a large reconciliation comes back with
-    // the report cut off at the command's diagnostic cap: exit code 0, the index written and the
-    // branch moved. A truncated report is not a failed move; taking it back would restore the old
-    // index against the new head and delete the incoming file the new head already holds.
+    // The export may fetch the incoming content it materializes; the origin is gone from the moment
+    // it returns. The completion phase writes the incoming index and moves the branch, and the file
+    // the turn kept is one whose incoming content no step exports — in a blobless checkout that blob
+    // is missing, so a phase that compares the kept file against the new index reaches for it with
+    // the turn's credentials, after the fence stopped being honored. The phase writes its index and
+    // its ref from the objects the move already put on disk instead: nothing about this move needs
+    // that blob, and a fast-forward that stalls on it would leave the checkout half applied.
+    const originGit = path.join(fixture.root, "origin.git");
     const runCommand = exec.runCommandWithTimeout;
-    let truncated = 0;
     vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
       const result = await runCommand(argv, options);
-      if (argv.includes("reset") && truncated === 0) {
-        truncated += 1;
-        return { ...result, stdoutTruncatedBytes: 1_048_576 };
+      if (argv.includes("checkout-index")) {
+        await fs.rename(originGit, path.join(fixture.root, "origin.gone"));
       }
       return result;
     });
 
     await prepare();
 
-    expect(truncated).toBe(1);
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
-    await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(
-      "remote file\n",
+    await expect(fs.readFile(path.join(cwd, "added.txt"), "utf8")).resolves.toBe("added bytes\n");
+    await expect(fs.readFile(path.join(cwd, "existing.txt"), "utf8")).resolves.toBe(
+      "local bytes\n",
     );
-    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    // The blob the kept file's incoming version holds is still missing, which is what makes this a
+    // regression for the phase rather than for the checkout: no step of the move needed it.
+    const incomingKept = (await git(cwd, "rev-parse", `${remoteHead}:existing.txt`)).trim();
+    await expect(
+      exec.runExec("git", ["-C", cwd, "cat-file", "-e", incomingKept], {
+        baseEnv: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
+      }),
+    ).rejects.toThrow();
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("puts the index back when a reset without placements cannot move the branch", async () => {
+  it("puts the index back when a move without placements cannot move the branch", async () => {
     await fs.writeFile(path.join(cwd, "modified.txt"), "local bytes\n");
     initialHead = await commit(cwd, "Track modified file");
     await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
@@ -1132,8 +1142,8 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     });
 
     // An incoming commit that only rewrites files materializes nothing, so there is no placement to
-    // notice the index the reset wrote before the branch ref it could not move. The backup cannot be
-    // tied to the placements: every reset writes the index first.
+    // notice the index the move wrote before the branch ref it could not move. The backup cannot be
+    // tied to the placements: every move writes the index first.
     const lock = path.join(cwd, ".git", "refs", "heads", `${workerFixtureBranch}.lock`);
     await fs.writeFile(lock, "");
 

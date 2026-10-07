@@ -19,6 +19,13 @@ import type { WorkerGitHubLaunchBinding } from "./launch-descriptor.js";
 
 const log = createSubsystemLogger("worker/github");
 
+/**
+ * The environment the completion phase runs its own commands with. It may only use objects the
+ * checkout already holds: a blob that is missing there refuses the command instead of being fetched
+ * from the origin with the turn's credentials after the fence stopped being honored.
+ */
+const noLazyFetchEnv = { GIT_NO_LAZY_FETCH: "1" };
+
 export function disposeWorkerGitHubEnvironment(stateDir: string, turnId: string) {
   return removeManagedGitHubProfile(
     path.join(stateDir, "github-profiles", sha256HexPrefixCore(turnId, 16)),
@@ -71,7 +78,8 @@ async function bindWorkerGitHubCheckout(
   // work or leaves the checkout exactly as the next turn expects it. The step that can still reach
   // the network — exporting the incoming content, which fetches a blobless clone's missing blobs
   // with the turn's credentials — runs while the abort is still honored, so the phase that ignores
-  // the fence only moves and links what is already on disk.
+  // the fence only moves and links what is already on disk, and writes the incoming index and branch
+  // from the objects it already holds.
   const requireMoveGit = (args: string[], extraEnv: NodeJS.ProcessEnv = {}) =>
     requireGitWith(args, false, extraEnv);
   try {
@@ -557,7 +565,7 @@ async function bindWorkerGitHubCheckout(
     // checkout's index, so HEAD and the index only move after every incoming file is in place.
     const incomingIndex = path.join(gitDirectory, "github-checkout-incoming.index");
     const incomingEnv = { GIT_INDEX_FILE: incomingIndex };
-    // The index copy that has to precede the reset is a concern of its own: it is taken once, put
+    // The index copy that has to precede the index write is a concern of its own: it is taken once, put
     // back when the move it describes fails, and kept when putting it back did not work.
     const indexTransaction = await createIndexTransaction({
       gitDirectory,
@@ -565,7 +573,7 @@ async function bindWorkerGitHubCheckout(
     });
     /**
      * Whether the branch already sits at the fetched commit. The rollback follows the branch that is
-     * actually there instead of inferring it from a command's exit: a reset that failed can still
+     * actually there instead of inferring it from a command's exit: a move that failed can still
      * have moved the branch, and putting the previous index back then would describe a head the
      * checkout no longer has and turn the incoming history into local work for every later turn.
      */
@@ -604,30 +612,35 @@ async function bindWorkerGitHubCheckout(
      */
     const refusedByFence = () => !mutationCommitted && signal?.aborted === true;
     /**
-     * Moves the branch to the fetched commit after copying the index, which `reset --mixed` writes
-     * before it moves the branch. Every reset has to go through here: a failure afterwards leaves
-     * the incoming entries staged against the head the checkout still has, and a turn that cannot
-     * put the index back leaves the next turn reading that mixture as local work. Only the exit code
-     * decides success. The command prints one line per path it changes, so a large reconciliation
-     * exceeds the diagnostic output cap and comes back with a truncated stdout on a clean exit with
-     * the index written and the branch moved; that is a reporting limit, not a mutation failure, and
-     * the rollback re-reads the branch instead of trusting or second-guessing the exit.
+     * Moves the branch to the fetched commit, in the two steps `reset --mixed` takes: the index of
+     * the incoming commit is written first and the branch moves after it, so a failure between the
+     * two leaves the rollback the index it describes rather than a head the checkout never read.
+     * Every move goes through here: a failure afterwards leaves the incoming entries staged against
+     * the head the checkout still has, and a turn that cannot put the index back leaves the next turn
+     * reading that mixture as local work. Only the exit codes decide success.
+     *
+     * The pair is also what keeps this phase off the network. `reset --mixed` refreshes the working
+     * tree against the index it just wrote, and that comparison reads the incoming content of every
+     * file it kept: in a blobless checkout those blobs are missing, so the reset fetches them from the
+     * origin with the turn's credentials — after the placements, where a fence no longer stops it.
+     * `read-tree` writes the same index from the trees alone and `update-ref` moves the branch, and
+     * lazy fetching is switched off for both, so an object this phase does not hold refuses the
+     * command instead of being fetched. The rollback re-reads the branch rather than trusting or
+     * second-guessing those exits.
      */
     const moveBranchToFetchedCommit = async () => {
       await indexTransaction.backUp();
-      // An incoming history that only rewrites existing files materializes nothing, so this reset is
-      // the first mutation of the turn — and the copy above is a filesystem call that does not
-      // observe the abort. Re-reading the fence after it is what keeps a turn fenced while the index
-      // was copied from advancing HEAD and replacing the index over an untouched working tree.
+      // An incoming history that only rewrites existing files materializes nothing, so this index
+      // write is the first mutation of the turn — and the copy above is a filesystem call that does
+      // not observe the abort. Re-reading the fence after it is what keeps a turn fenced while the
+      // index was copied from advancing HEAD and replacing the index over an untouched working tree.
       if (!admitFirstMutation()) {
         return;
       }
-      const result = await runGit(["reset", "--mixed", "FETCH_HEAD"], 5_000, false);
-      if (result.code !== 0) {
-        throw new Error(`git reset --mixed FETCH_HEAD failed (exit ${result.code})`);
-      }
+      await requireMoveGit(["read-tree", "FETCH_HEAD"], noLazyFetchEnv);
       noteCommittedMutation();
-      // The index the reset wrote is the one the checkout now has, so the backup is not needed.
+      await requireMoveGit(["update-ref", branch, "FETCH_HEAD"], noLazyFetchEnv);
+      // The index this wrote is the one the checkout now has, so the backup is not needed.
       indexTransaction.markSpent();
     };
     let staging: string | undefined;
@@ -645,7 +658,8 @@ async function bindWorkerGitHubCheckout(
       // still honors the fence, so a fence that lands here aborts with the checkout untouched. The
       // approved paths are exported too, because setting them aside makes them absent: the export
       // covers every path the move below can need, and everything after it only moves and links
-      // content that is already on disk.
+      // content that is already on disk — the completion phase writes its index and ref with lazy
+      // fetching switched off, so it cannot reach the origin even through an object it lacks.
       // The approved paths are asked of the incoming index under the *incoming* spelling: a literal
       // pathspec built from the local spelling of a path whose case differs matches no index entry,
       // so the export would come back empty, nothing would be materialized, and the branch would
@@ -877,19 +891,19 @@ async function bindWorkerGitHubCheckout(
       await moveBranchToFetchedCommit();
       replaced = true;
     } catch (error) {
-      // The rollback follows the branch that is actually there. A reset that failed after it wrote
+      // The rollback follows the branch that is actually there. A move that failed after it wrote
       // the index can still have moved the branch, so undoing that would restore the previous index
       // against a head it no longer describes and delete the incoming files that head holds.
       replaced ||= await branchReachedFetchedCommit();
       if (replaced) {
-        // The branch is at the fetched commit, so the index the reset wrote is the checkout's own.
+        // The branch is at the fetched commit, so the index the move wrote is the checkout's own.
         indexTransaction.markSpent();
       }
       // Nothing has moved, so put the checkout back exactly as this turn found it: the paths this
       // turn set aside are what the next turn's fast-forward expects to classify, and the incoming
       // files this turn already placed are taken back out, or the checkout would keep them while
       // HEAD still holds the paths they replaced and the next turn would read that mixture as local
-      // work. The index goes back first, because the reset that failed may have written it before it
+      // work. The index goes back first, because the move that failed may have written it before it
       // could not move the branch. The rollback never deletes a placed path and its restorations
       // never overwrite a writer's bytes, so whatever is left under the Git directory is still
       // recoverable from there.
@@ -912,7 +926,7 @@ async function bindWorkerGitHubCheckout(
       }
       await fs.rm(incomingIndex, { force: true });
       // The copy is discarded in every state except the one that must survive: the index the
-      // checkout still describes, reached when the reset ran and putting it back did not work.
+      // checkout still describes, reached when the move ran and putting it back did not work.
       await indexTransaction.discardUnused();
     }
   } catch (error) {

@@ -129,28 +129,32 @@ export function createCheckoutPaths(
     }
     return relative;
   };
+  /** The checkout's own resolved name, read once: it is what a parent is measured against. */
+  let checkoutRoot: string | undefined;
+  /**
+   * Whether a parent a pathname resolved to is the checkout or a directory below it. The checkout
+   * root is resolved the same way, so a checkout under a symlinked temporary directory is not a
+   * mismatch. The answer is about the name that was read, so a caller that keeps it and reads the
+   * path again afterwards compares two answers about the same name instead of asking twice.
+   */
+  const parentIsInsideCheckout = async (parent: string | undefined) => {
+    checkoutRoot ??= await fs.realpath(cwd).catch(() => undefined);
+    return (
+      checkoutRoot !== undefined &&
+      parent !== undefined &&
+      (parent === checkoutRoot || parent.startsWith(`${checkoutRoot}${path.sep}`))
+    );
+  };
   /**
    * The directory a path's parent resolves to, or `undefined` when that directory is not inside the
    * checkout. Creating or reading an entry resolves the whole pathname at once, so an ancestor a
    * writer swapped for a symlink after this turn checked it can only be observed afterwards, and
    * only the resolved path shows it. The leaf is never followed: a placed symlink points wherever
-   * the incoming entry points, which is not a place this decides. The checkout root is resolved the
-   * same way, so a checkout under a symlinked temporary directory is not a mismatch. Callers that
-   * then change the checkout keep the answer, so the same read can be taken again afterwards and the
-   * two compared.
+   * the incoming entry points, which is not a place this decides.
    */
-  let checkoutRoot: string | undefined;
   const resolvedCheckoutParent = async (target: string) => {
-    checkoutRoot ??= await fs.realpath(cwd).catch(() => undefined);
     const parent = await fs.realpath(path.dirname(target)).catch(() => undefined);
-    if (
-      checkoutRoot === undefined ||
-      parent === undefined ||
-      (parent !== checkoutRoot && !parent.startsWith(`${checkoutRoot}${path.sep}`))
-    ) {
-      return undefined;
-    }
-    return parent;
+    return (await parentIsInsideCheckout(parent)) ? parent : undefined;
   };
   /** Whether a path resolves inside the checkout, which is all a placement asks of it. */
   const resolvesInsideCheckout = async (target: string) =>
@@ -288,58 +292,147 @@ export function createCheckoutPaths(
    * parent's resolved name, so redirecting the link that pathname runs through in between cannot move
    * the syscall into a directory this turn never compared.
    */
+  /**
+   * Sets the entry a resolved pathname names aside, so the name it held is free.
+   *
+   * Nothing here can name a directory this turn already holds — there is no `renameat`, and the
+   * `/dev/fd/<n>/<name>` form does not traverse a held directory on this platform — so the directory
+   * a rename acts in is decided by the syscall, not by the reads before it. A writer that replaces a
+   * checked ancestor with a link to a directory of its own, then puts the directory back before this
+   * turn reads anything again, therefore has the reads before *and* after the move agree about the
+   * checkout while the rename acted about the writer's directory.
+   *
+   * What such a rename cannot hide is *which* entry it moved. The entry is renamed to the name it
+   * would keep in the recovery directory, but beside itself, inside the directory the pathname
+   * resolves to, and read back there: the two renames act in the same directory, so a redirect moves
+   * both ends together and the entry that arrives is the one that left; a redirected rename can
+   * therefore only have moved an entry within the directory it went to, and the read-back finds an
+   * entry this turn never read. The move is given up then, with that entry put back at the name it
+   * came from while the name still resolves there, and an entry the writer owns is left inside the
+   * writer's own directory instead of being carried under the Git directory. Only a name this read
+   * proved holds the expected entry is then carried across into the recovery directory, and what
+   * arrives is read back once more. That second rename is the one step whose destination is not
+   * beside its source, and it is the intermediate name — this turn's own, one the writer cannot know
+   * to place anything at — that keeps it from carrying an entry the writer owns: a redirect can only
+   * make the source name resolve to a directory without it, where the rename finds nothing to move.
+   * Every step moves an entry rather than deleting one, and the intermediate name is only ever
+   * occupied by this turn: bytes this turn did not write survive, and nothing the writer owns is left
+   * under the Git directory.
+   *
+   * The caller reads the entry it expects *before* the path rules that approve the move: a swap still
+   * in place when those rules run fails them, and one that came and went between this read and the
+   * rename is caught by the read-back below. `admit` is the caller's fence, read as late as it can be
+   * before the first syscall that changes the checkout — the entry leaving the path the caller acts
+   * on — and `markMutated` is how that syscall reports itself once it succeeded.
+   */
+  const setAsideVerified = async (
+    source: string,
+    expected: EntryStats,
+    parent: string,
+    preserved: string,
+    admit?: () => boolean,
+    markMutated?: () => void,
+  ): Promise<string | undefined> => {
+    const holdsExpected = async (at: string) => {
+      const entry = await fs.lstat(at).catch(() => undefined);
+      return entry !== undefined && entry.dev === expected.dev && entry.ino === expected.ino;
+    };
+    const held = path.join(parent, path.basename(preserved));
+    // The intermediate name is this turn's own invention, so an entry already sitting there is either
+    // a leftover of a turn that died between the two renames below or something the writer put there
+    // by chance. Renaming over it would replace it, so the move is given up instead: the caller's path
+    // is left as it was and the retry that follows reports the same blocker again.
+    if (await fs.lstat(held).catch(() => undefined)) {
+      return undefined;
+    }
+    if (admit && !admit()) {
+      return undefined;
+    }
+    if (
+      !(await fs
+        .rename(source, held)
+        .then(() => true)
+        .catch(() => false))
+    ) {
+      return undefined;
+    }
+    // The path the caller acts on is empty from here on, whatever the renames below answer, so this
+    // is the write the turn owes the rest of its bounded work to. Reporting the syscall rather than
+    // the admission is what leaves a call that never changed anything free to be refused by a later
+    // fence.
+    markMutated?.();
+    if (!(await holdsExpected(held))) {
+      await putBackWithoutReplacing(held, source);
+      return undefined;
+    }
+    if (
+      !(await fs
+        .rename(held, preserved)
+        .then(() => true)
+        .catch(() => false))
+    ) {
+      await putBackWithoutReplacing(held, source);
+      return undefined;
+    }
+    if (await holdsExpected(preserved)) {
+      return preserved;
+    }
+    await putBackWithoutReplacing(preserved, source);
+    return undefined;
+  };
+  /**
+   * Takes a placement or a restoration that resolved outside the checkout back into the recovery
+   * directory. The entry is moved rather than removed, so bytes a writer wrote through the
+   * misdirected name are not the price of refusing the placement, and the path is free for the retry
+   * that follows.
+   *
+   * The name is resolved again here, and a writer can point it at a different entry between the
+   * creation and this call: renaming the directory the entry was made in and putting a link to
+   * somewhere else in its place makes this pathname name a file that belongs to the writer, outside
+   * the checkout. Moving that entry would take an unrelated file under the Git directory and leave
+   * the placement behind, so what the pathname names is compared with the entry this turn created —
+   * proven by the inode it shares with the copy only this turn can reach, the destination a symlink
+   * was created with, or the emptiness of the directory it made — and anything else is left exactly
+   * where it is; the placement retry moves the blocker aside and writes into the path it freed
+   * instead.
+   *
+   * The recovery directory this moves the entry into may not exist yet, and creating it is an await
+   * like any other, so the writer owns that interval too. The parent the rename would resolve through
+   * is therefore read after the directory exists, and the entry is read at that parent's resolved
+   * name, so the comparison and the syscall speak about the same directory. The move itself is the
+   * one `setAsideVerified` performs, which is what keeps a rename that resolves through a redirected
+   * ancestor from carrying an entry the writer owns under the Git directory.
+   */
   const takeBackMisplaced = async (relative: string, target: string, created: CreatedEntry) => {
     const preserved = path.join(
       await recovery.ensureRecoveryDirectory(),
       recovery.recoveryName(relative),
     );
     const parent = await fs.realpath(path.dirname(target)).catch(() => undefined);
-    // The rename consumes the name that was resolved, not the pathname it came from. Renaming
-    // `target` resolves through the checkout pathname a second time, so a writer that redirects the
-    // link that pathname runs through between the identity read below and the syscall has the rename
-    // take an entry out of the directory the link now names — one this turn never verified — and the
-    // compensation cannot put it back, because the name it came from is the one the placement still
-    // occupies. Reading the entry at the resolved name as well makes the comparison and the syscall
-    // speak about the same directory.
-    const source = parent === undefined ? undefined : path.join(parent, path.basename(target));
-    const entry = source === undefined ? undefined : await fs.lstat(source).catch(() => undefined);
-    if (source === undefined || !entry || !(await isCreatedEntry(entry, source, created))) {
+    if (parent === undefined) {
       return;
     }
-    const moved = await fs
-      .rename(source, preserved)
-      .then(() => true)
-      .catch(() => false);
-    if (!moved) {
+    const source = path.join(parent, path.basename(target));
+    const entry = await fs.lstat(source).catch(() => undefined);
+    if (!entry || !(await isCreatedEntry(entry, source, created))) {
       return;
     }
-    const afterwards = await fs.realpath(path.dirname(target)).catch(() => undefined);
-    if (afterwards !== parent) {
-      await putBackWithoutReplacing(preserved, source);
-    }
+    await setAsideVerified(source, entry, parent, preserved);
   };
   /**
    * Moves a path inside the checkout into the recovery directory, and refuses when the pathname no
-   * longer reaches the directories this checkout owns. A rename resolves the whole pathname at the
-   * instant it runs, so a writer that replaced an ancestor of an approved path with a link would have
-   * this turn move a file that lives outside the checkout under the Git directory and destroy the
-   * name it had there — and the placement checks that follow cannot put back a source name they
-   * never saw.
+   * longer reaches the directories this checkout owns. The caller approved the path from the
+   * directory chain it read, and the reads that decide whether the path still reaches that chain are
+   * separate system calls from the rename they lead to, so the writer owns the interval between them:
+   * the rename then resolves through the writer's link and would take a file that lives outside the
+   * checkout under the Git directory, where the name it had there is not recorded anywhere.
    *
-   * Reading the parent before the move is not enough on its own: the read and the rename are
-   * separate system calls, and the writer owns the interval between them. The move therefore takes
-   * the parent the rename would resolve through, performs the rename on that resolved name rather
-   * than on the pathname it came from — which the syscall would otherwise resolve a second time and
-   * follow out of the checkout — and takes the parent again once the rename has run: a parent that
-   * now resolves somewhere else is one the rename followed out of the checkout, and the entry it took
-   * is put back at the name it had outside. Nothing this turn holds records that name, so the answer
-   * from before the move is the only thing that can restore it. Putting the entry back is a write of
-   * its own, and the writer that redirected the move owns the name it came from by then: the
-   * compensation refuses a name that is occupied rather than replacing what appeared there, so a file
-   * the writer refilled the name with keeps its bytes and the entry the move took stays reachable
-   * under the Git directory. The destination is resolved first and the caller's fence is read last,
-   * so the syscall is the first thing this turn does after it learned both that the path still
-   * reaches the checkout and that it still owns it.
+   * The entry is read at the parent's resolved name and the path rules are applied after it, which is
+   * what makes the two ends of the move cover the whole interval — a swap still in place when the
+   * rules run fails them, and one that came and went between this read and the rename is caught by
+   * the read-back `setAsideVerified` takes. The destination is resolved first and the caller's fence
+   * is read last, so the syscall is the first thing this turn does after it learned both that the
+   * path still reaches the checkout and that it still owns it.
    */
   const moveIntoRecovery = async (
     relative: string,
@@ -351,37 +444,27 @@ export function createCheckoutPaths(
       await recovery.ensureRecoveryDirectory(),
       recovery.recoveryName(relative),
     );
-    const parent = await resolvedCheckoutParent(source);
-    if (parent === undefined || !(await reachesIntendedDirectories(path.dirname(relative)))) {
+    const parent = await fs.realpath(path.dirname(source)).catch(() => undefined);
+    if (parent === undefined) {
       return undefined;
     }
-    // The syscall below takes the resolved name for the same reason the take-back does: the parent
-    // read above is a check, the rename is the syscall it guards, and a rename of the original
-    // pathname would resolve through it once more — following a link a writer redirected in between
-    // out of the directory this turn approved. Joining the resolved parent onto the final component
-    // leaves the syscall nothing to resolve, so the directory it acts in is the one the checks named.
+    // The rename consumes the name that was resolved, not the pathname it came from: renaming the
+    // pathname resolves through it once more, so a writer that redirects a link it runs through in
+    // between has the rename act in the directory the link now names, one this turn never approved.
+    // Reading the entry at the resolved name makes the comparison and the syscall speak about the
+    // same directory.
     const resolvedSource = path.join(parent, path.basename(source));
-    if (admit && !admit()) {
+    const entry = await fs.lstat(resolvedSource).catch(() => undefined);
+    if (entry === undefined) {
       return undefined;
     }
-    const moved = await fs
-      .rename(resolvedSource, preserved)
-      .then(() => true)
-      .catch(() => false);
-    if (!moved) {
+    if (
+      !(await parentIsInsideCheckout(parent)) ||
+      !(await reachesIntendedDirectories(path.dirname(relative)))
+    ) {
       return undefined;
     }
-    // The entry is out of the working tree, so this turn has mutated the checkout and has to finish
-    // the bounded work it began even if the fence lands from here on. Reporting the syscall rather
-    // than the admission is what leaves a call that never changed anything free to be refused by a
-    // later fence.
-    markMutated?.();
-    const afterwards = await fs.realpath(path.dirname(source)).catch(() => undefined);
-    if (afterwards === parent) {
-      return preserved;
-    }
-    await putBackWithoutReplacing(preserved, resolvedSource);
-    return undefined;
+    return await setAsideVerified(resolvedSource, entry, parent, preserved, admit, markMutated);
   };
   return {
     blockingPath,

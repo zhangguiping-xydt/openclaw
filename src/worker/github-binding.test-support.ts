@@ -10,6 +10,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { PreparedGitHubToolEnvironment } from "../agents/github-tool-identity.types.js";
 import * as exec from "../process/exec.js";
+import type { CommandOptions } from "../process/exec.js";
 import { prepareWorkerGitHubEnvironment } from "./github-binding.runtime.js";
 import type { WorkerGitHubLaunchBinding } from "./launch-descriptor.js";
 
@@ -105,6 +106,25 @@ async function preservedRecoveryLinks(
   return found.toSorted();
 }
 
+/**
+ * Whether a Git call is one of the two commands the completion phase runs — the incoming index write
+ * and the branch move — which happen once every incoming path is in place. They are the only calls
+ * that ask Git not to fetch lazily, which is what tells them apart from the same commands run earlier
+ * against the incoming index, and a scenario can hook them to act exactly when the move becomes
+ * observable. A caller inside a `runCommandWithTimeout` spy hands over that call's second argument,
+ * which is a bare timeout as often as it is an options bag, so the union is narrowed here rather
+ * than at every hook.
+ */
+export const isCompletionPhaseCommand = (optionsOrTimeout?: number | CommandOptions) =>
+  typeof optionsOrTimeout === "object" && optionsOrTimeout.baseEnv?.GIT_NO_LAZY_FETCH === "1";
+
+/**
+ * Whether a Git call moves the binding's session branch to the fetched commit: the last step of the
+ * completion phase, and the step that makes a fast-forward observable at all.
+ */
+export const isBranchMove = (argv: string[]) =>
+  argv.includes("update-ref") && argv.some((argument) => argument.startsWith("refs/heads/"));
+
 export type WorkerCheckoutFixture = {
   root: string;
   cwd: string;
@@ -117,6 +137,14 @@ export type WorkerCheckoutFixture = {
   commit: typeof fixtureCommit;
   /** Publishes one commit from a fresh clone onto the session branch, like an earlier turn. */
   publishIncoming: (apply: (seed: string) => Promise<void>) => Promise<string>;
+  /**
+   * Shapes the checkout like the blobless clone the binding meets in production: its incoming blobs
+   * are missing until a command needs one, and the first command that does fetches it from the
+   * origin with the turn's credentials. The filter only applies to a fetch when the remote is a
+   * promisor and the origin can serve a filtered pack, so both ends take the shape a partial clone is
+   * created with.
+   */
+  blobless: () => Promise<void>;
   prepare: (options?: {
     signal?: AbortSignal;
     binding?: WorkerGitHubLaunchBinding;
@@ -175,6 +203,18 @@ export const createWorkerCheckoutFixture = async (): Promise<WorkerCheckoutFixtu
       const head = await commit(seed, "Earlier turn");
       await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${workerFixtureBranch}`);
       return head;
+    },
+    blobless: async () => {
+      await git(
+        root,
+        "config",
+        "--file",
+        path.join(root, "origin.git", "config"),
+        "uploadpack.allowFilter",
+        "true",
+      );
+      await git(cwd, "config", "remote.origin.promisor", "true");
+      await git(cwd, "config", "remote.origin.partialclonefilter", "blob:none");
     },
     preservedBytes: () => preservedRecoveryBytes(cwd),
     preservedLinks: () => preservedRecoveryLinks(cwd),
