@@ -17,7 +17,18 @@ import path from "node:path";
  * also looks for an outstanding copy before it makes its own: the name is fixed, so a later turn
  * would discard it in its own cleanup or overwrite it while preparing its copy, and the preservation
  * would last only until that turn reached these paths.
+ *
+ * The name is fixed for that reason, which is also what makes it a name a command still running as
+ * the worker user can put something at. Neither direction of the copy may therefore resolve through
+ * it: the copy is taken with `O_EXCL`, so a link a writer left at the name is refused rather than
+ * having the checkout's index written wherever it points, and the copy is moved back only while the
+ * name still holds the entry this turn wrote, so a name a writer took over in the meantime cannot
+ * have the checkout's index replaced by whatever the writer left there. A turn that cannot take the
+ * name is a turn that cannot describe the index it would have to restore, so it does not advance the
+ * branch at all.
  */
+type IndexEntry = Awaited<ReturnType<typeof fs.lstat>>;
+
 export const createIndexTransaction = async ({
   gitDirectory,
   ensureRecoveryDirectory,
@@ -28,6 +39,8 @@ export const createIndexTransaction = async ({
   const index = path.join(gitDirectory, "index");
   const previousIndex = path.join(gitDirectory, "github-checkout-previous.index");
   let state: "absent" | "live" | "spent" = "absent";
+  /** The entry this turn's copy is, so putting it back never moves what a writer left there instead. */
+  let copy: IndexEntry | undefined;
   // A copy an earlier turn could not put back is moved under the recovery directory first, where it
   // keeps a name of its own and no later turn reuses it.
   if (await fs.lstat(previousIndex).catch(() => undefined)) {
@@ -37,13 +50,23 @@ export const createIndexTransaction = async ({
   /** Copies the index once, and only when the checkout does not already have a copy of its own. */
   const backUp = async () => {
     if (state === "absent") {
-      await fs.copyFile(index, previousIndex);
+      await fs.copyFile(index, previousIndex, fs.constants.COPYFILE_EXCL);
       state = "live";
+      copy = await fs.lstat(previousIndex).catch(() => undefined);
     }
   };
   /** Puts the copy back over the index, which is the one state in which it is still needed. */
   const putBack = async () => {
     if (state !== "live") {
+      return;
+    }
+    const held = await fs.lstat(previousIndex).catch(() => undefined);
+    if (
+      copy === undefined ||
+      held === undefined ||
+      held.dev !== copy.dev ||
+      held.ino !== copy.ino
+    ) {
       return;
     }
     const putBackIntoPlace = await fs

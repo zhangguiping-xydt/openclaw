@@ -921,17 +921,17 @@ describe("prepareWorkerGitHubEnvironment beside a racing writer", () => {
     const outside = path.join(fixture.root, "outside");
     const outsideFile = path.join(outside, collision);
     const parent = path.join(cwd, nested);
-    const removed = fs.rm;
+    const madeDirectory = fs.mkdtemp;
     let swapped = 0;
-    vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
-      if (String(target).includes("github-checkout-incoming.index") && swapped === 0) {
+    vi.spyOn(fs, "mkdtemp").mockImplementation(async (prefix, options) => {
+      if (prefix.includes("github-checkout-incoming-") && swapped === 0) {
         swapped += 1;
-        await removed(parent, { recursive: true, force: true });
+        await fs.rm(parent, { recursive: true, force: true });
         await fs.mkdir(outside, { recursive: true });
         await fs.writeFile(outsideFile, "outside file\n");
         await fs.symlink(outside, parent);
       }
-      return await removed(target, options);
+      return await madeDirectory(prefix, options);
     });
 
     await prepare();

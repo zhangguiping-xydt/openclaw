@@ -2,7 +2,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createCheckoutPaths, type CreatedEntry } from "./github-binding.checkout-paths.js";
+import {
+  createCheckoutPaths,
+  createGitScratch,
+  type CreatedEntry,
+} from "./github-binding.checkout-paths.js";
 
 /**
  * The rules a placement and a take-back both follow live in one module, and the reads that approve a
@@ -28,14 +32,16 @@ describe("checkout path rules beside a writer that moves the name", () => {
 
   /**
    * A recovery directory the scenario owns, so it can act while the module creates it. The module
-   * creates it once per turn, which is what makes this the whole of the interval under test.
+   * creates it once per turn, which is what makes this the whole of the interval under test. The
+   * fixture root stands in for the checkout's Git directory, so the boundary a name is held to here
+   * is the same one the runtime holds its scratch tree to.
    */
   const recoveryBeside = (create: () => Promise<void>) => {
     const directory = path.join(root, "recovery");
     let ensured: Promise<string> | undefined;
-    return {
-      directory,
-      recovery: {
+    const paths = createCheckoutPaths(
+      cwd,
+      {
         ensureRecoveryDirectory: async () => {
           ensured ??= (async () => {
             await fs.mkdir(directory, { recursive: true });
@@ -46,7 +52,9 @@ describe("checkout path rules beside a writer that moves the name", () => {
         },
         recoveryName: (relative: string) => `preserved-${path.basename(relative)}`,
       },
-    };
+      createGitScratch(root),
+    );
+    return { directory, paths };
   };
 
   it("leaves an entry the pathname no longer names with the writer that moved it there", async () => {
@@ -71,11 +79,10 @@ describe("checkout path rules beside a writer that moves the name", () => {
     // writer spends it pointing the ancestor at a directory of its own. The rename that follows
     // resolves through the new link, so the entry it takes is the writer's rather than the one this
     // turn identified, and nothing this turn holds records the name it had there.
-    const { directory, recovery } = recoveryBeside(async () => {
+    const { directory, paths } = recoveryBeside(async () => {
       await fs.rm(nested, { force: true });
       await fs.symlink(writer, nested);
     });
-    const paths = createCheckoutPaths(cwd, recovery);
 
     await paths.takeBackMisplaced("nested/remote.txt", target, created);
 
@@ -116,8 +123,7 @@ describe("checkout path rules beside a writer that moves the name", () => {
       }
       return result;
     });
-    const { directory, recovery } = recoveryBeside(async () => {});
-    const paths = createCheckoutPaths(cwd, recovery);
+    const { directory, paths } = recoveryBeside(async () => {});
 
     await expect(paths.moveIntoRecovery("nested/collision", collision)).resolves.toBeUndefined();
 
@@ -166,8 +172,7 @@ describe("checkout path rules beside a writer that moves the name", () => {
       }
       return result;
     });
-    const { directory, recovery } = recoveryBeside(async () => {});
-    const paths = createCheckoutPaths(cwd, recovery);
+    const { directory, paths } = recoveryBeside(async () => {});
     return { collision, directory, outside, paths, swapped: () => swapped };
   };
 
@@ -242,8 +247,7 @@ describe("checkout path rules beside a writer that moves the name", () => {
       }
       return await mkdir(directory, options);
     });
-    const { recovery } = recoveryBeside(async () => {});
-    const paths = createCheckoutPaths(cwd, recovery);
+    const { paths } = recoveryBeside(async () => {});
 
     await expect(paths.createRealDirectories("nested/deep")).rejects.toMatchObject({
       code: "EEXIST",
@@ -292,8 +296,7 @@ describe("checkout path rules beside a writer that moves the name", () => {
       }
       return await rename(from, to);
     });
-    const { directory, recovery } = recoveryBeside(async () => {});
-    const paths = createCheckoutPaths(cwd, recovery);
+    const { directory, paths } = recoveryBeside(async () => {});
 
     await paths.takeBackMisplaced("nested/remote.txt", target, created);
 
@@ -342,8 +345,7 @@ describe("checkout path rules beside a writer that moves the name", () => {
       }
       return await rename(from, to);
     });
-    const { directory, recovery } = recoveryBeside(async () => {});
-    const paths = createCheckoutPaths(cwd, recovery);
+    const { directory, paths } = recoveryBeside(async () => {});
 
     const outcome = await paths.moveIntoRecovery("nested/collision", collision);
 
@@ -358,5 +360,76 @@ describe("checkout path rules beside a writer that moves the name", () => {
       "outside file\n",
     );
     expect(outcome).toBeUndefined();
+  });
+
+  it("refuses a scratch directory a writer left a link at", async () => {
+    const outside = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "outside-")));
+    const rootName = path.join(root, "scratch");
+    await fs.symlink(outside, rootName);
+
+    // A recursive creation accepts an existing link as the directory it names, so a tree made that way
+    // and every name below it would be made at the link's target. The one component is created on its
+    // own instead, which refuses a name `lstat` does not report as a directory.
+    const scratch = createGitScratch(root);
+
+    await expect(scratch.make(rootName, "move-")).rejects.toMatchObject({ code: "EEXIST" });
+    await expect(fs.readdir(outside)).resolves.toEqual([]);
+    await fs.rm(outside, { recursive: true, force: true });
+  });
+
+  it("does not empty a directory a redirected scratch name points at", async () => {
+    const outside = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "outside-")));
+    const redirectedDirectory = path.join(outside, "move-1", "incoming-1");
+    await fs.mkdir(redirectedDirectory, { recursive: true });
+    await fs.writeFile(path.join(redirectedDirectory, "writer.txt"), "writer bytes\n");
+    const rootName = path.join(root, "scratch");
+    await fs.symlink(outside, rootName);
+
+    // A recursive removal resolves the whole pathname, so a link at the name above the scratch tree
+    // would have this turn empty a directory of the writer's. The single name is released instead, and
+    // a directory that is still not empty keeps the name that holds it.
+    const scratch = createGitScratch(root);
+
+    await scratch.remove(path.join(rootName, "move-1", "incoming-1"));
+
+    await expect(fs.readFile(path.join(redirectedDirectory, "writer.txt"), "utf8")).resolves.toBe(
+      "writer bytes\n",
+    );
+    await fs.rm(outside, { recursive: true, force: true });
+  });
+
+  it("gives up a move whose destination the writer moved out of the scratch tree", async () => {
+    const nested = path.join(cwd, "nested");
+    await fs.mkdir(nested);
+    const collision = path.join(nested, "collision");
+    await fs.writeFile(collision, "base file\n");
+    const outside = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "outside-")));
+    const { directory, paths } = recoveryBeside(async () => {});
+    const held = path.join(nested, "preserved-collision");
+
+    // The crossing rename resolves the destination's whole pathname, and the read-back that follows it
+    // reads through that same pathname: a writer that replaces the recovery tree with a link has the
+    // entry carried outside the checkout while the move is reported as finished. The tree the caller
+    // named is asked about the destination as well, and an entry that moved through a different tree
+    // goes back to the name it still has.
+    const rename = fs.rename;
+    let swapped = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      const result = await rename(from, to);
+      if (swapped === 0 && String(to) === held) {
+        swapped += 1;
+        await rename(directory, `${directory}-set-aside`);
+        await fs.symlink(outside, directory);
+      }
+      return result;
+    });
+
+    const outcome = await paths.moveIntoRecovery("nested/collision", collision);
+
+    expect(swapped).toBe(1);
+    await expect(fs.readdir(outside)).resolves.toEqual([]);
+    await expect(fs.readFile(collision, "utf8")).resolves.toBe("base file\n");
+    expect(outcome).toBeUndefined();
+    await fs.rm(outside, { recursive: true, force: true });
   });
 });

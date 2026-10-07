@@ -89,6 +89,95 @@ async function putBackWithoutReplacing(preserved: string, destination: string) {
 }
 
 /**
+ * The scratch tree this turn keeps under the checkout's Git directory, and the rules that hold it
+ * there. The Git directory is the one directory the turn's own commands already write, so it is
+ * where scratch state belongs; but a command from an earlier turn still runs as the worker user and
+ * can put anything there, and a scratch name is the one thing this turn has to be able to reach by a
+ * pathname nobody else chose.
+ *
+ * A recursive `mkdir` accepts an existing symlink as the directory it names — `lstat` follows
+ * nothing, a recursive creation resolves the whole pathname — so a scratch root made that way, and
+ * every name created or moved below it afterwards, would end up at the link's target: outside the
+ * checkout, under names the turn that put them there cannot describe. Every component here is
+ * therefore created on its own and has to be a directory `lstat` reports as one, every name below
+ * the root is made by `mkdtemp` so that a writer cannot place anything at it in advance, and each
+ * created name is read back and has to resolve inside the Git directory. What acts through the tree
+ * afterwards — a rename that carries an entry into it, a recursive removal that releases it —
+ * re-reads that boundary rather than trusting the creation, because each creation and the call it
+ * leads to are separate system calls.
+ */
+export function createGitScratch(gitDirectory: string) {
+  /**
+   * The Git directory's own resolved name, read once. Every other name is measured against it, so a
+   * checkout reached through a symlinked temporary directory is not a mismatch.
+   */
+  let boundary: string | undefined;
+  const resolvedBoundary = async () =>
+    (boundary ??= await fs.realpath(gitDirectory).catch(() => undefined));
+  /** Whether a name resolves to the Git directory itself or to a directory below it. */
+  const insideGitDirectory = async (directory: string) => {
+    const root = await resolvedBoundary();
+    const resolved = await fs.realpath(directory).catch(() => undefined);
+    return (
+      root !== undefined &&
+      resolved !== undefined &&
+      (resolved === root || resolved.startsWith(`${root}${path.sep}`))
+    );
+  };
+  /**
+   * Creates one uniquely named directory inside a scratch directory, and the scratch directory
+   * itself when it does not exist yet. `directory` is the Git directory or one of its children, so
+   * only one component can be missing, and it is created without `recursive` — which refuses a link
+   * a writer left at that name instead of resolving through it. Both the directory and the name just
+   * created are read back: a creation resolves the whole pathname, so a component a writer swapped
+   * for a link while it ran would have put the tree at the link's target.
+   */
+  const make = async (directory: string, prefix: string) => {
+    const existing = await fs.lstat(directory).catch(() => undefined);
+    if (!existing) {
+      await fs.mkdir(directory);
+    } else if (!existing.isDirectory()) {
+      throw Object.assign(new Error(`${directory} is not a directory`), { code: "EEXIST" });
+    }
+    if (!(await insideGitDirectory(directory))) {
+      throw Object.assign(new Error(`${directory} is outside the git directory`), {
+        code: "EEXIST",
+      });
+    }
+    const created = await fs.mkdtemp(path.join(directory, prefix));
+    if (!(await insideGitDirectory(created))) {
+      throw Object.assign(new Error(`${created} is outside the git directory`), { code: "EEXIST" });
+    }
+    return created;
+  };
+  /**
+   * Releases a scratch directory. The tree is removed recursively only while its name still resolves
+   * to a directory the Git directory owns: a recursive removal resolves the whole pathname at once,
+   * so a writer that replaced the scratch root with a link would have this turn empty a directory of
+   * its own. The single name is released instead, and `rmdir` reports a directory that is not empty
+   * rather than removing it, so whatever a redirect reaches keeps the entries it was aimed at.
+   */
+  const remove = async (target: string) => {
+    if (await insideGitDirectory(target)) {
+      await fs.rm(target, { recursive: true, force: true });
+      return;
+    }
+    await fs.rmdir(target).catch(() => {});
+  };
+  /**
+   * Whether a name this turn is about to use as a destination still resolves into the scratch tree:
+   * the directory it would be created in, or moved into, has to be one the Git directory owns. Every
+   * name the caller builds is made below a scratch root, so the Git directory is the boundary the
+   * recovery tree owes, and it is read again here rather than remembered from the creation.
+   */
+  const insideRecovery = async (target: string) => insideGitDirectory(path.dirname(target));
+  return { make, remove, insideRecovery };
+}
+
+/** The scratch tree a checkout turn keeps under its Git directory. */
+export type GitScratch = ReturnType<typeof createGitScratch>;
+
+/**
  * The directory-boundary rules a placement has to satisfy before it may create a name in a checkout,
  * and the rule a take-back has to satisfy before it may move one. Every rule re-reads the filesystem
  * rather than trusting an earlier answer, because each check and the write it guards are separate
@@ -107,6 +196,12 @@ export function createCheckoutPaths(
     ensureRecoveryDirectory: () => Promise<string>;
     recoveryName: (relative: string) => string;
   },
+  /**
+   * The scratch tree the recovery directory belongs to. The rename that carries an entry into it is
+   * the one step whose destination is not beside its source, so it owes the tree's own boundary
+   * rather than the checkout's.
+   */
+  scratch: GitScratch,
 ) {
   /**
    * The path a writer's file occupies on the way to `relative`, or the path itself when the
@@ -270,29 +365,6 @@ export function createCheckoutPaths(
     return true;
   };
   /**
-   * Takes a placement or a restoration that resolved outside the checkout back into the recovery
-   * directory. The entry is moved rather than removed, so bytes a writer wrote through the
-   * misdirected name are not the price of refusing the placement, and the path is free for the retry
-   * that follows. The name is resolved again here, and a writer can point it at a different entry
-   * between the creation and this call: renaming the directory the entry was made in and putting a
-   * link to somewhere else in its place makes this pathname name a file that belongs to the writer,
-   * outside the checkout. Moving that entry would take an unrelated file under the Git directory and
-   * leave the placement behind, so what the pathname names is compared with the entry this turn
-   * created first and anything else is left exactly where it is — the placement retry moves the
-   * blocker aside and writes into the path it freed instead.
-   *
-   * The recovery directory this moves the entry into may not exist yet, and creating it is an await
-   * like any other, so the writer owns that interval too. The parent the rename would resolve
-   * through is therefore read after the directory exists, and the identity is compared again as the
-   * last read before the syscall: a writer that moved the name onto one of its own files while the
-   * directory was being made is refused here rather than having its file taken under the Git
-   * directory. A parent that resolves somewhere else once the rename has run is the same writer
-   * working later, and the entry the rename took goes back to the name it had outside, which the
-   * answer from before the move is the only record of. Both the identity read and the rename take the
-   * parent's resolved name, so redirecting the link that pathname runs through in between cannot move
-   * the syscall into a directory this turn never compared.
-   */
-  /**
    * Sets the entry a resolved pathname names aside, so the name it held is free.
    *
    * Nothing here can name a directory this turn already holds — there is no `renameat`, and the
@@ -318,6 +390,13 @@ export function createCheckoutPaths(
    * Every step moves an entry rather than deleting one, and the intermediate name is only ever
    * occupied by this turn: bytes this turn did not write survive, and nothing the writer owns is left
    * under the Git directory.
+   *
+   * The last rename is also the only one whose destination is not beside its source, and a rename
+   * resolves the destination's whole pathname: a writer that replaced the scratch root with a link
+   * would have the entry carried outside the checkout, where the read-back would still find it and
+   * report a move that finished. Read-back alone cannot answer about a destination, so the tree the
+   * caller named is asked about the destination both before the syscall and after it, and an entry
+   * that moved through a different tree goes back to the name it still has.
    *
    * The caller reads the entry it expects *before* the path rules that approve the move: a swap still
    * in place when those rules run fails them, and one that came and went between this read and the
@@ -365,6 +444,16 @@ export function createCheckoutPaths(
       await putBackWithoutReplacing(held, source);
       return undefined;
     }
+    // The rename below is the one step whose destination is not beside its source, and it resolves
+    // that destination's whole pathname: a writer that replaced the scratch root it runs through with
+    // a link would have this move carry the entry out of the checkout, where the read-back would
+    // still find the expected entry and report a move that finished. The destination is therefore
+    // held to the tree the caller named, read again immediately before the syscall and again after
+    // it, and a move that cannot be held to it is given up with the entry put back at its own name.
+    if (!(await scratch.insideRecovery(preserved))) {
+      await putBackWithoutReplacing(held, source);
+      return undefined;
+    }
     if (
       !(await fs
         .rename(held, preserved)
@@ -374,7 +463,7 @@ export function createCheckoutPaths(
       await putBackWithoutReplacing(held, source);
       return undefined;
     }
-    if (await holdsExpected(preserved)) {
+    if ((await scratch.insideRecovery(preserved)) && (await holdsExpected(preserved))) {
       return preserved;
     }
     await putBackWithoutReplacing(preserved, source);

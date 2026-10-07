@@ -13,7 +13,11 @@ import { executeGitCommand } from "../infra/git-exec.js";
 import { isPathCaseInsensitive } from "../infra/path-case.js";
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import { createCheckoutPaths, type CreatedEntry } from "./github-binding.checkout-paths.js";
+import {
+  createCheckoutPaths,
+  createGitScratch,
+  type CreatedEntry,
+} from "./github-binding.checkout-paths.js";
 import { createIndexTransaction } from "./github-binding.index-transaction.js";
 import type { WorkerGitHubLaunchBinding } from "./launch-descriptor.js";
 
@@ -88,6 +92,10 @@ async function bindWorkerGitHubCheckout(
       return;
     }
     const gitDirectory = repository.stdout.trim();
+    // The scratch tree every later step keeps under it, and the boundary those steps are held to: a
+    // name under the Git directory is the one thing this turn has to reach by a pathname no writer
+    // chose, so the tree is created through real directories only and re-checked wherever it is used.
+    const scratch = createGitScratch(gitDirectory);
     if (binding.remoteUrl) {
       const origin = await git(["remote", "get-url", "origin"]);
       if (origin.code !== 0) {
@@ -301,8 +309,12 @@ async function bindWorkerGitHubCheckout(
     // `git status`, so preserved bytes cannot be mistaken for work to publish, and they stay for
     // the lifetime of the checkout, which is discarded with the worker. Recovery names are digest
     // based, so a legal path of any length still fits the filesystem's component limit, no
-    // placement writes through a directory a writer recreated as a symlink to somewhere else, and
-    // a failure part way through takes the placements back and puts back what this turn moved,
+    // placement writes through a directory a writer recreated as a symlink to somewhere else, the
+    // scratch tree the preserved bytes are moved into is not reached through one either — its
+    // directories are created a component at a time, the names inside it are ones no writer can
+    // predict, and both the rename that carries an entry into it and the removal that releases it
+    // are held to the Git directory — and a failure part way through takes the placements back and
+    // puts back what this turn moved,
     // without overwriting a writer's bytes or deleting anything a writer may have written since.
     // A placement a writer has modified in place is put back at its own path when it is still free,
     // and both copies stay reachable otherwise, so the writer's bytes are never the price of the
@@ -316,10 +328,7 @@ async function bindWorkerGitHubCheckout(
     const collisionRecovery = path.join(gitDirectory, "github-checkout-collision-recovery");
     let recoveryDirectory: string | undefined;
     const ensureRecoveryDirectory = async () => {
-      if (!recoveryDirectory) {
-        await fs.mkdir(collisionRecovery, { recursive: true });
-        recoveryDirectory = await fs.mkdtemp(path.join(collisionRecovery, "move-"));
-      }
+      recoveryDirectory ??= await scratch.make(collisionRecovery, "move-");
       return recoveryDirectory;
     };
     let recoverySequence = 0;
@@ -336,7 +345,8 @@ async function bindWorkerGitHubCheckout(
     // the filesystem instead of trusting an earlier check, and every creation site uses the same
     // ones, so they are kept together rather than beside the code that calls them. The take-back
     // writes into the recovery directory this turn just named, so it is handed the two callbacks
-    // that describe it.
+    // that describe it together with the scratch tree that directory belongs to, which is the
+    // boundary the one rename leaving the checkout has to be held to.
     const {
       blockingPath,
       resolvesInsideCheckout,
@@ -345,7 +355,7 @@ async function bindWorkerGitHubCheckout(
       createRealDirectories,
       takeBackMisplaced,
       moveIntoRecovery,
-    } = createCheckoutPaths(cwd, { ensureRecoveryDirectory, recoveryName });
+    } = createCheckoutPaths(cwd, { ensureRecoveryDirectory, recoveryName }, scratch);
     /**
      * Replacing a path means moving it aside, so a writer's bytes survive at one of the two. The
      * move itself is guarded where the path rules live: a rename resolves the whole pathname at the
@@ -562,9 +572,15 @@ async function bindWorkerGitHubCheckout(
       }
     };
     // The incoming history is exported and materialized from its own index, held outside the
-    // checkout's index, so HEAD and the index only move after every incoming file is in place.
-    const incomingIndex = path.join(gitDirectory, "github-checkout-incoming.index");
-    const incomingEnv = { GIT_INDEX_FILE: incomingIndex };
+    // checkout's index, so HEAD and the index only move after every incoming file is in place. That
+    // index is named inside a directory this turn makes rather than at a fixed name under the Git
+    // directory: a fixed name is one a writer can leave a link at, and `ls-files` reading through
+    // that link would report the deletions of an index this turn never wrote, so the move would take
+    // the checkout to a head whose files it never materialized — the mixture it exists to avoid,
+    // reached without a single delete. `mkdtemp` names the directory, so no writer can place
+    // anything at the name in advance, and the whole directory is released with the turn's scratch.
+    let incomingScratch: string | undefined;
+    const incomingEnv: NodeJS.ProcessEnv = {};
     // The index copy that has to precede the index write is a concern of its own: it is taken once, put
     // back when the move it describes fails, and kept when putting it back did not work.
     const indexTransaction = await createIndexTransaction({
@@ -646,8 +662,10 @@ async function bindWorkerGitHubCheckout(
     let staging: string | undefined;
     let replaced = false;
     try {
-      // A crashed turn can leave the index behind; a stale index file is not a valid one.
-      await fs.rm(incomingIndex, { force: true });
+      // A fresh directory every turn, so there is no index left behind by a turn that died: a stale
+      // index file is not a valid one, and the name it had is not reused.
+      incomingScratch = await scratch.make(gitDirectory, "github-checkout-incoming-");
+      incomingEnv.GIT_INDEX_FILE = path.join(incomingScratch, "index");
       await requireMoveGit(["read-tree", "FETCH_HEAD"], incomingEnv);
       const absent = splitPaths(
         await requireMoveGit(["ls-files", "--deleted", "-z"], incomingEnv),
@@ -683,7 +701,7 @@ async function bindWorkerGitHubCheckout(
         stagedEntries.filter((entry) => entry.startsWith("160000 ")).map(stagedPath),
       );
       if (exportable.size > 0) {
-        staging = await fs.mkdtemp(path.join(await ensureRecoveryDirectory(), "incoming-"));
+        staging = await scratch.make(await ensureRecoveryDirectory(), "incoming-");
         try {
           await requireGitWith(
             [
@@ -918,13 +936,18 @@ async function bindWorkerGitHubCheckout(
     } finally {
       // Every placed file keeps a name under the Git directory once the rollback has moved it there,
       // so the staging directory is only ever this turn's own scratch copy of the same bytes; the
-      // incoming index is a scratch file for the whole turn. The backup is kept while it is still
-      // the only copy of the index the checkout describes, which is what an unsuccessful
+      // incoming index is a scratch file for the whole turn. Both are released through the scratch
+      // tree's own rule, which recurses only while the name still resolves inside the Git directory:
+      // a recursive removal resolves the whole pathname, so a writer that replaced the scratch root
+      // with a link would have this turn empty a directory of its own. The backup is kept while it is
+      // still the only copy of the index the checkout describes, which is what an unsuccessful
       // restoration leaves behind.
       if (staging) {
-        await fs.rm(staging, { recursive: true, force: true });
+        await scratch.remove(staging);
       }
-      await fs.rm(incomingIndex, { force: true });
+      if (incomingScratch) {
+        await scratch.remove(incomingScratch);
+      }
       // The copy is discarded in every state except the one that must survive: the index the
       // checkout still describes, reached when the move ran and putting it back did not work.
       await indexTransaction.discardUnused();

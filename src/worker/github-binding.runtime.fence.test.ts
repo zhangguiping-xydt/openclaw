@@ -379,12 +379,12 @@ describe("prepareWorkerGitHubEnvironment for a fenced turn", () => {
     const nested = path.join(cwd, "nested");
     const controller = new AbortController();
     let classified = false;
-    const removed = fs.rm;
-    vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
-      if (String(target).includes("github-checkout-incoming.index")) {
+    const madeDirectory = fs.mkdtemp;
+    vi.spyOn(fs, "mkdtemp").mockImplementation(async (prefix, options) => {
+      if (prefix.includes("github-checkout-incoming-")) {
         classified = true;
       }
-      return await removed(target, options);
+      return await madeDirectory(prefix, options);
     });
     const lstat = fs.lstat;
     vi.spyOn(fs, "lstat").mockImplementation(async (target, options) => {
