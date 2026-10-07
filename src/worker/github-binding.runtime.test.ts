@@ -547,6 +547,45 @@ describe("prepareWorkerGitHubEnvironment", () => {
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
   });
 
+  it("moves the branch to the commit it resolved, not to one a later fetch names", async () => {
+    const remoteHead = await publishEarlierTurn();
+
+    // The fetched commit is read from `FETCH_HEAD`, and that file is a name a command still running as
+    // the worker user can rewrite with a fetch of its own. A turn that read the file again for each
+    // command of the move would export one commit and advance the branch to whichever one the file
+    // held when the last command ran — here a divergent history the session never classified, which
+    // the checkout would then hold as its head. The commit is resolved to an object name once, and
+    // every command after that names the object rather than the file.
+    const divergent = path.join(root, "divergent-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, divergent);
+    await fs.writeFile(path.join(divergent, "divergent.txt"), "divergent content\n");
+    const divergentHead = await commit(divergent, "Divergent turn");
+    await git(divergent, "push", "--quiet", "origin", "HEAD:refs/heads/divergent");
+
+    const runCommand = exec.runCommandWithTimeout;
+    let refetched = 0;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      const result = await runCommand(argv, options);
+      // The turn has just resolved the fetched commit, and the writer's own fetch lands straight
+      // after it — the one moment the name is between being read and being used.
+      if (refetched === 0 && argv.includes("rev-parse") && argv.includes("FETCH_HEAD")) {
+        refetched += 1;
+        await git(cwd, "fetch", "--quiet", "origin", "divergent");
+      }
+      return result;
+    });
+
+    await prepare();
+
+    // The branch sits at the commit this turn resolved and materialized, so the head and the working
+    // tree describe the same revision instead of the mixture two histories would leave behind.
+    expect(refetched).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).not.toBe(divergentHead);
+    await expect(fs.readFile(path.join(cwd, filename), "utf8")).resolves.toBe(pushedContent);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+  });
+
   it("keeps a commit a worker command makes while the branch is being moved", async () => {
     await fs.writeFile(path.join(cwd, "modified.txt"), "local bytes\n");
     initialHead = await commit(cwd, "Track modified file");

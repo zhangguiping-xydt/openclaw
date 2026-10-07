@@ -138,6 +138,23 @@ async function putBackWithoutReplacing(preserved: string, destination: string) {
 }
 
 /**
+ * Whether two entries a turn read are the same filesystem entry, rather than two that merely carry
+ * the same numbers. A device and an inode number are how a filesystem names an entry, and it hands
+ * the same pair out again as soon as the entry that held them is released: a writer that removes a
+ * scratch name and creates its own at that name, in that order, is handed the pair this turn
+ * recorded and passes for the entry the turn made. The birth time is therefore read with them — it
+ * belongs to the creation, so an entry created by someone else is a different moment — and a turn
+ * that cannot read one of the three treats the entries as different.
+ */
+type EntryNumbers = { dev: number | bigint; ino: number | bigint; birthtimeMs: number | bigint };
+export const isSameEntry = (left: EntryNumbers | undefined, right: EntryNumbers | undefined) =>
+  left !== undefined &&
+  right !== undefined &&
+  Number(left.dev) === Number(right.dev) &&
+  Number(left.ino) === Number(right.ino) &&
+  Number(left.birthtimeMs) === Number(right.birthtimeMs);
+
+/**
  * The scratch tree this turn keeps under the checkout's Git directory, and the rules that hold it
  * there. The Git directory is the one directory the turn's own commands already write, so it is
  * where scratch state belongs; but a command from an earlier turn still runs as the worker user and
@@ -166,9 +183,9 @@ export function createGitScratch(gitDirectory: string) {
   /**
    * The directory each created scratch name was when it was made. A name is only this turn's to act
    * through while it still denotes that directory, and a step that acts through one asks that of the
-   * recorded pair rather than trusting the creation.
+   * recorded identity rather than trusting the creation.
    */
-  const identity = new Map<string, { dev: number; ino: number }>();
+  const identity = new Map<string, { dev: number; ino: number; birthtimeMs: number }>();
   const resolvedBoundary = async () =>
     (boundary ??= await fs.realpath(gitDirectory).catch(() => undefined));
   /** Whether a name resolves to the Git directory itself or to a directory below it. */
@@ -207,7 +224,7 @@ export function createGitScratch(gitDirectory: string) {
     }
     // The identity the name carried when this turn made it, kept for `holds` below.
     const stats = await fs.lstat(created);
-    identity.set(created, { dev: stats.dev, ino: stats.ino });
+    identity.set(created, { dev: stats.dev, ino: stats.ino, birthtimeMs: stats.birthtimeMs });
     return created;
   };
   /**
@@ -229,22 +246,26 @@ export function createGitScratch(gitDirectory: string) {
     return (
       entry !== undefined &&
       entry.isDirectory() &&
-      entry.dev === recorded.dev &&
-      entry.ino === recorded.ino &&
+      isSameEntry(recorded, entry) &&
       (await insideGitDirectory(target))
     );
   };
   /**
-   * Releases a scratch directory. The tree is removed recursively only while its name still resolves
-   * to a directory the Git directory owns: a recursive removal resolves the whole pathname at once,
-   * so a writer that replaced the scratch root with a link would have this turn empty a directory of
-   * its own. The single name is released instead, and `rmdir` reports a directory that is not empty
-   * rather than removing it, so whatever a redirect reaches keeps the entries it was aimed at.
+   * Releases a scratch directory. The tree is removed recursively only while its name still denotes
+   * the directory this turn made, and still resolves inside the Git directory. A recursive removal
+   * resolves the whole pathname at once, so a scratch root a writer replaced — with a link, or with
+   * an ordinary directory of its own under the Git directory and files inside it — would have this
+   * turn empty a tree it never made. The single name is released instead, and `rmdir` reports a
+   * directory that is not empty rather than removing it, so whatever a redirect reaches keeps the
+   * entries it was aimed at.
    */
   const remove = async (target: string) => {
+    // Read before the name is released, because `holds` answers from the identity this turn recorded
+    // when it made the directory.
+    const owned = await holds(target);
     // A name this turn has released is no longer one it may claim, whatever it holds afterwards.
     identity.delete(target);
-    if (await insideGitDirectory(target)) {
+    if (owned) {
       await fs.rm(target, { recursive: true, force: true });
       return;
     }

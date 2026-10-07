@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isSameEntry, type GitScratch } from "./github-binding.checkout-paths.js";
 
 /**
  * The copy of the checkout's index this turn made, and what it is still needed for.
@@ -31,15 +32,23 @@ import path from "node:path";
  * checkout's own index, which is the destination of the move and a name a retained command writes as
  * well. An index that no longer holds the entry this turn last knew — the one its own write left, or
  * the one the copy was taken from when nothing was written — is left to whoever wrote it.
+ *
+ * The copy's own name is read for the same reason in both remaining directions. Discarding it after
+ * a successful move removes the entry this turn copied, not whatever holds the name by then; and an
+ * outstanding copy an earlier turn left is moved under the recovery directory through that
+ * directory's own scratch rules, so the name it is moved into is one this turn made and re-read
+ * rather than a path a retained command could have redirected.
  */
 type IndexEntry = Awaited<ReturnType<typeof fs.lstat>>;
 
 export const createIndexTransaction = async ({
   gitDirectory,
   ensureRecoveryDirectory,
+  scratch,
 }: {
   gitDirectory: string;
   ensureRecoveryDirectory: () => Promise<string>;
+  scratch: GitScratch;
 }) => {
   const index = path.join(gitDirectory, "index");
   const previousIndex = path.join(gitDirectory, "github-checkout-previous.index");
@@ -55,8 +64,14 @@ export const createIndexTransaction = async ({
   // A copy an earlier turn could not put back is moved under the recovery directory first, where it
   // keeps a name of its own and no later turn reuses it.
   if (await fs.lstat(previousIndex).catch(() => undefined)) {
-    const kept = await fs.mkdtemp(path.join(await ensureRecoveryDirectory(), "previous-index-"));
-    await fs.rename(previousIndex, path.join(kept, "index"));
+    // The name the copy is moved into is made through the scratch tree's own rules — every component
+    // created on its own and the created name read back inside the Git directory — and read again
+    // here, immediately before the move, because a rename resolves the whole destination pathname and
+    // the recovery directory is a name a command still running as the worker user can replace.
+    const kept = await scratch.make(await ensureRecoveryDirectory(), "previous-index-");
+    if (await scratch.holds(kept)) {
+      await fs.rename(previousIndex, path.join(kept, "index"));
+    }
   }
   /** Copies the index once, and only when the checkout does not already have a copy of its own. */
   const backUp = async () => {
@@ -82,12 +97,7 @@ export const createIndexTransaction = async ({
       return;
     }
     const held = await fs.lstat(previousIndex).catch(() => undefined);
-    if (
-      copy === undefined ||
-      held === undefined ||
-      held.dev !== copy.dev ||
-      held.ino !== copy.ino
-    ) {
+    if (!isSameEntry(copy, held)) {
       return;
     }
     // The destination is read last, because a rename replaces whatever holds it and the index is a
@@ -98,12 +108,7 @@ export const createIndexTransaction = async ({
     // stays where the next turn can still reach it. Git replaces the index through a lock file and a
     // rename, so a staged change is a different entry and never the one compared here.
     const current = await fs.lstat(index).catch(() => undefined);
-    if (
-      known === undefined ||
-      current === undefined ||
-      current.dev !== known.dev ||
-      current.ino !== known.ino
-    ) {
+    if (!isSameEntry(known, current)) {
       return;
     }
     const putBackIntoPlace = await fs
@@ -122,14 +127,21 @@ export const createIndexTransaction = async ({
     state = "spent";
   };
   /**
-   * Discards the copy in every state except the one that must survive: `live` is reached when the
-   * move ran and putting the copy back did not work, and it then holds the only description of the
-   * index the checkout still has.
+   * Discards the copy this turn took, and only while the name still holds that very entry. The name
+   * is fixed, so a command still running as the worker user can put a file of its own at it between
+   * the copy being spent and this cleanup, and removing the name then would delete that file. A copy
+   * this turn never took is not this turn's to remove either: `absent` means the move never reached
+   * the copy, so whatever holds the name was put there by someone else.
    */
   const discardUnused = async () => {
-    if (state === "absent" || state === "spent") {
-      await fs.rm(previousIndex, { force: true });
+    if (state !== "spent" || copy === undefined) {
+      return;
     }
+    const held = await fs.lstat(previousIndex).catch(() => undefined);
+    if (!isSameEntry(copy, held)) {
+      return;
+    }
+    await fs.rm(previousIndex, { force: true });
   };
   return { backUp, noteIndexWritten, putBack, markSpent, discardUnused };
 };

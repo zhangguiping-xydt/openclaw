@@ -173,6 +173,47 @@ describe("prepareWorkerGitHubEnvironment beside a writer that owns a scratch nam
     );
   });
 
+  it("keeps a writer's own directory at the name it releases the export through", async () => {
+    const { remoteHead } = await collisionScenario();
+
+    // The scratch copy of the incoming content is released once the move has placed it, and the
+    // release recurses while the name resolves inside the Git directory. A writer that replaces that
+    // name with an ordinary directory of its own — no link, so the name still resolves inside the
+    // boundary — and fills it would have the turn delete a tree it never made. The name is therefore
+    // released recursively only while it still denotes the directory this turn created, and `rmdir`
+    // then refuses the writer's directory instead of emptying it.
+    const recoveryRoot = path.join(cwd, ".git", "github-checkout-collision-recovery");
+    const runCommand = exec.runCommandWithTimeout;
+    let takenOver = 0;
+    let writerDirectory = "";
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      const result = await runCommand(argv, options);
+      if (isBranchMove(argv) && takenOver === 0) {
+        takenOver += 1;
+        const move = path.join(recoveryRoot, only(await fs.readdir(recoveryRoot), "move-"));
+        writerDirectory = path.join(move, only(await fs.readdir(move), "incoming-"));
+        // The writer removes the turn's directory and creates its own at the same name, which is the
+        // order that has the filesystem hand back the very numbers the turn recorded for it.
+        await fs.rm(writerDirectory, { recursive: true, force: true });
+        await fs.mkdir(writerDirectory);
+        await fs.writeFile(path.join(writerDirectory, "writer.txt"), "writer bytes\n");
+      }
+      return result;
+    });
+
+    await prepare();
+
+    // The turn's own fast-forward completed, and the directory the writer put at that name kept every
+    // entry it had: the name no longer denoted the directory this turn made, so the turn released the
+    // single name instead of recursing into the writer's tree.
+    expect(takenOver).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    await expect(fs.readFile(path.join(writerDirectory, "writer.txt"), "utf8")).resolves.toBe(
+      "writer bytes\n",
+    );
+  });
+
   it("does not export the incoming content through a link a writer left at its directory", async () => {
     const { collision, remoteHead } = await collisionScenario();
 
@@ -254,5 +295,76 @@ describe("prepareWorkerGitHubEnvironment beside a writer that owns a scratch nam
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
     await expect(fs.readFile(path.join(cwd, "added.txt"), "utf8")).resolves.toBe("remote added\n");
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+  });
+
+  it("keeps a writer's file at the name the index copy is discarded from", async () => {
+    const { remoteHead } = await collisionScenario();
+
+    // The copy of the checkout's index is taken at a fixed name under the Git directory, and it is
+    // discarded once the move has written the index it describes. A writer can put a file of its own at
+    // that name in between, and removing the name unconditionally would delete it. The name is read
+    // again before it is released, and only the entry this turn copied is removed.
+    const previousIndex = path.join(cwd, ".git", "github-checkout-previous.index");
+    const runCommand = exec.runCommandWithTimeout;
+    let replaced = 0;
+    vi.spyOn(exec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      const result = await runCommand(argv, options);
+      if (isBranchMove(argv) && replaced === 0) {
+        replaced += 1;
+        // The copy has done its work — the branch moved — and the writer takes the name over.
+        await fs.rm(previousIndex, { force: true });
+        await fs.writeFile(previousIndex, "writer bytes\n");
+      }
+      return result;
+    });
+
+    await prepare();
+
+    expect(replaced).toBe(1);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    await expect(fs.readFile(previousIndex, "utf8")).resolves.toBe("writer bytes\n");
+  });
+
+  it("does not move an earlier turn's index copy through a redirected recovery tree", async () => {
+    const { remoteHead } = await collisionScenario();
+
+    // A copy an earlier turn could not put back is found at its fixed name when this turn starts, and
+    // this turn moves it under the recovery directory. That is two steps — the name the copy lands on
+    // is created, and then the copy is renamed onto it — and a rename resolves the whole destination
+    // pathname, so a writer that replaces the recovery directory with a link in between has the
+    // preserved index carried outside the checkout where no later turn can find it. The name is
+    // therefore made through the scratch tree's own rules, and read back inside the Git directory
+    // immediately before the copy is moved onto it.
+    const recoveryRoot = path.join(cwd, ".git", "github-checkout-collision-recovery");
+    const previousIndex = path.join(cwd, ".git", "github-checkout-previous.index");
+    const outside = path.join(fixture.root, "outside");
+    const setAside = path.join(fixture.root, "recovery-set-aside");
+    await fs.writeFile(previousIndex, "preserved index bytes\n");
+    await fs.mkdir(outside);
+    const mkdtemp = fs.mkdtemp;
+    let redirected = 0;
+    vi.spyOn(fs, "mkdtemp").mockImplementation(async (template, options) => {
+      if (redirected === 0 && template.includes("previous-index-")) {
+        redirected += 1;
+        // The name the copy would be moved into is the recovery directory the turn was handed, and
+        // that is the name the writer replaces here.
+        const handed = path.join(recoveryRoot, only(await fs.readdir(recoveryRoot), "move-"));
+        await fs.rename(handed, setAside);
+        await fs.symlink(outside, handed);
+      }
+      return await mkdtemp(template, options);
+    });
+
+    await prepare();
+
+    expect(redirected).toBe(1);
+
+    // The turn could not make a name of its own under the recovery directory, so it left the copy
+    // where it was and the checkout untouched: nothing this turn handled is outside the checkout, and
+    // the branch is where it was for a later turn to repeat the same fast-forward.
+    await expect(filesBelow(outside)).resolves.toEqual([]);
+    await expect(fs.readFile(previousIndex, "utf8")).resolves.toBe("preserved index bytes\n");
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(remoteHead).not.toBe(initialHead);
   });
 });

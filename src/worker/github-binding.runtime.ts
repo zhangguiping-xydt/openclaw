@@ -123,15 +123,19 @@ async function bindWorkerGitHubCheckout(
       }
       throw new Error(`git fetch failed (exit ${fetched.code})`);
     }
-    await requireGit(["update-ref", `refs/remotes/origin/${binding.branch}`, "FETCH_HEAD"]);
+    // The fetched commit is resolved to an object name once, here, and every command after this
+    // point names that object instead of `FETCH_HEAD`. The file is a name a command still running as
+    // the worker user can rewrite with a fetch of its own, and a turn that read it again per command
+    // would materialize one commit and advance the branch to whichever one the file held next.
+    const remote = (await requireGit(["rev-parse", "FETCH_HEAD"])).trim();
+    await requireGit(["update-ref", `refs/remotes/origin/${binding.branch}`, remote]);
     // A tracked upstream lets a bare `git push` and `git status -sb` work on a fresh checkout.
     await requireGit(["branch", `--set-upstream-to=origin/${binding.branch}`, binding.branch]);
     const local = (await requireGit(["rev-parse", "HEAD"])).trim();
-    const remote = (await requireGit(["rev-parse", "FETCH_HEAD"])).trim();
     if (local === remote) {
       return;
     }
-    if ((await git(["merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"])).code !== 0) {
+    if ((await git(["merge-base", "--is-ancestor", "HEAD", remote])).code !== 0) {
       log.warn(
         `GitHub checkout fast-forward skipped: ${binding.branch} HEAD=${local.slice(0, 7)} origin=${remote.slice(0, 7)}`,
       );
@@ -149,7 +153,7 @@ async function bindWorkerGitHubCheckout(
       "--no-renames",
       "-z",
       "HEAD",
-      "FETCH_HEAD",
+      remote,
       "--",
     ]);
     const caseInsensitive = isPathCaseInsensitive(cwd);
@@ -569,6 +573,7 @@ async function bindWorkerGitHubCheckout(
     const indexTransaction = await createIndexTransaction({
       gitDirectory,
       ensureRecoveryDirectory,
+      scratch,
     });
     /**
      * Whether the branch already sits at the fetched commit. The rollback follows the branch that is
@@ -578,10 +583,10 @@ async function bindWorkerGitHubCheckout(
      */
     const branchReachedFetchedCommit = async () => {
       const current = await runGit(["rev-parse", "HEAD"], 5_000, false);
-      const target = await runGit(["rev-parse", "FETCH_HEAD"], 5_000, false);
-      return (
-        current.code === 0 && target.code === 0 && current.stdout.trim() === target.stdout.trim()
-      );
+      // Compared against the resolved object, not against a fresh read of `FETCH_HEAD`: the file can
+      // name a different commit by now, and the question here is whether the branch reached the one
+      // this turn was moving it to.
+      return current.code === 0 && current.stdout.trim() === remote;
     };
     /**
      * Admits the first mutation of the move, and only that one. Everything before it reads the
@@ -636,7 +641,7 @@ async function bindWorkerGitHubCheckout(
       if (!admitFirstMutation()) {
         return;
       }
-      await requireMoveGit(["read-tree", "FETCH_HEAD"], noLazyFetchEnv);
+      await requireMoveGit(["read-tree", remote], noLazyFetchEnv);
       // The index this turn's own write left, so the rollback below only ever puts the copy back over
       // the entry it knows about. A retained command can stage into the same name between this write
       // and a failure that reaches the restoration.
@@ -647,7 +652,7 @@ async function bindWorkerGitHubCheckout(
       // an unconditional update would rewind that commit to the fetched head and orphan history the
       // session never pushed. The expected value makes the update fail instead, and the rollback
       // leaves the writer's branch and index alone.
-      await requireMoveGit(["update-ref", branch, "FETCH_HEAD", local], noLazyFetchEnv);
+      await requireMoveGit(["update-ref", branch, remote, local], noLazyFetchEnv);
       // The index this wrote is the one the checkout now has, so the backup is not needed.
       indexTransaction.markSpent();
     };
@@ -658,7 +663,7 @@ async function bindWorkerGitHubCheckout(
       // index file is not a valid one, and the name it had is not reused.
       incomingScratch = await scratch.make(gitDirectory, "github-checkout-incoming-");
       incomingEnv.GIT_INDEX_FILE = path.join(incomingScratch, "index");
-      await requireMoveGit(["read-tree", "FETCH_HEAD"], incomingEnv);
+      await requireMoveGit(["read-tree", remote], incomingEnv);
       const absent = splitPaths(
         await requireMoveGit(["ls-files", "--deleted", "-z"], incomingEnv),
       ).filter((file) => !deletedBefore.has(file));
@@ -948,19 +953,21 @@ async function bindWorkerGitHubCheckout(
       // Every placed file keeps a name under the Git directory once the rollback has moved it there,
       // so the staging directory is only ever this turn's own scratch copy of the same bytes; the
       // incoming index is a scratch file for the whole turn. Both are released through the scratch
-      // tree's own rule, which recurses only while the name still resolves inside the Git directory:
-      // a recursive removal resolves the whole pathname, so a writer that replaced the scratch root
-      // with a link would have this turn empty a directory of its own. The backup is kept while it is
-      // still the only copy of the index the checkout describes, which is what an unsuccessful
-      // restoration leaves behind.
+      // tree's own rule, which recurses only while the name still denotes the directory this turn
+      // made and still resolves inside the Git directory: a recursive removal resolves the whole
+      // pathname, so a writer that replaced either name — with a link, or with a directory of its own
+      // under the Git directory — would have this turn empty a tree it never made. The backup is
+      // removed only while the name still holds the copy this turn took, and kept otherwise, because
+      // an unsuccessful restoration leaves it as the only copy of the index the checkout describes.
       if (staging) {
         await scratch.remove(staging);
       }
       if (incomingScratch) {
         await scratch.remove(incomingScratch);
       }
-      // The copy is discarded in every state except the one that must survive: the index the
-      // checkout still describes, reached when the move ran and putting it back did not work.
+      // The copy is discarded only while the name still holds it: the state that must survive is the
+      // index the checkout still describes, reached when the move ran and putting it back did not
+      // work, and a name a writer has taken over since is not this turn's to remove.
       await indexTransaction.discardUnused();
     }
   } catch (error) {
