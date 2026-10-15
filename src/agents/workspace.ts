@@ -925,6 +925,7 @@ export async function loadWorkspaceBootstrapFiles(
     const loaded = await readWorkspaceFileWithGuards({
       filePath: entry.filePath,
       workspaceDir: resolvedDir,
+      projectForPrompt: true,
     });
     if (loaded.ok) {
       result.push(createLoadedWorkspaceBootstrapFile(entry.name, entry.filePath, loaded));
@@ -1164,6 +1165,7 @@ export async function loadExtraBootstrapFilesWithDiagnostics(
     const loaded = await readWorkspaceFileWithGuards({
       filePath,
       workspaceDir: resolvedDir,
+      projectForPrompt: true,
     });
     if (loaded.ok) {
       files.push(
