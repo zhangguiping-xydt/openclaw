@@ -32,7 +32,7 @@ import {
 import {
   prepareNodeWorkerLaunch,
   createNodeWorkerAdmissionScope,
-  withNodeWorkerCheckoutPreparation,
+  dispatchNodeWorkerWithCheckoutPreparation,
   NODE_WORKER_STOP_GRACE_MS,
   NODE_WORKER_FORCE_STOP_WAIT_MS,
   nodeWorkerEnvironmentBinding,
@@ -284,7 +284,7 @@ class NodeWorkerSupervisor {
         signal.throwIfAborted();
         continue;
       }
-      return await withNodeWorkerCheckoutPreparation(
+      return await dispatchNodeWorkerWithCheckoutPreparation(
         this.workspace,
         input,
         signal,
@@ -341,7 +341,7 @@ class NodeWorkerSupervisor {
       void cancellation.catch(() => undefined);
     };
     signal?.addEventListener("abort", cancelClaimed, { once: true });
-    const startup = withNodeWorkerCheckoutPreparation(
+    const startup = dispatchNodeWorkerWithCheckoutPreparation(
       this.workspace,
       input,
       signal,

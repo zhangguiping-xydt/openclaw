@@ -286,7 +286,7 @@ export function buildNodeWorkerCheckoutTurn(
   );
 }
 
-export async function withNodeWorkerCheckoutPreparation(
+export async function dispatchNodeWorkerWithCheckoutPreparation(
   workspace: NodeWorkerWorkspaceRuntime,
   input: NodeWorkerLaunchInput,
   signal: AbortSignal,

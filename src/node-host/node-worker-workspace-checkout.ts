@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { ignoreMissingPath } from "../infra/errno.js";
 import { isPathInside } from "../infra/path-guards.js";
 import type { NodeWorkerWorkspaceExecInput } from "../worker/node-workspace-protocol.js";
 import type { NodeWorkerPreparedWorkspaceRow } from "./node-worker-prepared-workspace-store.js";
@@ -173,9 +174,7 @@ export function resolveNodeWorkerWorkspaceCommandPaths(
         throw new Error("INVALID_REQUEST: node worker workspace path escaped its owner root");
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw error;
-      }
+      ignoreMissingPath(error);
     }
   }
   return { sessionRoot, workspacePath, workspaceName, homeDir };
