@@ -1,9 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { isPathInside } from "../infra/path-guards.js";
+import type { NodeWorkerWorkspaceExecInput } from "../worker/node-workspace-protocol.js";
+import type { NodeWorkerPreparedWorkspaceRow } from "./node-worker-prepared-workspace-store.js";
 import type { NodeWorkerPreparedWorkspaceRuntime } from "./node-worker-prepared-workspace.js";
 import { serializeNodeWorkerWorkspace } from "./node-worker-transfer-client.js";
 import {
+  ensureContainedDirectory,
+  ensureNodeWorkerWorkspaceSessionRoot,
   hashNodeWorkerWorkspaceComponent as hashPathComponent,
   nodeWorkerWorkspaceGenerationKey as workspaceGenerationKey,
   resolveNodePreparedWorkspaceIdentity,
@@ -121,4 +125,58 @@ export async function withNodeWorkerCheckoutPreparation<T>(
   } finally {
     release();
   }
+}
+
+/** Resolves command paths under the caller's existing serialized workspace admission. */
+export function resolveNodeWorkerWorkspaceCommandPaths(
+  owner: {
+    root: string;
+    prepared: Pick<NodeWorkerPreparedWorkspaceRuntime, "resolveCommand">;
+    validateDeviceFolder: (folder: string) => string;
+  },
+  input: NodeWorkerWorkspaceExecInput,
+  registered: NodeWorkerPreparedWorkspaceRow | undefined,
+  prepared: NodeWorkerPreparedWorkspaceRow | undefined,
+  deviceFolder: string | undefined,
+) {
+  let sessionRoot: string;
+  let workspacePath: string;
+  if (prepared) {
+    workspacePath = owner.prepared.resolveCommand(input, prepared).workspaceDir;
+    sessionRoot = path.dirname(workspacePath);
+  } else {
+    if (registered) {
+      throw new Error("INVALID_REQUEST: prepared workspace registration disappeared");
+    }
+    sessionRoot = ensureNodeWorkerWorkspaceSessionRoot(
+      owner.root,
+      input.gatewayNamespace,
+      input.environmentId,
+      input.sessionId,
+    );
+    workspacePath = deviceFolder
+      ? owner.validateDeviceFolder(input.deviceFolder!)
+      : path.join(sessionRoot, String(input.generation));
+  }
+  const workspaceName = path.basename(workspacePath);
+  const homeDir = deviceFolder
+    ? ensureContainedDirectory(sessionRoot, String(input.generation))
+    : (prepared?.home_dir ?? sessionRoot);
+  if (prepared && (input.resetWorkspace !== undefined || input.seed)) {
+    throw new Error("INVALID_REQUEST: a consumed prepared workspace cannot be reset or reseeded");
+  }
+  if (input.transfer || input.resetWorkspace || input.seed) {
+    try {
+      const stats = fs.lstatSync(workspacePath);
+      const resolved = fs.realpathSync.native(workspacePath);
+      if (!stats.isDirectory() || !isPathInside(sessionRoot, resolved)) {
+        throw new Error("INVALID_REQUEST: node worker workspace path escaped its owner root");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+  return { sessionRoot, workspacePath, workspaceName, homeDir };
 }

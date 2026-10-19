@@ -323,13 +323,11 @@ it("retains an unknown legacy reservation when construction fails before scope a
   });
   const failure = new Error("synthetic ambiguous command construction failure");
   const scope = commandScopes.withCommandProcessScope;
-  vi.spyOn(commandScopes, "withCommandProcessScope").mockImplementation(
-    (run, signal, custody) => {
-      // Model the exact reserve-before-construction gap; no fake PID or native signal.
-      custody?.reserve(["synthetic-unacknowledged-legacy-command"]);
-      return scope(run, signal, custody);
-    },
-  );
+  vi.spyOn(commandScopes, "withCommandProcessScope").mockImplementation((run, signal, custody) => {
+    // Model the exact reserve-before-construction gap; no fake PID or native signal.
+    custody?.reserve(["synthetic-unacknowledged-legacy-command"]);
+    return scope(run, signal, custody);
+  });
   vi.spyOn(commandExec, "runCommandWithTimeout").mockRejectedValue(failure);
   try {
     await expect(

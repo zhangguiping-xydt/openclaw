@@ -455,7 +455,7 @@ describe("prepareWorkerGitHubEnvironment", () => {
     expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
 
     // The next turn sees a local head that already matches the remote one, so it returns early.
-    await prepareFenced();
+    await prepare();
 
     expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
     await expect(fs.readFile(path.join(cwd, collision, "remote.txt"), "utf8")).resolves.toBe(

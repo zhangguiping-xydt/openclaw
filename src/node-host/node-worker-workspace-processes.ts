@@ -170,9 +170,7 @@ export class NodeWorkerWorkspaceProcesses {
         }
       };
       const command: WorkspaceProcess = {
-        fingerprint: createHash("sha256")
-          .update(JSON.stringify([input.argv, input.input ?? null]))
-          .digest("hex"),
+        fingerprint: sha256Hex(JSON.stringify([input.argv, input.input ?? null])),
         stdout: "",
         stderr: "",
         settled: false,

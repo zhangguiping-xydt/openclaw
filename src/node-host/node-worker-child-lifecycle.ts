@@ -34,6 +34,7 @@ import {
 import { NodeWorkerProcessObservations } from "./node-worker-process-observation.js";
 import {
   buildNodeWorkerCheckoutTurn,
+  settleNodeWorkerTurnResult,
   acceptNodeWorkerCheckoutPrepared,
   type NodeWorkerChildAdmission,
   NODE_WORKER_STOP_GRACE_MS,
@@ -562,46 +563,7 @@ export class NodeWorkerChildLifecycle {
       if (active.stopState) {
         return;
       }
-      const turn = active.turn;
-      if (!turn || turn.claim.launchId !== frame.turnId || active.retiring) {
-        throw new Error("node worker returned a result outside its active turn");
-      }
-      if (turn.checkoutPreparation && frame.retainWorker) {
-        throw new Error("worker retained execution before checkout preparation settled");
-      }
-      // Publish this operation before finish can invoke a reentrant cancellation.
-      const settling = Promise.resolve()
-        .then(async () => {
-          const receipt = await this.options.turns.finish({
-            expected: turn.claim,
-            ownerLaunchId: active.launchId,
-            supervisor: active.supervisor,
-            worker: active.worker,
-            ...(turn.cancelled
-              ? ({
-                  state: "cancelled",
-                  errorText: active.connectionFailure.errorText ?? "node worker turn cancelled",
-                } as const)
-              : ({ state: "completed", resultJson: JSON.stringify(frame.result) } as const)),
-          });
-          if (!receipt || receipt.state === "pending" || receipt.state === "running") {
-            throw new Error("node worker turn completion lost its physical owner");
-          }
-          // An early failed/fenced result keeps pending preparation on this exact
-          // turn until the physical child retires; logical result is not an unlock.
-          if (!turn.checkoutPreparation) {
-            active.turn = undefined;
-          }
-          active.retiring = !frame.retainWorker;
-          turn.settle();
-        })
-        .finally(() => {
-          if (turn.settling === settling) {
-            turn.settling = undefined;
-          }
-        });
-      turn.settling = settling;
-      await settling;
+      await settleNodeWorkerTurnResult(active, frame, this.options.turns);
     } else if (active.turn || active.retention?.turnId !== frame.turnId) {
       return;
     }

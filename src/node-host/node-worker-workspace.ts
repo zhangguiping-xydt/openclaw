@@ -34,6 +34,7 @@ import {
 import { createNodeWorkerTempWorkspace } from "./node-worker-workspace-admission.js";
 import {
   ordinaryWorkspacePaths,
+  resolveNodeWorkerWorkspaceCommandPaths,
   withNodeWorkerCheckoutPreparation,
 } from "./node-worker-workspace-checkout.js";
 import {
@@ -590,47 +591,18 @@ export class NodeWorkerWorkspaceRuntime {
             "drained\n",
           );
         }
-        let sessionRoot: string;
-        let workspacePath: string;
-        if (prepared) {
-          workspacePath = this.prepared.resolveCommand(input, prepared).workspaceDir;
-          sessionRoot = path.dirname(workspacePath);
-        } else {
-          if (registered) {
-            throw new Error("INVALID_REQUEST: prepared workspace registration disappeared");
-          }
-          sessionRoot = ensureNodeWorkerWorkspaceSessionRoot(
-            this.root,
-            input.gatewayNamespace,
-            input.environmentId,
-            input.sessionId,
+        const { sessionRoot, workspacePath, workspaceName, homeDir } =
+          resolveNodeWorkerWorkspaceCommandPaths(
+            {
+              root: this.root,
+              prepared: this.prepared,
+              validateDeviceFolder: (folder) => this.validateDeviceFolder(folder),
+            },
+            input,
+            registered,
+            prepared,
+            deviceFolder,
           );
-          workspacePath = deviceFolder
-            ? this.validateDeviceFolder(input.deviceFolder!)
-            : path.join(sessionRoot, String(input.generation));
-        }
-        const workspaceName = path.basename(workspacePath);
-        const homeDir = deviceFolder
-          ? ensureContainedDirectory(sessionRoot, String(input.generation))
-          : (prepared?.home_dir ?? sessionRoot);
-        if (prepared && (input.resetWorkspace !== undefined || input.seed)) {
-          throw new Error(
-            "INVALID_REQUEST: a consumed prepared workspace cannot be reset or reseeded",
-          );
-        }
-        if (input.transfer || input.resetWorkspace || input.seed) {
-          try {
-            const stats = fs.lstatSync(workspacePath);
-            const resolved = fs.realpathSync.native(workspacePath);
-            if (!stats.isDirectory() || !isPathInside(sessionRoot, resolved)) {
-              throw new Error("INVALID_REQUEST: node worker workspace path escaped its owner root");
-            }
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-              throw error;
-            }
-          }
-        }
         if (input.seed) {
           if (input.seed.action === "apply") {
             await removeNodeWorkerWorkspaceEntry(this.root, workspacePath, "directory");

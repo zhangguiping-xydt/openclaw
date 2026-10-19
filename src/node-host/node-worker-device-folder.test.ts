@@ -118,10 +118,10 @@ it("defers checkout writes while preserving the acquired device-folder identity"
     throw new Error("bound device-folder acquisition has no identity assertion");
   }
   try {
-    const mode = await runtime.withCheckoutPreparation(request(), async (mode) => {
+    const mode = await runtime.withCheckoutPreparation(request(), async (preparationMode) => {
       acquired.assertCurrent?.();
       expect(fs.readFileSync(path.join(folder, "user.txt"), "utf8")).toBe("original");
-      return mode;
+      return preparationMode;
     });
     expect(mode).toBe("deferred");
     fs.renameSync(folder, `${folder}-original`);
