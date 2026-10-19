@@ -2149,7 +2149,6 @@ src/node-host/mcp.ts	1
 src/node-host/node-worker-transfer-client.ts	1
 src/node-host/node-worker-transfer-http.ts	1
 src/node-host/node-worker-tree-control.ts	2
-src/node-host/node-worker-workspace.ts	1
 src/node-host/plugin-node-host.ts	1
 src/node-host/skills.ts	1
 src/node-host/worker-support.ts	4
