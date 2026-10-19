@@ -100,13 +100,36 @@ const writeArtifact = (descriptor, name, value) => fs.writeFileSync(
   path.join(descriptor.assignment.workspaceDir, descriptor.assignment.turnId + "." + name + ".json"),
   JSON.stringify(value),
 );
-const runTurn = async (descriptor) => {
+const runTurn = async (descriptor, checkoutPreparation) => {
 const startedPath = path.join(descriptor.assignment.workspaceDir, descriptor.assignment.turnId + ".started.json");
 const starts = fs.existsSync(startedPath) ? JSON.parse(fs.readFileSync(startedPath, "utf8")).starts + 1 : 1;
 writeArtifact(descriptor, "started", { pid: process.pid, starts });
 const mode = descriptor.assignment.prompt;
 const credential = descriptor.admission.credential;
-if (mode === "admission-rearm") {
+if (mode === "checkout-await-release") {
+  if (checkoutPreparation !== "admitted") throw new Error("checkout was not admitted");
+  const releasePath = path.join(descriptor.assignment.workspaceDir, "checkout-release");
+  await new Promise((resolve) => {
+    const released = () => {
+      if (!fs.existsSync(releasePath)) return;
+      watcher.close();
+      resolve();
+    };
+    const watcher = fs.watch(descriptor.assignment.workspaceDir, released);
+    writeArtifact(descriptor, "checkout", { checkoutPreparation });
+    released();
+  });
+  fs.writeSync(1, JSON.stringify({ type: "checkout-prepared", turnId: descriptor.assignment.turnId }) + "\n");
+  finish(descriptor);
+} else if (mode === "checkout-failed-before-ack") {
+  if (checkoutPreparation !== "admitted") throw new Error("checkout was not admitted");
+  writeArtifact(descriptor, "checkout", { checkoutPreparation });
+  finish(descriptor, { status: "failed", reason: "turn-failed", transcriptLeafId: null, transcriptNextSeq: 1 }, false);
+} else if (mode === "checkout-wrong-ack") {
+  if (checkoutPreparation !== "admitted") throw new Error("checkout was not admitted");
+  fs.writeSync(1, JSON.stringify({ type: "checkout-prepared", turnId: descriptor.assignment.turnId + "-other" }) + "\n");
+  setInterval(() => {}, 1000);
+} else if (mode === "admission-rearm") {
   const marker = path.join(descriptor.assignment.workspaceDir, "admission-attempt");
   const first = !fs.existsSync(marker);
   fs.writeFileSync(marker, descriptor.assignment.turnId);
@@ -222,7 +245,11 @@ lines.on("line", (line) => {
     exitWorker(25);
   }
   currentTurn = request.descriptor;
-  void runTurn(currentTurn).catch((error) => {
+  if (request.checkoutPreparation === "admitted" &&
+      !currentTurn.assignment.prompt.startsWith("checkout-")) {
+    fs.writeSync(1, JSON.stringify({ type: "checkout-prepared", turnId: request.turnId }) + "\n");
+  }
+  void runTurn(currentTurn, request.checkoutPreparation).catch((error) => {
     process.stderr.write(error.message + "\n");
     hardTerminate();
   });

@@ -46,6 +46,18 @@ describe("worker process protocol", () => {
     ).toBeNull();
   });
 
+  it("accepts only exact checkout completion for a bounded turn identity", () => {
+    const ready = { type: "checkout-prepared", turnId: "turn-1" };
+    expect(parseWorkerProcessMessage(ready)).toEqual(ready);
+    expect(parseWorkerProcessMessage({ ...ready, prepared: true })).toBeNull();
+    expect(parseWorkerProcessMessage({ ...ready, turnId: "" })).toBeNull();
+    expect(
+      parseWorkerProcessMessage(
+        inheritedRecord({ type: "checkout-prepared" }, { turnId: "turn-1" }),
+      ),
+    ).toBeNull();
+  });
+
   it("rejects request discriminators inherited alongside the wrong own keys", () => {
     const request = inheritedRecord({ type: "cancel" }, { turnId: "turn-1", unexpected: true });
 

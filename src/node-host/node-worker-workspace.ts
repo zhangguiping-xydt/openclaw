@@ -33,6 +33,10 @@ import {
 } from "./node-worker-transfer-client.js";
 import { createNodeWorkerTempWorkspace } from "./node-worker-workspace-admission.js";
 import {
+  ordinaryWorkspacePaths,
+  withNodeWorkerCheckoutPreparation,
+} from "./node-worker-workspace-checkout.js";
+import {
   nodeWorkspaceManifestCapture,
   projectWorkspaceOperationResult,
   runNodeWorkspaceManifestCapture,
@@ -45,7 +49,6 @@ import {
   type NodeWorkerWorkspaceRetainSnapshot,
   ensureContainedDirectory,
   ensureNodeWorkerWorkspaceSessionRoot,
-  hashNodeWorkerWorkspaceComponent as hashPathComponent,
   nodeWorkerWorkspaceGenerationKey as workspaceGenerationKey,
   nodeWorkerWorkspaceLaunchGenerationKey as launchGenerationKey,
   nodeWorkerWorkspaceSessionKey as workspaceSessionKey,
@@ -231,6 +234,36 @@ export class NodeWorkerWorkspaceRuntime {
       ...(prepared ? { homeDir: prepared.home_dir } : {}),
       release: finishOperation,
     };
+  }
+
+  /** The existing workspace queue owns this short interval, not the model turn. */
+  async withCheckoutPreparation<T>(
+    request: Omit<NodeWorkerManagedWorkspaceRequest, "sessionKey"> & {
+      gatewayNamespace: string;
+      sessionKey?: string;
+    },
+    operation: (mode: "admitted" | "deferred") => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (this.isDeviceFolder(request.workspaceDir)) {
+      signal?.throwIfAborted();
+      this.processes.captureAdmission(request, request.ownerEpoch)();
+      // The existing launch acquisition retains folder consent and assertCurrent.
+      // External folders never admit automatic checkout metadata or fast-forward writes.
+      return await operation("deferred");
+    }
+    return await withNodeWorkerCheckoutPreparation(
+      {
+        root: this.root,
+        prepared: this.prepared,
+        processes: this.processes,
+        deletingWorkspaceGenerations: this.deletingWorkspaceGenerations,
+        beginWorkspaceOperation: this.beginWorkspaceOperation.bind(this),
+      },
+      request,
+      operation,
+      signal,
+    );
   }
 
   private beginWorkspaceOperation(gatewayNamespace: string, generationKey: string): () => void {
@@ -521,20 +554,14 @@ export class NodeWorkerWorkspaceRuntime {
       return projectWorkspaceOperationResult(deviceFolder!, "validated\n");
     }
     const assertProcessCurrent = this.processes.captureAdmission(input, input.generation);
-    const environmentHash = hashPathComponent(input.environmentId, 16);
-    const sessionHash = hashPathComponent(input.sessionId, 32);
+    const ordinary = ordinaryWorkspacePaths(this.root, input);
+    const { generationKey } = ordinary;
     const registered = deviceFolder
       ? undefined
       : await this.prepared.store?.find(input.environmentId);
     const sessionRootCandidate = registered
       ? path.dirname(registered.workspace_dir)
-      : path.join(this.root, input.gatewayNamespace, "workspaces", environmentHash, sessionHash);
-    const generationKey = workspaceGenerationKey({
-      gatewayNamespace: input.gatewayNamespace,
-      environmentHash,
-      sessionHash,
-      generation: input.generation,
-    });
+      : ordinary.sessionRoot;
     if (this.deletingWorkspaceGenerations.has(generationKey)) {
       throw new Error("INVALID_REQUEST: node placement workspace is being removed");
     }

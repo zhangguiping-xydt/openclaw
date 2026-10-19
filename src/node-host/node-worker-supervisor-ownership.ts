@@ -1,11 +1,26 @@
+import {
+  NODE_WORKER_CHECKOUT_PREPARATION_PROTOCOL_FEATURE,
+  NODE_WORKER_IDLE_RETENTION_PROTOCOL_FEATURE,
+} from "../../packages/gateway-protocol/src/schema/worker-admission.js";
 import type { NodeWorkerCapacitySnapshot } from "../infra/node-runner-inventory.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import { createDeferredCore } from "../shared/deferred.js";
+import type { WorkerLaunchDescriptor } from "../worker/launch-descriptor.js";
+import {
+  nodeWorkerPlanHash,
+  validateNodeWorkerLaunchInput,
+} from "../worker/node-supervisor-protocol.js";
 import type {
   NodeWorkerEnvironmentStopInput,
   NodeWorkerLaunchInput,
   NodeWorkerSupervisorIdentity,
 } from "../worker/node-supervisor-protocol.js";
 import type { NodeWorkerProcessesChanged } from "../worker/worker-process-observation.js";
+import {
+  parseWorkerConnectionEndpoint,
+  type WorkerConnectionEndpoint,
+} from "../worker/worker-connection-endpoint.js";
+import { buildWorkerProcessTurn } from "../worker/worker-process-protocol.js";
 import type { NodeWorkerCapacity } from "./node-worker-capacity.js";
 import type { NodeWorkerContainerEngine } from "./node-worker-container-engine.js";
 import type { NodeWorkerContainerLifecycle } from "./node-worker-container-lifecycle.js";
@@ -82,17 +97,38 @@ export function nodeWorkerEnvironmentMatches(
   );
 }
 
+export type NodeWorkerCheckoutPreparation = {
+  done: Promise<void>;
+  dispatched: boolean;
+  settle: () => void;
+};
+
+export function createNodeWorkerCheckoutPreparation(): NodeWorkerCheckoutPreparation {
+  const { promise, resolve } = createDeferredCore();
+  return { done: promise, dispatched: false, settle: resolve };
+}
+
 type NodeWorkerActiveTurn = {
   claim: NodeWorkerLaunchClaim;
   done: Promise<void>;
   settle: () => void;
   cancelled: boolean;
   settling?: Promise<void>;
+  checkoutPreparation?: NodeWorkerCheckoutPreparation;
 };
 
-export function createNodeWorkerActiveTurn(claim: NodeWorkerLaunchClaim): NodeWorkerActiveTurn {
+export function createNodeWorkerActiveTurn(
+  claim: NodeWorkerLaunchClaim,
+  checkoutPreparation?: NodeWorkerCheckoutPreparation,
+): NodeWorkerActiveTurn {
   const { promise, resolve } = createDeferredCore();
-  return { claim, done: promise, settle: resolve, cancelled: false };
+  return {
+    claim,
+    done: promise,
+    settle: resolve,
+    cancelled: false,
+    ...(checkoutPreparation ? { checkoutPreparation } : {}),
+  };
 }
 
 type NodeWorkerActiveBase = {
@@ -196,6 +232,8 @@ export function nodeWorkerReceiptMatchesOwner(
   );
 }
 
+const checkoutLog = createSubsystemLogger("node-host/worker");
+
 export type NodeWorkerChildLifecycleOptions = {
   onProcessesChanged?: NodeWorkerSupervisorOptions["onProcessesChanged"];
   bundleRoot: string;
@@ -215,3 +253,156 @@ export type NodeWorkerChildLifecycleOptions = {
   ) => Promise<NodeWorkerLaunchReceipt | undefined>;
   recoverRunning: NodeWorkerLaunchRecovery;
 };
+
+/** Synchronous: the exact child owner still sends and accepts the acknowledgement. */
+export function buildNodeWorkerCheckoutTurn(
+  descriptor: WorkerLaunchDescriptor,
+  idleRetention: boolean | undefined,
+  checkoutMode?: "admitted" | "deferred",
+  checkoutPreparation?: NodeWorkerCheckoutPreparation,
+  canonicalWorkspace = false,
+  processChanges = false,
+) {
+  if (
+    checkoutMode &&
+    !descriptor.admission.handshake.protocolFeatures.includes(
+      NODE_WORKER_CHECKOUT_PREPARATION_PROTOCOL_FEATURE,
+    )
+  ) {
+    throw new Error("worker bundle does not support owned checkout preparation");
+  }
+  if (checkoutPreparation) {
+    checkoutPreparation.dispatched = true;
+  }
+  return buildWorkerProcessTurn(
+    descriptor,
+    idleRetention,
+    canonicalWorkspace,
+    processChanges,
+    checkoutMode,
+  );
+}
+
+export async function withNodeWorkerCheckoutPreparation(
+  workspace: NodeWorkerWorkspaceRuntime,
+  input: NodeWorkerLaunchInput,
+  signal: AbortSignal,
+  dispatch: (
+    mode?: "admitted" | "deferred",
+    preparation?: NodeWorkerCheckoutPreparation,
+  ) => Promise<NodeWorkerLaunchReceipt>,
+): Promise<NodeWorkerLaunchReceipt> {
+  if (!input.descriptor.assignment.github) {
+    return dispatch();
+  }
+  const receipt = createDeferredCore<NodeWorkerLaunchReceipt>();
+  const operation = workspace.withCheckoutPreparation(
+    { ...nodeWorkerEnvironmentBinding(input), sessionKey: input.sessionKey },
+    async (mode) => {
+      const preparation = mode === "admitted" ? createNodeWorkerCheckoutPreparation() : undefined;
+      try {
+        const result = await dispatch(mode, preparation);
+        receipt.resolve(result);
+        return result;
+      } catch (error) {
+        receipt.reject(error);
+        throw error;
+      } finally {
+        if (preparation) {
+          // No descriptor bytes means no mutator. Otherwise the exact active turn
+          // retains this queue operation until ACK or confirmed tree retirement.
+          if (!preparation.dispatched) {
+            preparation.settle();
+          }
+          await preparation.done;
+        }
+      }
+    },
+    signal,
+  );
+  void operation.catch((error: unknown) => {
+    receipt.reject(error);
+    checkoutLog.warn(`Owned checkout preparation failed: ${String(error).slice(0, 2_048)}`);
+  });
+  return receipt.promise;
+}
+
+export function prepareNodeWorkerLaunch(
+  rawInput: NodeWorkerLaunchInput,
+  connectionEndpoint: WorkerConnectionEndpoint,
+) {
+  const input = validateNodeWorkerLaunchInput(structuredClone(rawInput));
+  if (
+    input.descriptor.assignment.github &&
+    !input.descriptor.admission.handshake.protocolFeatures.includes(
+      NODE_WORKER_CHECKOUT_PREPARATION_PROTOCOL_FEATURE,
+    )
+  ) {
+    throw new Error(
+      "Worker bundle does not support owned checkout preparation; refresh the worker runtime",
+    );
+  }
+  const parsedEndpoint = parseWorkerConnectionEndpoint(connectionEndpoint);
+  if (!parsedEndpoint) {
+    throw new Error("invalid worker launch descriptor");
+  }
+  const descriptor = { ...input.descriptor, connectionEndpoint: parsedEndpoint };
+  const claimInput: NodeWorkerLaunchClaim = {
+    launchId: input.launchId,
+    planHash: nodeWorkerPlanHash(input),
+    gatewayNamespace: input.gatewayNamespace,
+    environmentId: descriptor.admission.environmentId,
+    sessionId: descriptor.admission.sessionId,
+    ownerEpoch: descriptor.admission.ownerEpoch,
+    placementGeneration: input.placementGeneration,
+    runId: descriptor.assignment.runId,
+  };
+  return { input, descriptor, claimInput };
+}
+
+export type NodeWorkerChildAdmission = {
+  workerEnv: NodeJS.ProcessEnv;
+  homeDir?: string;
+  input: NodeWorkerLaunchInput;
+  descriptor: WorkerLaunchDescriptor;
+  supervisor: NodeWorkerProcessIdentity;
+  claim: NodeWorkerLaunchClaim;
+  signal?: AbortSignal;
+  idleRetention?: boolean;
+  checkoutMode?: "admitted" | "deferred";
+  checkoutPreparation?: NodeWorkerCheckoutPreparation;
+  assertWorkspaceCurrent?: () => void;
+};
+
+export function createNodeWorkerAdmissionScope(input: NodeWorkerLaunchInput, signal?: AbortSignal) {
+  const abort = new AbortController();
+  const idleRetention =
+    input.idleRetention &&
+    input.descriptor.admission.handshake.protocolFeatures.includes(
+      NODE_WORKER_IDLE_RETENTION_PROTOCOL_FEATURE,
+    );
+  const admissionSignal = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal;
+  return { abort, idleRetention, admissionSignal };
+}
+
+export function acceptNodeWorkerCheckoutPrepared(
+  active: NodeWorkerRunningChild,
+  turnId: string,
+  isCurrentOwner: boolean,
+): void {
+  const turn = active.turn;
+  const preparation = turn?.checkoutPreparation;
+  if (
+    !turn ||
+    turn.claim.launchId !== turnId ||
+    !preparation ||
+    !preparation.dispatched ||
+    active.retiring ||
+    active.stopState ||
+    !isCurrentOwner
+  ) {
+    throw new Error("worker returned checkout preparation outside its exact turn");
+  }
+  delete turn.checkoutPreparation;
+  preparation.settle();
+}

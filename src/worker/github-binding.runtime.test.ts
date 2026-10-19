@@ -3,6 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  addSession,
+  deleteSession,
+  markExited,
+  settleExecSessionFinalization,
+} from "../agents/bash-process-registry.js";
+import { createProcessSessionFixture } from "../agents/bash-process-registry.test-helpers.js";
 import { resolvePreparedExecEnvironment } from "../agents/bash-tools.exec-request-preparation.js";
 import * as exec from "../process/exec.js";
 import {
@@ -88,6 +95,8 @@ describe("prepareWorkerGitHubEnvironment", () => {
     prepareWorkerGitHubEnvironment({
       binding,
       stateDir: path.join(root, "state"),
+      execScopeKey: "worker:checkout-fixture",
+      checkoutPreparation: "admitted",
       turnId: "turn",
       cwd,
     });
@@ -430,6 +439,8 @@ describe("prepareWorkerGitHubEnvironment", () => {
       prepareWorkerGitHubEnvironment({
         binding,
         stateDir: path.join(root, "state"),
+        execScopeKey: "worker:checkout-fixture",
+        checkoutPreparation: "admitted",
         turnId: "turn",
         cwd,
         signal: controller.signal,
@@ -507,6 +518,194 @@ describe("prepareWorkerGitHubEnvironment", () => {
     );
   });
 
+  it.each([false, true])(
+    "defers a retained writer's fast-forward through finalization (late local write: %s)",
+    async (lateWrite) => {
+      const collision = "collision";
+      await fs.mkdir(path.join(cwd, collision));
+      await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+      initialHead = await commit(cwd, "Track collision directory");
+      await git(cwd, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+      const seed = path.join(root, "earlier-worker");
+      await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+      await fs.rm(path.join(seed, collision), { recursive: true });
+      await fs.writeFile(path.join(seed, collision), "remote file\n");
+      const remoteHead = await commit(seed, "Earlier turn");
+      await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+      const session = createProcessSessionFixture({
+        id: "retained-checkout",
+        cwd,
+        backgrounded: true,
+      });
+      session.scopeKey = "worker:checkout-fixture";
+      addSession(session);
+      const runner = vi.spyOn(exec, "runCommandWithTimeout");
+      try {
+        if (lateWrite) {
+          await fs.writeFile(path.join(cwd, collision, "late.txt"), "unpublished writer bytes\n");
+        }
+        await prepare();
+        expect(runner).not.toHaveBeenCalled();
+        expect(warn).toHaveBeenLastCalledWith(expect.stringContaining("retained commands"));
+
+        // Clearing process-tool presentation must not release native writer custody.
+        deleteSession(session.id);
+        session.backgrounded = false;
+        await prepare();
+        expect(runner).not.toHaveBeenCalled();
+        session.finalizing = true;
+        markExited(session, 0, null, "completed");
+        await prepare();
+        expect(runner).not.toHaveBeenCalled();
+
+        settleExecSessionFinalization(session);
+        await prepare();
+        expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(
+          lateWrite ? initialHead : remoteHead,
+        );
+        if (lateWrite) {
+          await expect(fs.readFile(path.join(cwd, collision, "late.txt"), "utf8")).resolves.toBe(
+            "unpublished writer bytes\n",
+          );
+          await expect(fs.readFile(path.join(cwd, collision, "base.txt"), "utf8")).resolves.toBe(
+            "base file\n",
+          );
+        } else {
+          await expect(fs.readFile(path.join(cwd, collision), "utf8")).resolves.toBe(
+            "remote file\n",
+          );
+          expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+        }
+      } finally {
+        settleExecSessionFinalization(session);
+        deleteSession(session.id);
+      }
+    },
+  );
+
+  it("rejects a turn fenced after its final classification command settles", async () => {
+    const collision = "collision";
+    await fs.mkdir(path.join(cwd, collision));
+    await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+    initialHead = await commit(cwd, "Track collision directory");
+    await git(cwd, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+    const seed = path.join(root, "earlier-worker");
+    await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+    await fs.rm(path.join(seed, collision), { recursive: true });
+    await fs.writeFile(path.join(seed, collision), "remote file\n");
+    await commit(seed, "Earlier turn");
+    await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+    const indexBefore = await git(cwd, "ls-files", "--stage", "-z");
+    const controller = new AbortController();
+    const runCommand = exec.runCommandWithTimeout;
+    let finalClassificationObserved = false;
+    const runner = vi
+      .spyOn(exec, "runCommandWithTimeout")
+      .mockImplementation(async (argv, options) => {
+        const result = await runCommand(argv, options);
+        if (argv.includes("--deleted")) {
+          finalClassificationObserved = true;
+          controller.abort(new Error("worker fenced: owner-epoch-mismatch"));
+        }
+        return result;
+      });
+    await prepareWorkerGitHubEnvironment({
+      binding,
+      stateDir: path.join(root, "state"),
+      execScopeKey: "worker:checkout-fixture",
+      checkoutPreparation: "admitted",
+      turnId: "turn",
+      cwd,
+      signal: controller.signal,
+    });
+    expect(finalClassificationObserved).toBe(true);
+    expect(runner.mock.calls.some(([argv]) => argv.includes("reset"))).toBe(false);
+    expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(await git(cwd, "ls-files", "--stage", "-z")).toBe(indexBefore);
+    await expect(fs.readFile(path.join(cwd, collision, "base.txt"), "utf8")).resolves.toBe(
+      "base file\n",
+    );
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("keeps credentials while an unadmitted managed checkout defers all Git", async () => {
+    await publishEarlierTurn();
+    const runner = vi.spyOn(exec, "runCommandWithTimeout");
+    const prepared = await prepareWorkerGitHubEnvironment({
+      binding,
+      stateDir: path.join(root, "state"),
+      turnId: "deferred-turn",
+      cwd,
+      execScopeKey: "worker:checkout-fixture",
+      checkoutPreparation: "deferred",
+    });
+    expect(prepared?.managedLocalIdentity).toBe(true);
+    expect(runner).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("fast-forward deferred"));
+  });
+
+  it.each(["empty-directory", ...(process.platform === "win32" ? [] : ["named-pipe"])])(
+    "preserves Git-invisible %s under an otherwise clean tracked collision",
+    async (kind) => {
+      const collision = "collision";
+      await fs.mkdir(path.join(cwd, collision));
+      await fs.writeFile(path.join(cwd, collision, "base.txt"), "base file\n");
+      initialHead = await commit(cwd, "Track collision directory");
+      await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+      const seed = path.join(root, "earlier-worker");
+      await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+      await fs.rm(path.join(seed, collision), { recursive: true });
+      await fs.writeFile(path.join(seed, collision), "remote file\n");
+      await commit(seed, "Earlier turn");
+      await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+      const unpublished = path.join(cwd, collision, "unpublished");
+      if (kind === "empty-directory") {
+        await fs.mkdir(unpublished);
+      } else {
+        await exec.runExec("mkfifo", [unpublished], { timeoutMs: 10_000, logOutput: false });
+      }
+      await prepare();
+      expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+      const stat = await fs.lstat(unpublished);
+      expect(kind === "empty-directory" ? stat.isDirectory() : stat.isFIFO()).toBe(true);
+      expect(await fs.readFile(path.join(cwd, collision, "base.txt"), "utf8")).toBe("base file\n");
+    },
+  );
+
+  it.each(["file-to-directory", "directory-to-file"] as const)(
+    "uses the actual literal disk spelling for a clean case alias %s",
+    async (kind) => {
+      const oldPath = "Shape";
+      if (kind === "directory-to-file") {
+        await fs.mkdir(path.join(cwd, oldPath));
+        await fs.writeFile(path.join(cwd, oldPath, "base.txt"), "base file\n");
+      } else {
+        await fs.writeFile(path.join(cwd, oldPath), "base file\n");
+      }
+      initialHead = await commit(cwd, "Track original spelling");
+      await git(cwd, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+      const seed = path.join(root, "earlier-worker");
+      await git(root, "clone", "--quiet", "--branch", "main", origin, seed);
+      await fs.rm(path.join(seed, oldPath), { recursive: true });
+      const incoming = kind === "directory-to-file" ? "shape" : "shape/remote.txt";
+      if (kind === "file-to-directory") {
+        await fs.mkdir(path.join(seed, "shape"));
+      }
+      await fs.writeFile(path.join(seed, incoming), "remote file\n");
+      const remote = await commit(seed, "Earlier turn");
+      await git(seed, "push", "--quiet", "origin", `HEAD:refs/heads/${binding.branch}`);
+      const lstat = fs.lstat;
+      vi.spyOn(fs, "lstat").mockImplementation((...args) =>
+        lstat(args[0] === path.join(cwd, "shape") ? path.join(cwd, oldPath) : args[0], args[1]),
+      );
+      isPathCaseInsensitive.mockReturnValueOnce(true);
+      await prepare();
+      expect((await git(cwd, "rev-parse", "HEAD")).trim()).toBe(remote);
+      expect(await fs.readFile(path.join(cwd, incoming), "utf8")).toBe("remote file\n");
+      expect(await git(cwd, "status", "--porcelain", "-z")).toBe("");
+    },
+  );
+
   it("leaves diverged local history and files untouched with one warning", async () => {
     const remoteHead = await publishEarlierTurn();
     await fs.writeFile(path.join(cwd, "local.txt"), "local commit\n");
@@ -533,6 +732,8 @@ describe("prepareWorkerGitHubEnvironment", () => {
       prepareWorkerGitHubEnvironment({
         binding,
         stateDir: path.join(root, "state"),
+        execScopeKey: "worker:checkout-fixture",
+        checkoutPreparation: "admitted",
         turnId: "turn",
         cwd,
         signal: controller.signal,
@@ -561,6 +762,8 @@ describe("prepareWorkerGitHubEnvironment", () => {
     await prepareWorkerGitHubEnvironment({
       binding,
       stateDir: path.join(root, "state"),
+      execScopeKey: "worker:checkout-fixture",
+      checkoutPreparation: "admitted",
       turnId: "turn",
       cwd,
       signal: controller.signal,
@@ -600,6 +803,8 @@ describe("prepareWorkerGitHubEnvironment", () => {
     await prepareWorkerGitHubEnvironment({
       binding: withoutRemote,
       stateDir: path.join(root, "state"),
+      execScopeKey: "worker:checkout-fixture",
+      checkoutPreparation: "admitted",
       turnId: "turn",
       cwd,
     });
@@ -650,9 +855,13 @@ describe("prepareWorkerGitHubEnvironment", () => {
       GIT_AUTHOR_NAME: binding.gitAuthor.name,
       GIT_AUTHOR_EMAIL: binding.gitAuthor.email,
     });
-    const fetchCall = runner.mock.calls.find(([args]) => args[3] === "fetch");
+    const fetchCall = runner.mock.calls.find(([args]) => args.includes("fetch"));
     expect(fetchCall?.[0]).toEqual([
       "git",
+      "-c",
+      "maintenance.autoDetach=false",
+      "-c",
+      "gc.autoDetach=false",
       "-C",
       cwd,
       "fetch",
@@ -665,6 +874,8 @@ describe("prepareWorkerGitHubEnvironment", () => {
       throw new Error("Expected options for Git fetch");
     }
     expect(options.timeoutMs).toBe(60_000);
+    expect(options.killProcessTree).toBe(true);
+    expect(options.requireProcessTreeExtinction).toBe(true);
     // Project only fixture-owned keys so a failed assertion cannot dump the host environment.
     const expectedEnv = {
       ...prepared?.localIdentityEnv,
@@ -708,6 +919,8 @@ describe("prepareWorkerGitHubEnvironment", () => {
     const prepared = await prepareWorkerGitHubEnvironment({
       binding,
       stateDir: path.join(root, "state"),
+      execScopeKey: "worker:checkout-fixture",
+      checkoutPreparation: "admitted",
       turnId: "renewed",
       cwd,
       signal: controller.signal,
@@ -730,6 +943,8 @@ describe("prepareWorkerGitHubEnvironment", () => {
     const current = await prepareWorkerGitHubEnvironment({
       binding,
       stateDir: path.join(root, "state"),
+      execScopeKey: "worker:checkout-fixture",
+      checkoutPreparation: "admitted",
       turnId: "next-turn",
       cwd,
     });

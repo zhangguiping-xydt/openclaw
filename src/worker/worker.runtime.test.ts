@@ -1700,7 +1700,10 @@ it.skipIf(process.platform === "win32")(
       await writeFile(path.join(workspaceDir, ".git", "shallow"), `${baseCommit}\n`);
 
       await expect(
-        runWorkerDescriptor(launch, { environmentStateDir: environment.stateDir }),
+        runWorkerDescriptor(launch, {
+          environmentStateDir: environment.stateDir,
+          checkoutPreparation: "standalone",
+        }),
       ).resolves.toMatchObject({ status: "completed" });
 
       const toolResult = gateway.inferenceRequests[1]?.context.messages

@@ -8,6 +8,12 @@ import {
 } from "../../test/helpers/fixture-receipts.js";
 import { awaitGateBeforeSettlement, withinTest } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import * as commandScopes from "../process/exec-spawn.js";
+import * as commandExec from "../process/exec.js";
+import { BrokerChild } from "../process/spawn-broker/child.js";
+import { runWithSpawnBroker } from "../process/spawn-broker/context.js";
+import { createSpawnBrokerHost } from "../process/spawn-broker/host.js";
+import { supportsSpawnBrokerCommandTransport } from "../process/spawn-broker/pipe.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import {
   NODE_WORKSPACE_DRAIN_COMMAND,
@@ -15,6 +21,7 @@ import {
   type NodeWorkerWorkspaceExecInput,
 } from "../worker/node-workspace-protocol.js";
 import { NodeWorkerPreparedWorkspaceStore } from "./node-worker-prepared-workspace-store.js";
+import * as workspaceTransfer from "./node-worker-transfer-client.js";
 import { NodeWorkerWorkspaceRuntime } from "./node-worker-workspace.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -134,8 +141,303 @@ function fixture(ephemeral = false) {
       },
       async () => [],
     );
-  return { root, workspace, start, control, launch, stop, collect, rejectRetired };
+  return { root, workspace, start, control, ready, launch, stop, collect, rejectRetired };
 }
+
+it.skipIf(!supportsSpawnBrokerCommandTransport())(
+  "keeps a real legacy command and its preparation queue owned through delayed broker readiness",
+  async ({ signal }) => {
+    const { root, workspace } = fixture();
+    const seeded = await workspace.exec({
+      ...identity,
+      nativeProcessOwner: true,
+      argv: [runtimeExecutableName, "-e", "process.exit(0)"],
+    });
+    const readiness = createDeferredCore();
+    const bounded =
+      createDeferredCore<Awaited<ReturnType<typeof commandExec.runCommandWithTimeout>>>();
+    const queued = createDeferredCore();
+    const controller = new AbortController();
+    const host = createSpawnBrokerHost();
+    await host.ready();
+    const ready = Object.getOwnPropertyDescriptor(BrokerChild.prototype, "ready")?.value as
+      | BrokerChild["ready"]
+      | undefined;
+    if (typeof ready !== "function") {
+      throw new Error("Expected the native broker readiness method");
+    }
+    vi.spyOn(BrokerChild.prototype, "ready").mockImplementation(function (this: BrokerChild) {
+      // Delay only receipt delivery. The broker starts a real Node command below.
+      return ready.call(this).then(() => readiness.promise);
+    });
+    const run = commandExec.runCommandWithTimeout;
+    vi.spyOn(commandExec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      const result = await run(argv, options);
+      if (argv.some((arg) => arg.includes("legacy-real-writer"))) {
+        bounded.resolve(result);
+      }
+      return result;
+    });
+    const script = `
+      import fs from "node:fs";
+      import http from "node:http";
+      ${fixtureReceiptClientSource(receipts.endpoint)}
+      const source = ${JSON.stringify(root)};
+      const server = http.createServer((_request, response) => {
+        fs.writeFileSync("late.txt", "retained legacy bytes\\n");
+        response.end("written");
+      });
+      server.listen(0, "127.0.0.1", () => {
+        fs.writeFileSync("legacy-ready.json", JSON.stringify({
+          pid: process.pid, url: "http://127.0.0.1:" + server.address().port,
+        }));
+        sendReceipt(source, "legacy-real-writer");
+      });
+    `;
+    const execution = runWithSpawnBroker(host, () =>
+      workspace.exec(
+        {
+          ...identity,
+          argv: [runtimeExecutableName, "--input-type=module", "-e", script],
+        },
+        AbortSignal.any([signal, controller.signal]),
+      ),
+    );
+    const outcome = execution.then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error }),
+    );
+    let preparation: Promise<"admitted" | "deferred"> | undefined;
+    let entered = false;
+    try {
+      await withinTest(receipts.waitFor(root, "legacy-real-writer"), signal);
+      const actual = JSON.parse(
+        fs.readFileSync(path.join(seeded.workspaceDir, "legacy-ready.json"), "utf8"),
+      ) as {
+        pid: number;
+        url: string;
+      };
+      expect(() => process.kill(actual.pid, 0)).not.toThrow();
+      // Establish real writer bytes before cancellation. Delaying client readiness
+      // does not withhold the broker's independent cancellation delivery.
+      expect(await (await fetch(actual.url, { signal })).text()).toBe("written");
+      expect(fs.readFileSync(path.join(seeded.workspaceDir, "late.txt"), "utf8")).toBe(
+        "retained legacy bytes\n",
+      );
+      controller.abort(new Error("legacy caller cancelled before PID delivery"));
+      expect(await withinTest(bounded.promise, signal)).toMatchObject({
+        termination: "signal",
+        cleanup: "uncertain",
+      });
+      expect(workspace.processes.hasActiveWorkspace(seeded.workspaceDir)).toBe(true);
+      const serialize = workspaceTransfer.serializeNodeWorkerWorkspace;
+      vi.spyOn(workspaceTransfer, "serializeNodeWorkerWorkspace").mockImplementation(
+        <T>(directory: string, operation: () => Promise<T>): Promise<T> => {
+          const result = serialize(directory, operation);
+          queued.resolve();
+          return result;
+        },
+      );
+      preparation = workspace.withCheckoutPreparation(
+        {
+          gatewayNamespace: identity.gatewayNamespace,
+          environmentId: identity.environmentId,
+          sessionId: identity.sessionId,
+          ownerEpoch: identity.generation,
+          workspaceDir: seeded.workspaceDir,
+        },
+        async (mode) => {
+          entered = true;
+          return mode;
+        },
+        signal,
+      );
+      await withinTest(queued.promise, signal);
+      expect(entered).toBe(false);
+      // No post-cancellation liveness claim: the bounded result is uncertain
+      // until canonical readiness and physical settlement finish below.
+      readiness.resolve();
+      const completed = await withinTest(outcome, signal);
+      expect(completed).not.toHaveProperty("error");
+      expect(await withinTest(preparation, signal)).toBe("admitted");
+      expect(workspace.processes.hasActiveWorkspace(seeded.workspaceDir)).toBe(false);
+      expect(() => process.kill(actual.pid, 0)).toThrow();
+      expect(fs.readFileSync(path.join(seeded.workspaceDir, "late.txt"), "utf8")).toBe(
+        "retained legacy bytes\n",
+      );
+    } finally {
+      readiness.resolve();
+      controller.abort();
+      await Promise.allSettled([outcome, ...(preparation ? [preparation] : [])]);
+      await host.close();
+    }
+  },
+);
+
+it("does not unlock checkout when a real legacy command's canonical cleanup reports uncertainty", async () => {
+  const { workspace } = fixture();
+  const seeded = await workspace.exec({
+    ...identity,
+    nativeProcessOwner: true,
+    argv: [runtimeExecutableName, "-e", "process.exit(0)"],
+  });
+  const run = commandExec.runCommandWithTimeout;
+  vi.spyOn(commandExec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+    const result = await run(argv, options);
+    // A real command executes; only the cleanup acknowledgement is fault injected.
+    commandScopes.retainCommandProcessCleanup(Promise.resolve("uncertain"));
+    return result;
+  });
+  await expect(
+    workspace.exec({
+      ...identity,
+      argv: [
+        runtimeExecutableName,
+        "-e",
+        "require('node:fs').writeFileSync('late.txt', 'owned bytes');",
+      ],
+    }),
+  ).rejects.toMatchObject({ code: "ERR_COMMAND_PROCESS_CLEANUP_UNCERTAIN" });
+  expect(workspace.processes.hasActiveWorkspace(seeded.workspaceDir)).toBe(true);
+  const request = {
+    gatewayNamespace: identity.gatewayNamespace,
+    environmentId: identity.environmentId,
+    sessionId: identity.sessionId,
+    ownerEpoch: identity.generation,
+    workspaceDir: seeded.workspaceDir,
+  };
+  expect(await workspace.withCheckoutPreparation(request, async (mode) => mode)).toBe("deferred");
+  expect(fs.readFileSync(path.join(seeded.workspaceDir, "late.txt"), "utf8")).toBe("owned bytes");
+  // Explicit normal cleanup can confirm the canonical receipts; the failed call stays failed.
+  await workspace.processes.stopEnvironment({ ...identity, ownerEpoch: identity.generation });
+  expect(workspace.processes.hasActiveWorkspace(seeded.workspaceDir)).toBe(false);
+  expect(await workspace.withCheckoutPreparation(request, async (mode) => mode)).toBe("admitted");
+});
+
+it("retains an unknown legacy reservation when construction fails before scope attachment", async () => {
+  const { workspace } = fixture();
+  const seeded = await workspace.exec({
+    ...identity,
+    nativeProcessOwner: true,
+    argv: [runtimeExecutableName, "-e", "process.exit(0)"],
+  });
+  const failure = new Error("synthetic ambiguous command construction failure");
+  const scope = commandScopes.withCommandProcessScope;
+  vi.spyOn(commandScopes, "withCommandProcessScope").mockImplementation(
+    (run, signal, custody) => {
+      // Model the exact reserve-before-construction gap; no fake PID or native signal.
+      custody?.reserve(["synthetic-unacknowledged-legacy-command"]);
+      return scope(run, signal, custody);
+    },
+  );
+  vi.spyOn(commandExec, "runCommandWithTimeout").mockRejectedValue(failure);
+  try {
+    await expect(
+      workspace.exec({
+        ...identity,
+        argv: [runtimeExecutableName, "-e", "0"],
+      }),
+    ).rejects.toMatchObject({ code: "ERR_COMMAND_PROCESS_CLEANUP_UNCERTAIN", cause: failure });
+    expect(workspace.processes.hasActiveWorkspace(seeded.workspaceDir)).toBe(true);
+    expect(
+      await workspace.withCheckoutPreparation(
+        {
+          gatewayNamespace: identity.gatewayNamespace,
+          environmentId: identity.environmentId,
+          sessionId: identity.sessionId,
+          ownerEpoch: identity.generation,
+          workspaceDir: seeded.workspaceDir,
+        },
+        async (mode) => mode,
+      ),
+    ).toBe("deferred");
+    await expect(
+      workspace.processes.stopEnvironment({ ...identity, ownerEpoch: identity.generation }),
+    ).rejects.toThrow();
+    expect(workspace.processes.hasActiveWorkspace(seeded.workspaceDir)).toBe(true);
+  } finally {
+    // Unknown custody is deliberately fail-closed. This synthetic reservation
+    // spawned nothing; do not make the shared fixture teardown claim it was settled.
+    await expect(workspace.processes.close()).rejects.toThrow();
+    workspaces.splice(workspaces.indexOf(workspace), 1);
+  }
+});
+
+it("defers checkout for a live preview and admits the same ordinary workspace after extinction", async ({
+  signal,
+}) => {
+  const { workspace, start, control, ready } = fixture();
+  const launched = await workspace.exec(start);
+  const url = await ready(signal);
+  const request = {
+    gatewayNamespace: identity.gatewayNamespace,
+    environmentId: identity.environmentId,
+    sessionId: identity.sessionId,
+    ownerEpoch: identity.generation,
+    workspaceDir: launched.workspaceDir,
+  };
+  // Ordinary managed placements deliberately have no prepared-cache session key.
+  expect(await workspace.withCheckoutPreparation(request, async (mode) => mode)).toBe("deferred");
+  expect(workspace.processes.hasActiveWorkspace(launched.workspaceDir)).toBe(true);
+  expect(await (await fetch(url)).text()).toBe(":99");
+  await control("stop");
+  expect(workspace.processes.hasActiveWorkspace(launched.workspaceDir)).toBe(false);
+  expect(await workspace.withCheckoutPreparation(request, async (mode) => mode)).toBe("admitted");
+});
+
+it("queues preview spawn behind the canonical checkout preparation interval", async ({
+  signal,
+}) => {
+  const { workspace, start, ready } = fixture();
+  const seeded = await workspace.exec({
+    ...identity,
+    nativeProcessOwner: true,
+    argv: [runtimeExecutableName, "-e", "process.exit(0)"],
+  });
+  const entered = createDeferredCore();
+  const release = createDeferredCore();
+  const previewQueued = createDeferredCore();
+  const serialize = workspaceTransfer.serializeNodeWorkerWorkspace;
+  let enqueued = 0;
+  vi.spyOn(workspaceTransfer, "serializeNodeWorkerWorkspace").mockImplementation(
+    <T>(directory: string, operation: () => Promise<T>): Promise<T> => {
+      const result = serialize(directory, operation);
+      if (++enqueued === 2) {
+        previewQueued.resolve();
+      }
+      return result;
+    },
+  );
+  const execute = vi.spyOn(workspace.processes, "execute");
+  const preparation = workspace.withCheckoutPreparation(
+    {
+      gatewayNamespace: identity.gatewayNamespace,
+      environmentId: identity.environmentId,
+      sessionId: identity.sessionId,
+      ownerEpoch: identity.generation,
+      workspaceDir: seeded.workspaceDir,
+    },
+    async (mode) => {
+      expect(mode).toBe("admitted");
+      entered.resolve();
+      await release.promise;
+    },
+  );
+  let starting: ReturnType<typeof workspace.exec> | undefined;
+  try {
+    await withinTest(entered.promise, signal);
+    starting = workspace.exec(start);
+    await withinTest(previewQueued.promise, signal);
+    expect(execute).not.toHaveBeenCalled();
+    release.resolve();
+    await preparation;
+    await starting;
+    expect((await fetch(await ready(signal))).ok).toBe(true);
+  } finally {
+    release.resolve();
+    await Promise.allSettled([preparation, ...(starting ? [starting] : [])]);
+  }
+});
 
 it("rejects outside path operands after positional arguments, eval terminators, and option values", async () => {
   const { workspace } = fixture(true);

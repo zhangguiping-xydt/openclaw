@@ -21,6 +21,7 @@ import {
 import { projectNodeWorkerSupervisorReceipt } from "./node-worker-supervisor-contract.js";
 import {
   createNodeWorkerSupervisorFixture,
+  createNodeWorkerCheckoutFixture,
   observeNodeWorkerAdapters,
   waitForNodeWorkerTerminal as waitForTerminal,
 } from "./node-worker-supervisor.fixture.test-support.js";
@@ -311,9 +312,20 @@ describe("node worker supervisor", () => {
   });
 
   it("preserves worker result text while bounding and scrubbing failure diagnostics", async () => {
-    await using f = fixture();
+    const value = await createNodeWorkerCheckoutFixture(
+      tempDirs.make("node-worker-checkout-secret-"),
+    );
+    await using f = {
+      ...value,
+      launch: (input: ReturnType<typeof launchInput>) =>
+        value.supervisor.launch(input, TEST_WORKER_ENDPOINT),
+      terminal: (id: string) => waitForTerminal(value.supervisor, id),
+      [Symbol.asyncDispose]: () => value.supervisor.close(),
+    };
     const { workspaceDir } = f;
     const successInput = launchInput(workspaceDir, "secret-success-launch", "secret-success");
+    successInput.descriptor.admission.environmentId = "environment-1";
+    successInput.descriptor.admission.sessionId = "session-1";
     successInput.descriptor.assignment.github = {
       token: "worker-github-token",
       login: "worker-bot",
@@ -369,7 +381,17 @@ describe("node worker supervisor", () => {
   });
 
   it("rotates credential scrubbing and drops prior-turn diagnostics when a worker is reused", async () => {
-    await using f = fixture({ capacity: 1 });
+    const value = await createNodeWorkerCheckoutFixture(
+      tempDirs.make("node-worker-checkout-retained-secret-"),
+      { capacity: 1 },
+    );
+    await using f = {
+      ...value,
+      launch: (input: ReturnType<typeof launchInput>) =>
+        value.supervisor.launch(input, TEST_WORKER_ENDPOINT),
+      terminal: (id: string) => waitForTerminal(value.supervisor, id),
+      [Symbol.asyncDispose]: () => value.supervisor.close(),
+    };
     const { workspaceDir } = f;
     const first = testWorkerLaunchInput(workspaceDir, "previous-diagnostic", "diagnostic-retain");
     const second = testWorkerLaunchInput(workspaceDir, "rotated-credential", "secret-success");

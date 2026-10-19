@@ -172,6 +172,7 @@ async function runManagedWorkerCommand(
         lastTurnId = request.turnId;
         const current = { turnId: request.turnId, controller: new AbortController() };
         active = current;
+        let checkoutPrepared = request.checkoutPreparation !== "admitted";
         running = (async (descriptor: WorkerLaunchDescriptor, idleRetention?: true) => {
           // Device-folder admission binds a canonical path. Do not independently
           // resolve a replacement symlink into a different execution target.
@@ -238,6 +239,17 @@ async function runManagedWorkerCommand(
               ...(assertWorkspaceCurrent ? { assertWorkspaceCurrent } : {}),
               nativeInference: options.nativeInference,
               signal: current.controller.signal,
+              ...(request.checkoutPreparation
+                ? { checkoutPreparation: request.checkoutPreparation }
+                : {}),
+              ...(request.checkoutPreparation === "admitted"
+                ? {
+                    onCheckoutPrepared: async () => {
+                      await write({ type: "checkout-prepared", turnId: current.turnId });
+                      checkoutPrepared = true;
+                    },
+                  }
+                : {}),
               ...(options.lifetime
                 ? { onConnectionFailure: options.lifetime.reportConnectionFailure }
                 : {}),
@@ -254,8 +266,9 @@ async function runManagedWorkerCommand(
             await disposeWorkerGitHubEnvironment(stateDir, descriptor.assignment.turnId);
           };
           const canRetain =
-            result.status === "completed" ||
-            (result.status === "failed" && result.reason === "turn-failed");
+            checkoutPrepared &&
+            (result.status === "completed" ||
+              (result.status === "failed" && result.reason === "turn-failed"));
           let retention: WorkerProcessResult["retention"] =
             canRetain && getActiveBackgroundExecSessionCount() > 0
               ? "background"
@@ -409,6 +422,7 @@ export async function runWorkerCommand(input: RunWorkerCommandOptions): Promise<
       return;
     }
     const result = await runWorkerDescriptor(descriptor, {
+      checkoutPreparation: "standalone",
       nativeInference: options.nativeInference,
       signal: abortController.signal,
       ...(options.lifetime

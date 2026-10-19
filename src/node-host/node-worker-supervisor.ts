@@ -1,5 +1,4 @@
 import path from "node:path";
-import { NODE_WORKER_IDLE_RETENTION_PROTOCOL_FEATURE } from "../../packages/gateway-protocol/src/schema/worker-admission.js";
 import { resolveStateDir } from "../config/paths.js";
 import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { throwCollectedErrors } from "../infra/error-graph-internal.js";
@@ -7,9 +6,7 @@ import { withTimeout } from "../infra/fs-safe.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import type { WorkerLaunchDescriptor } from "../worker/launch-descriptor.js";
 import {
-  nodeWorkerPlanHash,
   nodeWorkerTurnMatchesIdentity,
-  validateNodeWorkerLaunchInput,
   type NodeWorkerEnvironmentStopInput,
   type NodeWorkerLaunchInput,
   type NodeWorkerSupervisorIdentity,
@@ -18,10 +15,7 @@ import type {
   NodeWorkerWorkspaceRetainInput,
   NodeWorkerWorkspaceRetainResult,
 } from "../worker/node-workspace-retain-protocol.js";
-import {
-  parseWorkerConnectionEndpoint,
-  type WorkerConnectionEndpoint,
-} from "../worker/worker-connection-endpoint.js";
+import type { WorkerConnectionEndpoint } from "../worker/worker-connection-endpoint.js";
 import type { NodeWorkerProcessInput } from "../worker/worker-process-observation.js";
 import { NodeWorkerCapacity } from "./node-worker-capacity.js";
 import { NodeWorkerChildLifecycle } from "./node-worker-child-lifecycle.js";
@@ -36,6 +30,9 @@ import {
   type NodeWorkerProcessIdentity,
 } from "./node-worker-process-identity.js";
 import {
+  prepareNodeWorkerLaunch,
+  createNodeWorkerAdmissionScope,
+  withNodeWorkerCheckoutPreparation,
   NODE_WORKER_STOP_GRACE_MS,
   NODE_WORKER_FORCE_STOP_WAIT_MS,
   nodeWorkerEnvironmentBinding,
@@ -162,22 +159,7 @@ class NodeWorkerSupervisor {
     connectionEndpoint: WorkerConnectionEndpoint,
     signal?: AbortSignal,
   ): Promise<NodeWorkerLaunchReceipt> {
-    const input = validateNodeWorkerLaunchInput(structuredClone(rawInput));
-    const parsedEndpoint = parseWorkerConnectionEndpoint(connectionEndpoint);
-    if (!parsedEndpoint) {
-      throw new Error("invalid worker launch descriptor");
-    }
-    const descriptor = { ...input.descriptor, connectionEndpoint: parsedEndpoint };
-    const claimInput: NodeWorkerLaunchClaim = {
-      launchId: input.launchId,
-      planHash: nodeWorkerPlanHash(input),
-      gatewayNamespace: input.gatewayNamespace,
-      environmentId: descriptor.admission.environmentId,
-      sessionId: descriptor.admission.sessionId,
-      ownerEpoch: descriptor.admission.ownerEpoch,
-      placementGeneration: input.placementGeneration,
-      runId: descriptor.assignment.runId,
-    };
+    const { input, descriptor, claimInput } = prepareNodeWorkerLaunch(rawInput, connectionEndpoint);
     if (this.closed) {
       throw new Error("node worker supervisor is closed");
     }
@@ -196,13 +178,7 @@ class NodeWorkerSupervisor {
       }
       return await admission.done;
     }
-    const abort = new AbortController();
-    const idleRetention =
-      input.idleRetention &&
-      descriptor.admission.handshake.protocolFeatures.includes(
-        NODE_WORKER_IDLE_RETENTION_PROTOCOL_FEATURE,
-      );
-    const admissionSignal = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal;
+    const { abort, idleRetention, admissionSignal } = createNodeWorkerAdmissionScope(input, signal);
     const done = (async () => {
       const workspace = await this.workspace.acquirePreparedWorkspace({
         ...binding,
@@ -308,13 +284,21 @@ class NodeWorkerSupervisor {
         signal.throwIfAborted();
         continue;
       }
-      return await this.children.startTurn(
-        owner,
-        descriptor,
-        claimInput,
+      return await withNodeWorkerCheckoutPreparation(
+        this.workspace,
+        input,
         signal,
-        idleRetention,
-        assertWorkspaceCurrent,
+        (mode, preparation) =>
+          this.children.startTurn(
+            owner,
+            descriptor,
+            claimInput,
+            signal,
+            idleRetention,
+            assertWorkspaceCurrent,
+            mode,
+            preparation,
+          ),
       );
     }
     const claim = await this.capacity.claim(claimInput, supervisor, signal, () =>
@@ -357,17 +341,25 @@ class NodeWorkerSupervisor {
       void cancellation.catch(() => undefined);
     };
     signal?.addEventListener("abort", cancelClaimed, { once: true });
-    const startup = this.children.startChild({
-      workerEnv: homeDir ? snapshotNodeWorkerEnv(this.workerEnv, homeDir) : this.workerEnv,
-      homeDir,
+    const startup = withNodeWorkerCheckoutPreparation(
+      this.workspace,
       input,
-      descriptor,
-      supervisor,
       signal,
-      claim: claimInput,
-      idleRetention,
-      assertWorkspaceCurrent,
-    });
+      (mode, preparation) =>
+        this.children.startChild({
+          workerEnv: homeDir ? snapshotNodeWorkerEnv(this.workerEnv, homeDir) : this.workerEnv,
+          homeDir,
+          input,
+          descriptor,
+          supervisor,
+          signal,
+          claim: claimInput,
+          idleRetention,
+          assertWorkspaceCurrent,
+          checkoutMode: mode,
+          checkoutPreparation: preparation,
+        }),
+    );
     this.starting.set(input.launchId, startup);
     if (signal?.aborted) {
       cancelClaimed();

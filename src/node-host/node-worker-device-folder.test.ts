@@ -111,6 +111,28 @@ it("does not reinterpret an unbound legacy worker cwd as a device folder", async
   await expect(runtime.acquirePreparedWorkspace(legacy)).resolves.toBeUndefined();
 });
 
+it("defers checkout writes while preserving the acquired device-folder identity", async () => {
+  write();
+  const acquired = await runtime.acquirePreparedWorkspace(request());
+  if (!acquired?.assertCurrent) {
+    throw new Error("bound device-folder acquisition has no identity assertion");
+  }
+  try {
+    const mode = await runtime.withCheckoutPreparation(request(), async (mode) => {
+      acquired.assertCurrent?.();
+      expect(fs.readFileSync(path.join(folder, "user.txt"), "utf8")).toBe("original");
+      return mode;
+    });
+    expect(mode).toBe("deferred");
+    fs.renameSync(folder, `${folder}-original`);
+    fs.mkdirSync(folder);
+    expect(() => acquired.assertCurrent?.()).toThrow("acquired device folder changed");
+    expect(fs.readdirSync(folder)).toEqual([]);
+  } finally {
+    acquired.release();
+  }
+});
+
 it("disables device-folder validation with an explicit empty list", async () => {
   runtime = makeRuntime([]);
   expect(() => runtime.validateDeviceFolder(folder)).toThrow("sessions are disabled");

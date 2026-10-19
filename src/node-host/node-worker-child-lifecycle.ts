@@ -1,15 +1,9 @@
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import type { WorkerLaunchDescriptor } from "../worker/launch-descriptor.js";
-import type {
-  NodeWorkerLaunchInput,
-  NodeWorkerSupervisorIdentity,
-} from "../worker/node-supervisor-protocol.js";
+import type { NodeWorkerSupervisorIdentity } from "../worker/node-supervisor-protocol.js";
 import type { NodeWorkerProcessInput } from "../worker/worker-process-observation.js";
-import {
-  buildWorkerProcessTurn,
-  type WorkerProcessMessage,
-} from "../worker/worker-process-protocol.js";
+import type { WorkerProcessMessage } from "../worker/worker-process-protocol.js";
 import { nodeWorkerLaunchSecrets } from "./node-worker-child-secrets.js";
 import type { NodeWorkerContainerLifecycle } from "./node-worker-container-lifecycle.js";
 import type { NodeWorkerLaunchClaim } from "./node-worker-journal.types.js";
@@ -39,6 +33,9 @@ import {
 } from "./node-worker-process-identity.js";
 import { NodeWorkerProcessObservations } from "./node-worker-process-observation.js";
 import {
+  buildNodeWorkerCheckoutTurn,
+  acceptNodeWorkerCheckoutPrepared,
+  type NodeWorkerChildAdmission,
   NODE_WORKER_STOP_GRACE_MS,
   NODE_WORKER_FORCE_STOP_WAIT_MS,
   clearNodeWorkerRetention,
@@ -48,6 +45,7 @@ import {
   nodeWorkerReceiptMatchesOwner,
   type NodeWorkerActiveOwnership,
   type NodeWorkerRunningChild,
+  type NodeWorkerCheckoutPreparation,
   type NodeWorkerStopState,
   type NodeWorkerPendingAdmission,
   type NodeWorkerChildLifecycleOptions,
@@ -137,17 +135,7 @@ export class NodeWorkerChildLifecycle {
   }
 
   /** Starts one physical owner behind the durable journal gate, independent of turn reuse. */
-  async startChild(params: {
-    workerEnv: NodeJS.ProcessEnv;
-    homeDir?: string;
-    input: NodeWorkerLaunchInput;
-    descriptor: WorkerLaunchDescriptor;
-    supervisor: NodeWorkerProcessIdentity;
-    claim: NodeWorkerLaunchClaim;
-    signal?: AbortSignal;
-    idleRetention?: boolean;
-    assertWorkspaceCurrent?: () => void;
-  }): Promise<NodeWorkerLaunchReceipt> {
+  async startChild(params: NodeWorkerChildAdmission): Promise<NodeWorkerLaunchReceipt> {
     const sensitiveValues = nodeWorkerLaunchSecrets(
       params.descriptor,
       this.options.nativeInferenceSnapshot,
@@ -231,7 +219,7 @@ export class NodeWorkerChildLifecycle {
     const active = {
       state: "running",
       binding: nodeWorkerEnvironmentBinding(params.input),
-      turn: createNodeWorkerActiveTurn(params.claim),
+      turn: createNodeWorkerActiveTurn(params.claim, params.checkoutPreparation),
       retiring: false,
       idleRetention: params.idleRetention,
       adapter,
@@ -311,9 +299,11 @@ export class NodeWorkerChildLifecycle {
       params.assertWorkspaceCurrent?.();
       await sendNodeWorkerInput(
         adapter,
-        buildWorkerProcessTurn(
+        buildNodeWorkerCheckoutTurn(
           params.descriptor,
           params.idleRetention === true,
+          params.checkoutMode,
+          params.checkoutPreparation,
           Boolean(params.assertWorkspaceCurrent),
           true,
         ),
@@ -347,6 +337,8 @@ export class NodeWorkerChildLifecycle {
     signal: AbortSignal,
     idleRetention = false,
     assertWorkspaceCurrent?: () => void,
+    checkoutMode?: "admitted" | "deferred",
+    checkoutPreparation?: NodeWorkerCheckoutPreparation,
   ): Promise<NodeWorkerLaunchReceipt> {
     if (descriptor.assignment.inference === "runtime-local") {
       resolveNodeWorkerNativeInferenceWorkspace(this.options.nativeInferenceSnapshot, descriptor);
@@ -373,7 +365,7 @@ export class NodeWorkerChildLifecycle {
       return admitted.receipt;
     }
     clearNodeWorkerRetention(active);
-    active.turn = createNodeWorkerActiveTurn(claim);
+    active.turn = createNodeWorkerActiveTurn(claim, checkoutPreparation);
     const negotiated = active.idleRetention || idleRetention;
     active.idleRetention = idleRetention;
     if (negotiated) {
@@ -398,9 +390,11 @@ export class NodeWorkerChildLifecycle {
       assertWorkspaceCurrent?.();
       await sendNodeWorkerInput(
         active.adapter,
-        buildWorkerProcessTurn(
+        buildNodeWorkerCheckoutTurn(
           descriptor,
           active.idleRetention,
+          checkoutMode,
+          checkoutPreparation,
           Boolean(assertWorkspaceCurrent),
           true,
         ),
@@ -552,6 +546,14 @@ export class NodeWorkerChildLifecycle {
       }
       return;
     }
+    if (frame.type === "checkout-prepared") {
+      acceptNodeWorkerCheckoutPrepared(
+        active,
+        frame.turnId,
+        this.owners.get(active.launchId) === active,
+      );
+      return;
+    }
     if (frame.type === "process-result") {
       this.processObservations.accept(active, frame);
       return;
@@ -563,6 +565,9 @@ export class NodeWorkerChildLifecycle {
       const turn = active.turn;
       if (!turn || turn.claim.launchId !== frame.turnId || active.retiring) {
         throw new Error("node worker returned a result outside its active turn");
+      }
+      if (turn.checkoutPreparation && frame.retainWorker) {
+        throw new Error("worker retained execution before checkout preparation settled");
       }
       // Publish this operation before finish can invoke a reentrant cancellation.
       const settling = Promise.resolve()
@@ -582,7 +587,11 @@ export class NodeWorkerChildLifecycle {
           if (!receipt || receipt.state === "pending" || receipt.state === "running") {
             throw new Error("node worker turn completion lost its physical owner");
           }
-          active.turn = undefined;
+          // An early failed/fenced result keeps pending preparation on this exact
+          // turn until the physical child retires; logical result is not an unlock.
+          if (!turn.checkoutPreparation) {
+            active.turn = undefined;
+          }
           active.retiring = !frame.retainWorker;
           turn.settle();
         })
@@ -635,6 +644,11 @@ export class NodeWorkerChildLifecycle {
     active: NodeWorkerRunningChild,
     outcome: NodeWorkerTerminalOutcome,
   ): Promise<void> {
+    // This function is reached only after confirmed cleanup (including deferred retry).
+    active.turn?.checkoutPreparation?.settle();
+    if (active.turn) {
+      delete active.turn.checkoutPreparation;
+    }
     const observed = createNodeWorkerObservedTerminal(active, outcome);
     if (this.owners.get(active.launchId) !== active) {
       return;

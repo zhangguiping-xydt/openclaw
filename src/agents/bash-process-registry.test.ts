@@ -9,6 +9,8 @@ import {
   clearFinishedSessionsForScopes,
   deleteSession,
   getActiveBackgroundExecSessionCount,
+  hasActiveExecScope,
+  settleExecSessionFinalization,
   getFinishedSession,
   isProcessSessionIdTaken,
   listFinishedSessions,
@@ -29,6 +31,33 @@ const randomMocks = vi.hoisted(() => ({ generateSecureInt: vi.fn(() => 0) }));
 
 // mock-isolation: Deterministic session IDs exercise collision handling without real randomness.
 vi.mock("../infra/secure-random.js", () => ({ generateSecureInt: randomMocks.generateSecureInt }));
+
+it("keeps exact exec scope custody through hidden output and pending finalization", () => {
+  const session = createProcessSessionFixture({
+    command: "echo test",
+    id: "checkout-scope",
+    maxOutputChars: 100,
+    pendingMaxOutputChars: 30_000,
+    backgrounded: false,
+  });
+  session.scopeKey = "worker:checkout-fixture";
+  expect(hasActiveExecScope(session.scopeKey)).toBe(false);
+  addSession(session);
+  expect(hasActiveExecScope(session.scopeKey)).toBe(true);
+  expect(hasActiveExecScope("worker:another-fixture")).toBe(false);
+
+  markBackgrounded(session);
+  session.backgrounded = false;
+  deleteSession(session.id);
+  expect(listRunningSessions()).toHaveLength(0);
+  expect(hasActiveExecScope(session.scopeKey)).toBe(true);
+
+  session.finalizing = true;
+  markExited(session, 0, null, "completed");
+  expect(hasActiveExecScope(session.scopeKey)).toBe(true);
+  settleExecSessionFinalization(session);
+  expect(hasActiveExecScope(session.scopeKey)).toBe(false);
+});
 
 it("releases discarded backing strings from live, finished, and staged output", async ({
   signal,

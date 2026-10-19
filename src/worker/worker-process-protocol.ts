@@ -1,6 +1,9 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { z } from "zod";
-import { NODE_WORKER_PROCESS_CHANGES_PROTOCOL_FEATURE } from "../../packages/gateway-protocol/src/schema/worker-admission.js";
+import {
+  NODE_WORKER_CHECKOUT_PREPARATION_PROTOCOL_FEATURE,
+  NODE_WORKER_PROCESS_CHANGES_PROTOCOL_FEATURE,
+} from "../../packages/gateway-protocol/src/schema/worker-admission.js";
 import { WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES } from "../../packages/gateway-protocol/src/schema/worker-inference.js";
 import { WORKER_PROTOCOL_MAX_IDENTIFIER_LENGTH } from "../../packages/gateway-protocol/src/schema/worker-protocol-primitives.js";
 import { parseWorkerLaunchDescriptor, type WorkerLaunchPlan } from "./launch-descriptor.js";
@@ -15,12 +18,23 @@ import {
 /** Private JSONL protocol between one node supervisor and its environment-owned worker. */
 export type WorkerProcessInput = ReturnType<typeof parseWorkerProcessRequest>;
 
+export type WorkerCheckoutPreparationMode = "admitted" | "deferred";
+
 export function buildWorkerProcessTurn<T extends WorkerLaunchPlan>(
   descriptor: T,
   idleRetention = false,
   canonicalWorkspace = false,
   processChanges = false,
+  checkoutPreparation?: WorkerCheckoutPreparationMode,
 ) {
+  if (
+    checkoutPreparation !== undefined &&
+    !descriptor.admission.handshake.protocolFeatures.includes(
+      NODE_WORKER_CHECKOUT_PREPARATION_PROTOCOL_FEATURE,
+    )
+  ) {
+    throw new Error("worker bundle does not support owned checkout preparation");
+  }
   return {
     type: "turn" as const,
     turnId: descriptor.assignment.turnId,
@@ -34,6 +48,7 @@ export function buildWorkerProcessTurn<T extends WorkerLaunchPlan>(
     )
       ? { processChanges: true as const }
       : {}),
+    ...(checkoutPreparation ? { checkoutPreparation } : {}),
   };
 }
 
@@ -46,7 +61,17 @@ export function measureWorkerProcessTurnBytes(
   return (
     Buffer.byteLength(
       JSON.stringify(
-        buildWorkerProcessTurn({ ...plan, connectionEndpoint: null }, idleRetention, true, true),
+        buildWorkerProcessTurn(
+          { ...plan, connectionEndpoint: null },
+          idleRetention,
+          true,
+          true,
+          plan.admission.handshake.protocolFeatures.includes(
+            NODE_WORKER_CHECKOUT_PREPARATION_PROTOCOL_FEATURE,
+          )
+            ? "deferred"
+            : undefined,
+        ),
       ),
     ) -
     "null".length +
@@ -100,6 +125,10 @@ const ProcessResultSchema = workerProtocolObject({
 const ProcessMessageSchema = z.union([
   WorkerProcessObservationResultSchema,
   workerProtocolObject({ type: z.literal("processes-changed") }),
+  workerProtocolObject({
+    type: z.literal("checkout-prepared"),
+    turnId: TurnIdSchema,
+  }),
   ProcessResultSchema,
   workerProtocolObject({
     type: z.literal("idle-ready"),
@@ -132,11 +161,14 @@ export function parseWorkerProcessRequest(value: unknown) {
     hasExactOwnKeys(
       value,
       ["type", "turnId", "descriptor"],
-      ["idleRetention", "canonicalWorkspace", "processChanges"],
+      ["idleRetention", "canonicalWorkspace", "processChanges", "checkoutPreparation"],
     ) &&
     (value.idleRetention === undefined || value.idleRetention === true) &&
     (value.canonicalWorkspace === undefined || value.canonicalWorkspace === true) &&
-    (value.processChanges === undefined || value.processChanges === true)
+    (value.processChanges === undefined || value.processChanges === true) &&
+    (value.checkoutPreparation === undefined ||
+      value.checkoutPreparation === "admitted" ||
+      value.checkoutPreparation === "deferred")
   ) {
     const descriptor = parseWorkerLaunchDescriptor(value.descriptor);
     if (descriptor.assignment.turnId !== value.turnId) {
@@ -147,6 +179,7 @@ export function parseWorkerProcessRequest(value: unknown) {
       value.idleRetention === true,
       value.canonicalWorkspace === true,
       value.processChanges === true,
+      value.checkoutPreparation,
     );
   }
   throw new Error("invalid managed worker request");

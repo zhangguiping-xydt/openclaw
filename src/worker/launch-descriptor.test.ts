@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  NODE_WORKER_CHECKOUT_PREPARATION_PROTOCOL_FEATURE,
   WORKER_PROTOCOL_FEATURES,
   WORKER_PROTOCOL_MAX_IDENTIFIER_LENGTH,
   WORKER_PROTOCOL_MAX_PAYLOAD_BYTES,
@@ -10,6 +11,11 @@ import { WORKER_PROTOCOL_MAX_MEDIA_PAYLOAD_BYTES } from "../../packages/gateway-
 import { createNoisyPngBuffer } from "../../test/helpers/image-fixtures.js";
 import type { WorkerGitHubLaunchBinding, WorkerLaunchDescriptor } from "./launch-descriptor.js";
 import { buildWorkerConnectParams, parseWorkerLaunchDescriptor } from "./launch-descriptor.js";
+import {
+  buildWorkerProcessTurn,
+  parseWorkerProcessRequest,
+  serializeWorkerProcessInput,
+} from "./worker-process-protocol.js";
 
 function launchDescriptor(): WorkerLaunchDescriptor {
   return {
@@ -83,6 +89,33 @@ function withAssignment(overrides: Record<string, unknown>, descriptor = launchD
 }
 
 describe("worker launch descriptor", () => {
+  it.each(["admitted", "deferred"] as const)(
+    "roundtrips build-bound private %s checkout preparation",
+    (mode) => {
+      const descriptor = launchDescriptor();
+      const request = buildWorkerProcessTurn(descriptor, false, false, false, mode);
+      expect(parseWorkerProcessRequest(JSON.parse(serializeWorkerProcessInput(request)))).toEqual(
+        request,
+      );
+      expect(() =>
+        parseWorkerProcessRequest({ ...request, checkoutPreparation: "unknown" }),
+      ).toThrow("invalid managed worker request");
+      descriptor.admission.handshake.protocolFeatures =
+        descriptor.admission.handshake.protocolFeatures.filter(
+          (feature) => feature !== NODE_WORKER_CHECKOUT_PREPARATION_PROTOCOL_FEATURE,
+        );
+      expect(() => buildWorkerProcessTurn(descriptor, false, false, false, mode)).toThrow(
+        "worker bundle does not support owned checkout preparation",
+      );
+      expect(() => parseWorkerProcessRequest({ ...request, descriptor })).toThrow(
+        "worker bundle does not support owned checkout preparation",
+      );
+      expect(parseWorkerProcessRequest(buildWorkerProcessTurn(descriptor))).toEqual(
+        buildWorkerProcessTurn(descriptor),
+      );
+    },
+  );
+
   it("admits bounded image-only input and replay without raising the text budget", () => {
     const descriptor = launchDescriptor();
     const image = {

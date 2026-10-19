@@ -6,12 +6,16 @@ import {
   decodeWindowsOutputBuffer,
   resolveWindowsConsoleEncoding,
 } from "../infra/windows-encoding.js";
+import { settleCommandProcessGroups } from "../process/command-process-custody.js";
+import type { CommandProcessIdentity } from "../process/command-process-custody.types.js";
 import {
   appendCapturedOutput,
   createCapturedOutputBuffers,
   finalizeCapturedOutput,
   type CapturedOutputBuffers,
 } from "../process/exec-output.js";
+import { CommandProcessCleanupError } from "../process/exec-result.js";
+import { withCommandProcessScope } from "../process/exec-spawn.js";
 import { runCommandWithTimeout } from "../process/exec.js";
 import { getProcessSupervisor, type ManagedRun } from "../process/supervisor/index.js";
 import type { RunExit } from "../process/supervisor/types.js";
@@ -82,6 +86,15 @@ export class NodeWorkerWorkspaceProcesses {
     );
   }
 
+  /** Live custody includes stopped/uncertain trees until native extinction is joined. */
+  hasActiveWorkspace(workspaceDir: string): boolean {
+    return [...this.owners.values()].some(
+      (owner) =>
+        owner.workspaceDir === workspaceDir &&
+        [...owner.processes.values()].some((process) => !process.settled),
+    );
+  }
+
   /** Capture before workspace lookup can yield; stop revokes this admission, not the directory. */
   captureAdmission(
     input: Pick<NodeWorkerWorkspaceExecInput, "gatewayNamespace" | "environmentId">,
@@ -116,21 +129,149 @@ export class NodeWorkerWorkspaceProcesses {
     const { input, workspaceDir, signal } = params;
     // Legacy callers retain their shipped executor, including detached lease helpers.
     if (!input.process && !input.nativeProcessOwner) {
-      const result = await runCommandWithTimeout(input.argv, {
-        cwd: workspaceDir,
-        baseEnv: params.env,
-        ...(input.input === undefined ? {} : { input: input.input }),
-        timeoutMs: params.timeoutMs,
-        ...(signal ? { signal } : {}),
-        killProcessTree: true,
-        requireProcessTreeExtinction: true,
-        maxOutputBytes: {
-          stdout: NODE_WORKER_WORKSPACE_STDOUT_MAX_BYTES,
-          stderr: NODE_WORKER_WORKSPACE_STDERR_MAX_BYTES,
+      signal?.throwIfAborted();
+      params.assertCurrent();
+      const key = JSON.stringify([
+        input.gatewayNamespace,
+        input.environmentId,
+        input.sessionId,
+        input.generation,
+      ]);
+      let owner = this.owners.get(key);
+      if (owner && (!owner.accepting || owner.workspaceDir !== workspaceDir)) {
+        throw new Error("INVALID_REQUEST: workspace process binding changed");
+      }
+      if (!owner) {
+        owner = {
+          key,
+          gatewayNamespace: input.gatewayNamespace,
+          environmentId: input.environmentId,
+          sessionId: input.sessionId,
+          generation: input.generation,
+          workspaceDir,
+          accepting: true,
+          processes: new Map(),
+        };
+        this.owners.set(key, owner);
+      }
+      const boundOwner = owner;
+      const processId = "legacy-" + randomUUID();
+      const reservations = new Set<{ identity?: CommandProcessIdentity }>();
+      let stopCommand: (() => void) | undefined;
+      const finish = () => {
+        if (command.settled) {
+          return;
+        }
+        command.settled = true;
+        command.releaseWorkspace();
+        boundOwner.processes.delete(processId);
+        if (boundOwner.processes.size === 0 && this.owners.get(key) === boundOwner) {
+          this.owners.delete(key);
+        }
+      };
+      const command: WorkspaceProcess = {
+        fingerprint: createHash("sha256")
+          .update(JSON.stringify([input.argv, input.input ?? null]))
+          .digest("hex"),
+        stdout: "",
+        stderr: "",
+        settled: false,
+        started: Promise.resolve(),
+        releaseWorkspace: params.retainWorkspace(),
+        cleanup: async () => {
+          stopCommand?.();
+          await commandCompletion?.catch(() => undefined);
+          if (command.settled) {
+            return;
+          }
+          // An unknown launch has no PID receipt that could authorize recovery.
+          const retained = [...reservations];
+          const identities = retained.flatMap(({ identity }) => (identity ? [identity] : []));
+          if (identities.length !== retained.length) {
+            throw command.cleanupError ?? new CommandProcessCleanupError();
+          }
+          const cleanup = await settleCommandProcessGroups(identities);
+          if (!cleanup.settled) {
+            throw command.cleanupError ?? new CommandProcessCleanupError();
+          }
+          finish();
         },
-        terminateOnOutputLimit: true,
-      });
-      return { ...result, workspaceDir };
+      };
+      boundOwner.processes.set(processId, command);
+      type Outcome =
+        | { kind: "result"; result: Awaited<ReturnType<typeof runCommandWithTimeout>> }
+        | { kind: "error"; error: unknown };
+      const commandCompletion: Promise<NodeWorkerWorkspaceExecResult> = withCommandProcessScope(
+        async (stop): Promise<Outcome> => {
+          stopCommand = stop;
+          // Keep caller errors separate from physical scope settlement. A bounded
+          // uncertain result cannot release this queue before its owner joins.
+          try {
+            return {
+              kind: "result",
+              result: await runCommandWithTimeout(input.argv, {
+                cwd: workspaceDir,
+                baseEnv: params.env,
+                ...(input.input === undefined ? {} : { input: input.input }),
+                timeoutMs: params.timeoutMs,
+                ...(signal ? { signal } : {}),
+                killProcessTree: true,
+                requireProcessTreeExtinction: true,
+                maxOutputBytes: {
+                  stdout: NODE_WORKER_WORKSPACE_STDOUT_MAX_BYTES,
+                  stderr: NODE_WORKER_WORKSPACE_STDERR_MAX_BYTES,
+                },
+                terminateOnOutputLimit: true,
+              }),
+            };
+          } catch (error) {
+            return { kind: "error", error };
+          }
+        },
+        signal,
+        {
+          reserve: () => {
+            const reservation: { identity?: CommandProcessIdentity } = {};
+            reservations.add(reservation);
+            return {
+              spawned: (identity) => {
+                reservation.identity = identity;
+              },
+              settled: () => {
+                reservations.delete(reservation);
+              },
+            };
+          },
+        },
+      ).then(
+        (outcome) => {
+          // A constructor/transport failure can precede retainCommandProcess. A
+          // fulfilled scope cannot retire an unacknowledged custody reservation.
+          if (reservations.size > 0) {
+            command.cleanupError = new CommandProcessCleanupError({
+              cause: outcome.kind === "error" ? outcome.error : undefined,
+            });
+            throw command.cleanupError;
+          }
+          finish();
+          if (outcome.kind === "error") {
+            throw outcome.error;
+          }
+          return { ...outcome.result, workspaceDir };
+        },
+        (error: unknown) => {
+          // Keep the existing physical workspace owner after queue failure. Only
+          // identity-bound cleanup (or a proven non-start) may release that entry.
+          command.cleanupError = new CommandProcessCleanupError({ cause: error });
+          throw command.cleanupError;
+        },
+      );
+      command.started = commandCompletion.then(
+        () => undefined,
+        () => undefined,
+      );
+      void commandCompletion.catch(() => undefined);
+      return await commandCompletion;
     }
     const operation: NonNullable<NodeWorkerWorkspaceExecInput["process"]> = input.process ?? {
       action: "start",

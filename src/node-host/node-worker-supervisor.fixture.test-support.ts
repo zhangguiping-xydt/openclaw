@@ -23,6 +23,7 @@ import {
   writeNodeWorkerFixture,
 } from "./node-worker-supervisor.test-support.js";
 import { NodeWorkerTurnStore } from "./node-worker-turn-store.js";
+import { NodeWorkerWorkspaceRuntime } from "./node-worker-workspace.js";
 
 const supervisorUrl = resolveRuntimeWorkerUrl(workerBackgroundExecEntrypoints.supervisor);
 const turnsUrl = resolveRuntimeWorkerUrl(workerBackgroundExecEntrypoints.turnStore);
@@ -251,6 +252,50 @@ export function createNodeWorkerSupervisorFixture(
   const fixture = writeNodeWorkerFixture(root);
   const { bundleRoot, env } = fixture;
   return { ...fixture, supervisor: createNodeWorkerSupervisor({ bundleRoot, env, ...options }) };
+}
+
+/** Uses the real workspace owner when a fixture exercises GitHub checkout admission. */
+export async function createNodeWorkerCheckoutFixture(
+  root: string,
+  options: Parameters<typeof createNodeWorkerSupervisor>[0] = {},
+) {
+  const fixture = writeNodeWorkerFixture(root);
+  const env = { ...fixture.env, HOME: root, PATH: path.dirname(process.execPath) };
+  const workspace = new NodeWorkerWorkspaceRuntime({ root: fixture.bundleRoot, env });
+  const input = testWorkerLaunchInput(fixture.workspaceDir, "checkout-owner-seed");
+  try {
+    const seeded = await workspace.exec({
+      gatewayNamespace: input.gatewayNamespace,
+      environmentId: input.descriptor.admission.environmentId,
+      sessionId: input.descriptor.admission.sessionId,
+      generation: input.descriptor.admission.ownerEpoch,
+      nativeProcessOwner: true,
+      argv: [path.basename(process.execPath), "-e", "process.exit(0)"],
+    });
+    return {
+      ...fixture,
+      env,
+      workspace,
+      workspaceDir: seeded.workspaceDir,
+      supervisor: createNodeWorkerSupervisor({
+        bundleRoot: fixture.bundleRoot,
+        env,
+        ...options,
+        workspace,
+      }),
+    };
+  } catch (error) {
+    try {
+      await workspace.processes.close();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "checkout fixture initialization and cleanup failed",
+        { cause: cleanupError },
+      );
+    }
+    throw error;
+  }
 }
 
 export async function waitForNodeWorkerTerminal(

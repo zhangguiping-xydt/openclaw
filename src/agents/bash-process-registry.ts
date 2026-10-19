@@ -467,6 +467,16 @@ export function getActiveBackgroundExecSessionCount(): number {
   return count;
 }
 
+/** Reports live scope custody, including hidden work and pending finalization. */
+export function hasActiveExecScope(scopeKey: string): boolean {
+  for (const { session } of activeExecSessions.values()) {
+    if (session.scopeKey === scopeKey) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Joins registered exec cleanup, including foreground and hidden processes. */
 export async function waitForExecScope(scopeKey: string): Promise<void> {
   while (true) {

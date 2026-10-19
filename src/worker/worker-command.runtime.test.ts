@@ -152,8 +152,12 @@ function managedHarness() {
   const input = new PassThrough();
   const output = new PassThrough();
   const results: WorkerProcessResult[] = [];
+  const messages: WorkerProcessMessage[] = [];
   output.on("data", (chunk: Buffer) => {
     const result = parseWorkerProcessMessage(JSON.parse(chunk.toString("utf8")));
+    if (result) {
+      messages.push(result);
+    }
     if (result?.type === "result") {
       results.push(result);
     }
@@ -168,6 +172,7 @@ function managedHarness() {
     input,
     output,
     results,
+    messages,
     nextMessage: () =>
       new Promise<WorkerProcessMessage>((resolve, reject) => {
         output.once("data", (chunk: Buffer) => {
@@ -326,7 +331,7 @@ describe("worker command lifetime gate", () => {
 
     expect(runWorkerDescriptor).toHaveBeenCalledWith(
       descriptor,
-      expect.objectContaining({ browserRuntime }),
+      expect.objectContaining({ browserRuntime, checkoutPreparation: "standalone" }),
     );
   });
 
@@ -387,6 +392,115 @@ describe("worker command lifetime gate", () => {
       expect(lifetime.dispose).toHaveBeenCalledOnce();
     },
   );
+
+  it("acknowledges only the admitted turn before its result across managed reuse", async () => {
+    const harness = managedHarness();
+    const completeTurn = createDeferred();
+    vi.mocked(runWorkerDescriptor).mockImplementationOnce(async (_launch, options) => {
+      expect(options?.checkoutPreparation).toBe("admitted");
+      expect(options?.onCheckoutPrepared).toBeTypeOf("function");
+      const onCheckoutPrepared = options?.onCheckoutPrepared;
+      if (!onCheckoutPrepared) {
+        throw new Error("Expected the admitted checkout preparation callback");
+      }
+      await onCheckoutPrepared();
+      await completeTurn.promise;
+      return { status: "completed", transcriptLeafId: null, transcriptNextSeq: 1 };
+    });
+    const running = runWorkerCommand({ ...harness, managed: true });
+    try {
+      const acknowledgment = harness.nextMessage();
+      harness.send(buildWorkerProcessTurn(harness.launch, true, false, false, "admitted"));
+      expect(await Promise.race([acknowledgment, running])).toEqual({
+        type: "checkout-prepared",
+        turnId: "turn-1",
+      });
+      expect(harness.results).toEqual([]);
+      const first = harness.nextMessage();
+      completeTurn.resolve();
+      expect(await Promise.race([first, running])).toMatchObject({
+        type: "result",
+        turnId: "turn-1",
+        retainWorker: true,
+        retention: "idle",
+      });
+
+      const deferred = structuredClone(harness.launch);
+      deferred.assignment.turnId = "turn-2";
+      deferred.assignment.runId = "run-2";
+      deferred.assignment.operationalRunInstance = { instanceId: "instance-run-2", runId: "run-2" };
+      const second = harness.nextMessage();
+      harness.send(buildWorkerProcessTurn(deferred, true, false, false, "deferred"));
+      expect(await Promise.race([second, running])).toMatchObject({
+        type: "result",
+        turnId: "turn-2",
+        retainWorker: true,
+        retention: "idle",
+      });
+
+      const legacy = structuredClone(deferred);
+      legacy.assignment.turnId = "turn-3";
+      legacy.assignment.runId = "run-3";
+      legacy.assignment.operationalRunInstance = { instanceId: "instance-run-3", runId: "run-3" };
+      const third = harness.nextMessage();
+      harness.turn(legacy);
+      expect(await Promise.race([third, running])).toMatchObject({
+        type: "result",
+        turnId: "turn-3",
+        retainWorker: false,
+      });
+    } finally {
+      completeTurn.resolve();
+      harness.input.end();
+      await running;
+    }
+    expect(runWorkerDescriptor).toHaveBeenCalledTimes(3);
+    const calls = vi.mocked(runWorkerDescriptor).mock.calls;
+    expect(calls[1]?.[1]).toMatchObject({ checkoutPreparation: "deferred" });
+    expect(calls[1]?.[1]).not.toHaveProperty("onCheckoutPrepared");
+    expect(calls[2]?.[1]).not.toHaveProperty("checkoutPreparation");
+    expect(calls[2]?.[1]).not.toHaveProperty("onCheckoutPrepared");
+    expect(harness.results).toHaveLength(3);
+    expect(harness.messages).toEqual([
+      { type: "checkout-prepared", turnId: "turn-1" },
+      ...harness.results,
+    ]);
+    expect(createWorkerRuntimeEnvironment).toHaveBeenCalledOnce();
+    expect(managedRuntime.close).toHaveBeenCalledOnce();
+  });
+
+  it("does not retain an admitted turn that fails without checkout preparation acknowledgment", async () => {
+    const harness = managedHarness();
+    const failed = {
+      status: "failed" as const,
+      reason: "turn-failed" as const,
+      transcriptLeafId: null,
+      transcriptNextSeq: 1,
+    };
+    managedRuntime.backgroundCount = 1;
+    vi.mocked(runWorkerDescriptor).mockResolvedValueOnce(failed);
+    const running = runWorkerCommand({ ...harness, managed: true });
+    try {
+      const result = harness.nextMessage();
+      harness.send(buildWorkerProcessTurn(harness.launch, true, false, false, "admitted"));
+      expect(await Promise.race([result, running])).toEqual({
+        type: "result",
+        turnId: "turn-1",
+        result: failed,
+        retainWorker: false,
+      });
+    } finally {
+      harness.input.end();
+      await running;
+    }
+    expect(vi.mocked(runWorkerDescriptor).mock.calls[0]?.[1]).toMatchObject({
+      checkoutPreparation: "admitted",
+      onCheckoutPrepared: expect.any(Function),
+    });
+    expect(harness.messages).toEqual(harness.results);
+    expect(managedRuntime.waitForExecScope).not.toHaveBeenCalled();
+    expect(managedRuntime.close).toHaveBeenCalledOnce();
+  });
 
   it("retains state across turns and cancels only the exact active turn", async () => {
     const harness = managedHarness();

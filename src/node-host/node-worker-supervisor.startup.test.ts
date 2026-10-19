@@ -26,6 +26,7 @@ import type { NodeWorkerChildAdapter } from "./node-worker-launch-transport.js";
 import * as workerProcessIdentity from "./node-worker-process-identity.js";
 import {
   createNodeWorkerSupervisorFixture,
+  createNodeWorkerCheckoutFixture,
   observeNodeWorkerAdapters,
   waitForNodeWorkerTerminal as waitForTerminal,
 } from "./node-worker-supervisor.fixture.test-support.js";
@@ -36,6 +37,7 @@ import {
   testNodeWorkerLaunchIdentity,
   testWorkerLaunchInput,
 } from "./node-worker-supervisor.test-support.js";
+import * as workspaceTransfer from "./node-worker-transfer-client.js";
 import * as workerTreeControl from "./node-worker-tree-control.js";
 
 const tempDirs = useStateDatabaseTempDirs();
@@ -545,4 +547,133 @@ it.skipIf(process.platform === "win32")(
     }
   },
   20_000,
+);
+
+it("returns running while checkout owns the queue and starts preview only after the exact ACK", async ({
+  signal,
+}) => {
+  const { supervisor, workspace, workspaceDir } = await createNodeWorkerCheckoutFixture(
+    tempDirs.make("node-worker-checkout-ack-"),
+  );
+  const input = testWorkerLaunchInput(workspaceDir, "checkout-ack", "checkout-await-release");
+  input.descriptor.assignment.github = {
+    login: "fixture",
+    token: "checkout-fixture-token",
+    branch: "session/fixture",
+  };
+  const checkoutPath = path.join(workspaceDir, `${input.launchId}.checkout.json`);
+  const releasePath = path.join(workspaceDir, "checkout-release");
+  const queued = createDeferred();
+  const serialize = workspaceTransfer.serializeNodeWorkerWorkspace;
+  let calls = 0;
+  vi.spyOn(workspaceTransfer, "serializeNodeWorkerWorkspace").mockImplementation(
+    <T>(directory: string, operation: () => Promise<T>): Promise<T> => {
+      const result = serialize(directory, operation);
+      if (++calls === 2) {
+        queued.resolve();
+      }
+      return result;
+    },
+  );
+  const execute = vi.spyOn(workspace.processes, "execute");
+  let preview: ReturnType<typeof workspace.exec> | undefined;
+  try {
+    expect(await withinTest(supervisor.launch(input, TEST_WORKER_ENDPOINT), signal)).toMatchObject({
+      state: "running",
+    });
+    await vi.waitFor(() => expect(fs.existsSync(checkoutPath)).toBe(true));
+    expect(JSON.parse(fs.readFileSync(checkoutPath, "utf8"))).toEqual({
+      checkoutPreparation: "admitted",
+    });
+    preview = workspace.exec({
+      gatewayNamespace: input.gatewayNamespace,
+      environmentId: input.descriptor.admission.environmentId,
+      sessionId: input.descriptor.admission.sessionId,
+      generation: input.descriptor.admission.ownerEpoch,
+      argv: [path.basename(process.execPath), "-e", "setInterval(() => {}, 1000)"],
+      process: { action: "start", processId: "checkout-preview" },
+    });
+    // The asserted await below still reports failure; keep early queue rejection owned too.
+    void preview.catch(() => undefined);
+    await withinTest(queued.promise, signal);
+    expect(execute).not.toHaveBeenCalled();
+    fs.writeFileSync(releasePath, "release");
+    expect(await withinTest(preview, signal)).toMatchObject({ process: { state: "running" } });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(await waitForTerminal(supervisor, input.launchId)).toMatchObject({ state: "completed" });
+  } finally {
+    fs.writeFileSync(releasePath, "release");
+    await supervisor.close();
+    if (preview) {
+      await Promise.allSettled([preview]);
+    }
+  }
+});
+
+it
+  .skipIf(process.platform === "win32")
+  .for(["checkout-failed-before-ack", "checkout-wrong-ack"] as const)(
+  "keeps checkout custody after %s until native extinction is confirmed",
+  async (mode, { signal }) => {
+    const { supervisor, workspaceDir } = await createNodeWorkerCheckoutFixture(
+      tempDirs.make("node-worker-checkout-unconfirmed-"),
+    );
+    const input = testWorkerLaunchInput(workspaceDir, "checkout-early-result", mode);
+    input.descriptor.assignment.github = {
+      login: "fixture",
+      token: "checkout-fixture-token",
+      branch: "session/fixture",
+    };
+    const reported = createDeferred();
+    let confirmed = false;
+    let restoreConfirmation: (() => void) | undefined;
+    vi.spyOn(workerTreeControl, "inspectOwnedNodeWorkerTree").mockReturnValue("unknown");
+    const capture = observeNodeWorkerAdapters((adapter) => {
+      const waitForExtinction = adapter.waitForExtinction;
+      if (!waitForExtinction) {
+        throw new Error("Expected the real relay's extinction boundary");
+      }
+      const confirmExtinction = adapter.confirmExtinction;
+      adapter.confirmExtinction = undefined;
+      restoreConfirmation = () => {
+        adapter.confirmExtinction = confirmExtinction;
+      };
+      adapter.waitForExtinction = async () => {
+        await waitForExtinction();
+        reported.resolve();
+        return confirmed
+          ? { status: "confirmed" }
+          : { status: "uncertain", reason: "job-unavailable" };
+      };
+    });
+    let afterPreparation: Promise<void> | undefined;
+    try {
+      await withinTest(supervisor.launch(input, TEST_WORKER_ENDPOINT), signal);
+      await withinTest(reported.promise, signal);
+      const observed = vi.fn();
+      afterPreparation = workspaceTransfer.serializeNodeWorkerWorkspace(
+        path.dirname(workspaceDir),
+        async () => {
+          observed();
+        },
+      );
+      await expect(
+        supervisor.stopEnvironment(testNodeWorkerEnvironmentIdentity(input)),
+      ).rejects.toThrow("cleanup remains unconfirmed");
+      expect(observed).not.toHaveBeenCalled();
+      confirmed = true;
+      restoreConfirmation?.();
+      await supervisor.stopEnvironment(testNodeWorkerEnvironmentIdentity(input));
+      await withinTest(afterPreparation, signal);
+      expect(observed).toHaveBeenCalledOnce();
+    } finally {
+      confirmed = true;
+      restoreConfirmation?.();
+      capture.mockRestore();
+      await supervisor.close();
+      if (afterPreparation) {
+        await Promise.allSettled([afterPreparation]);
+      }
+    }
+  },
 );

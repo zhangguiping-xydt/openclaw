@@ -160,6 +160,7 @@ export type GitCommandOptions = Pick<
   | "input"
   | "signal"
   | "killProcessTree"
+  | "requireProcessTreeExtinction"
   | "killGraceMs"
   | "maxOutputBytes"
   | "terminateOnOutputLimit"

@@ -122,6 +122,8 @@ export async function runWorkerDescriptor(
   descriptor: WorkerLaunchDescriptor,
   options: {
     signal?: AbortSignal;
+    checkoutPreparation?: "admitted" | "deferred" | "standalone";
+    onCheckoutPrepared?: () => Promise<void>;
     onConnectionFailure?: (cause: string | undefined) => void;
     browserRuntime?: WorkerBrowserRuntime;
     /** Supplied by the managed process owner, which closes state after its final turn. */
@@ -313,6 +315,8 @@ export async function runWorkerDescriptor(
             stateDir,
             turnId: descriptor.assignment.turnId,
             cwd: workspaceDir,
+            execScopeKey: `worker:${descriptor.admission.sessionId}`,
+            checkoutPreparation: options.checkoutPreparation,
             signal: abortController.signal,
           });
         })
@@ -320,6 +324,9 @@ export async function runWorkerDescriptor(
     githubRefresh = github;
     if (github) {
       githubGeneration = 0;
+    }
+    if (options.checkoutPreparation === "admitted") {
+      await options.onCheckoutPrepared?.();
     }
     try {
       turnStarted = true;
