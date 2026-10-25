@@ -1,0 +1,93 @@
+{
+  "kind": "public-field-allowlist-projection",
+  "notNativeReceipt": true,
+  "sourceHead": "460d0939aa0e61336a470e5b359ac5fc4cdd11bb",
+  "sourceTree": "d85955688e81a351efc4cb5f22271986fa7e7712",
+  "submittedDiffSha256": "425881dd8ad5ee62cf48cea967716989aa42d91985898f7d652dcbb2d3ac3e18",
+  "qualificationStatus": "QUALIFIED_REAL_GATEWAY_AND_NATURAL_JOIN",
+  "allOwnedActorsJoined": true,
+  "scopeLimit": "Trusted loopback identity peer, no real external identity provider or model task. Public role close cannot prove silent in-place identity reassignment; that is an independent owner-composition lane.",
+  "visualScope": "Captured functional controls; no layout/pixel/geometry/performance claim; no chat.send/suggestion submission in browser",
+  "nativeValidation": {
+    "file": "1792934908792-post4ca179661-whole-gateway-ui-04.json",
+    "sha256": "8fb32aa34c960c63be5072fa2d3af9f84528062271400d0ffffb1e2390b60b39"
+  },
+  "bounded": {
+    "file": "1792934908792-post4ca179661-whole-gateway-ui-04.bounded-command.json",
+    "sha256": "8d8136a5d1a69856838abf649726a868e46488c105ffbed96e0501963f25c654"
+  },
+  "images": [
+    {
+      "path": "images/01-shared-before.png",
+      "sha256": "297c49767f56d2ad69f9bbf30037e62238f3e0b88dd5a0acf999013a7d1c2b9a",
+      "bytes": 149035,
+      "label": "shared-before",
+      "enabled": true,
+      "suggest": false,
+      "accessEventsObserved": 0
+    },
+    {
+      "path": "images/02-read-only-disabled.png",
+      "sha256": "4ff7ead06b0666c266597b3b41e59d91b6cfbc5bae4053c3073e06367163fbff",
+      "bytes": 154530,
+      "label": "read-only-disabled",
+      "enabled": false,
+      "suggest": false,
+      "accessEventsObserved": 1
+    },
+    {
+      "path": "images/03-shared-restored.png",
+      "sha256": "cf5450d1d39de7ce8a821d97b52e58bdaa1c265db731153e63b687d3d2ab69e2",
+      "bytes": 151655,
+      "label": "shared-restored",
+      "enabled": true,
+      "suggest": false,
+      "accessEventsObserved": 2
+    },
+    {
+      "path": "images/04-draft-revoked-disabled.png",
+      "sha256": "a511e4fa92e97912caaa48743df929934edb82264293402e5b7a02b4370d41a6",
+      "bytes": 155749,
+      "label": "draft-revoked-disabled",
+      "enabled": false,
+      "suggest": false,
+      "accessEventsObserved": 3
+    },
+    {
+      "path": "images/05-shared-recovered.png",
+      "sha256": "cf5450d1d39de7ce8a821d97b52e58bdaa1c265db731153e63b687d3d2ab69e2",
+      "bytes": 151655,
+      "label": "shared-recovered",
+      "enabled": true,
+      "suggest": false,
+      "accessEventsObserved": 4
+    },
+    {
+      "path": "images/06-suggest-composer-enabled.png",
+      "sha256": "9c596567c16bf317331ca02c0d1e0e1d6fb516a73f8bdd37305e6d8733fdeeaa",
+      "bytes": 152348,
+      "label": "suggest-composer-enabled",
+      "enabled": true,
+      "suggest": true,
+      "accessEventsObserved": 5
+    },
+    {
+      "path": "images/07-suggest-withdrawn-disabled.png",
+      "sha256": "0afb1206418d7d5d2e7c7251156c397025743c282be46d7c6e6add36e6f54aa5",
+      "bytes": 155240,
+      "label": "suggest-withdrawn-disabled",
+      "enabled": false,
+      "suggest": false,
+      "accessEventsObserved": 6
+    },
+    {
+      "path": "images/08-shared-final-restored.png",
+      "sha256": "491999704a547a5d028bfa1a62b7055e5f61b12ba36d0d89d13c7568252d9cad",
+      "bytes": 152589,
+      "label": "shared-final-restored",
+      "enabled": true,
+      "suggest": false,
+      "accessEventsObserved": 7
+    }
+  ]
+}

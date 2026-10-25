@@ -1,0 +1,79 @@
+{
+  "kind": "retained-original-source-hashes",
+  "status": "IMMUTABLE_EXPORT_SNAPSHOT",
+  "sourceHead": "460d0939aa0e61336a470e5b359ac5fc4cdd11bb",
+  "sourceTree": "d85955688e81a351efc4cb5f22271986fa7e7712",
+  "effectiveDiffSha256": "425881dd8ad5ee62cf48cea967716989aa42d91985898f7d652dcbb2d3ac3e18",
+  "originalsUnchangedDuringExport": true,
+  "sources": {
+    "owner-transport-02/owner-transport.ndjson": {
+      "sha256": "eb44d8a10a45e08327f45a2654afef3faaf24b15d8535fe7ee93a9d932e76779",
+      "bytes": 55328
+    },
+    "owner-transport-02/owner-transport-observations.json": {
+      "sha256": "644cc6ad73ed617e3695e40ff884113ebe1bddda35d8508de00c134b94d44a42",
+      "bytes": 12794218
+    },
+    "owner-transport-02/qualified-owner-transport.actual.json": {
+      "sha256": "201d66b4c1e9dc4b89dcb35f9d41770533be2dc2cf8f4a7506f0aa040eb05ba5",
+      "bytes": 12755
+    },
+    "ui-04/qualified-gateway-proof.actual.json": {
+      "sha256": "edbc905c1e94460a70ee9ecab2a5709c8d8e36667d9d1314db0ed3046adae8bb",
+      "bytes": 8594
+    },
+    "ui-04/artifacts/ui-result.json": {
+      "sha256": "58252542446d8a9d432c453956e30b5300ea54dc4174a8b2caca35c42bd175a6",
+      "bytes": 15264
+    },
+    "ui-04/artifacts/ui-report.json": {
+      "sha256": "7e313d3f422f64da74f61f19636ec146b6c6f84bbeb27531b6424860947522ab",
+      "bytes": 7042146
+    },
+    "ui-04/root-visual-review.actual.json": {
+      "sha256": "e5c23fb5667c54d5149a5ef465366204da3144dfa4ce12fe2e8767040d9f5622",
+      "bytes": 4948
+    },
+    "owner-transport-02/natural-join-witness.actual.json": {
+      "sha256": "bd40be616c09580e419b0873c71ee6fe6827b49906adddb6f7e9081ba2f56e34",
+      "bytes": 3512
+    },
+    "execution-preparations/B/owner-transport.worker-lifetime.prepared.mjs": {
+      "sha256": "0c501bd209f800d0250dd1bbc4707a97d8cbc6b92d5ac8fc92bf1fb066997a50",
+      "bytes": 33931
+    },
+    "ui-04/artifacts/access-live-tbK2vD/01-shared-before.png": {
+      "sha256": "297c49767f56d2ad69f9bbf30037e62238f3e0b88dd5a0acf999013a7d1c2b9a",
+      "bytes": 149035
+    },
+    "ui-04/artifacts/access-live-tbK2vD/02-read-only-disabled.png": {
+      "sha256": "4ff7ead06b0666c266597b3b41e59d91b6cfbc5bae4053c3073e06367163fbff",
+      "bytes": 154530
+    },
+    "ui-04/artifacts/access-live-tbK2vD/03-shared-restored.png": {
+      "sha256": "cf5450d1d39de7ce8a821d97b52e58bdaa1c265db731153e63b687d3d2ab69e2",
+      "bytes": 151655
+    },
+    "ui-04/artifacts/access-live-tbK2vD/04-draft-revoked-disabled.png": {
+      "sha256": "a511e4fa92e97912caaa48743df929934edb82264293402e5b7a02b4370d41a6",
+      "bytes": 155749
+    },
+    "ui-04/artifacts/access-live-tbK2vD/05-shared-recovered.png": {
+      "sha256": "cf5450d1d39de7ce8a821d97b52e58bdaa1c265db731153e63b687d3d2ab69e2",
+      "bytes": 151655
+    },
+    "ui-04/artifacts/access-live-tbK2vD/06-suggest-composer-enabled.png": {
+      "sha256": "9c596567c16bf317331ca02c0d1e0e1d6fb516a73f8bdd37305e6d8733fdeeaa",
+      "bytes": 152348
+    },
+    "ui-04/artifacts/access-live-tbK2vD/07-suggest-withdrawn-disabled.png": {
+      "sha256": "0afb1206418d7d5d2e7c7251156c397025743c282be46d7c6e6add36e6f54aa5",
+      "bytes": 155240
+    },
+    "ui-04/artifacts/access-live-tbK2vD/08-shared-final-restored.png": {
+      "sha256": "491999704a547a5d028bfa1a62b7055e5f61b12ba36d0d89d13c7568252d9cad",
+      "bytes": 152589
+    }
+  },
+  "publicationReceipt": "Recorded separately outside this immutable packet; no publication claim is made by this snapshot."
+}

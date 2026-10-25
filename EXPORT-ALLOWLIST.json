@@ -1,0 +1,41 @@
+{
+  "status": "IMMUTABLE_EXPORT_SNAPSHOT",
+  "operation": "Read and project ended actual evidence only; no proof rerun and no original mutation",
+  "traceRows": 155,
+  "topLevelAllowed": [
+    "seq",
+    "at",
+    "peer",
+    "direction",
+    "agentId",
+    "frame"
+  ],
+  "frameAllowed": [
+    "type",
+    "event",
+    "seq",
+    "recipientProfileId",
+    "payload"
+  ],
+  "sessionAccessPayloadAllowed": [
+    "agentId",
+    "sessionKey",
+    "sessionId",
+    "access"
+  ],
+  "barrierPayload": "one-to-one stable synthetic nonce alias, preserving pair correspondence",
+  "otherEventPayloads": "omitted entirely; event envelope retained",
+  "redacted": [
+    "all absolute paths",
+    "SQLite device/inode/birthtime identifiers",
+    "fixture injection stack text",
+    "session keys and instance identifiers",
+    "recipient profile UUIDs",
+    "barrier nonce UUIDs",
+    "all other frame payload fields"
+  ],
+  "identifierAliasing": "one-to-one stable synthetic aliases by field category; alias map intentionally not published",
+  "pngPolicy": "exact original PNG bytes, no pixel alterations or fabricated UI; current UI04 synthetic fixture, not historical PR169078",
+  "qualificationPolicy": "derived projections are not native receipts; original inner wholeProofPass=false retained, actual original source hashes retained separately; outer qualified result reported separately",
+  "publicationReceipt": "Recorded separately outside this immutable packet; no publication claim is made by this snapshot."
+}
