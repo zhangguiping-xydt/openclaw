@@ -1,0 +1,423 @@
+{
+  "kind": "public-field-allowlist-projection",
+  "notNativeReceipt": true,
+  "sourceHead": "a5c6206e9a5ebfe2161c707e5b84ec29c25e1f71",
+  "sourceTree": "fb16f54fe9f7e7eabffbbbe823d6014794a9ff1c",
+  "submittedDiffSha256": "794cd62f88184cc1eea6d216d83fe352af795f5a7b0a1eec2bd62934129076c4",
+  "cases": [
+    {
+      "phase": "before-publication",
+      "drift": "identity",
+      "authorityMutationIsFixtureOnly": true,
+      "recipientAccessFrames": 0,
+      "recipientAccessTransportSendCalls": 0,
+      "unaffectedControlFrames": 1,
+      "sameSocketStillOpen": true,
+      "prepared": 1,
+      "published": 1,
+      "targetSetInjections": 0,
+      "targetSetLine": 328,
+      "rawSeqWindow": [
+        34,
+        47
+      ],
+      "finalAccessFrameRows": {
+        "viewer": {
+          "transport-send": [],
+          "received": []
+        },
+        "control": {
+          "transport-send": [
+            34
+          ],
+          "received": [
+            39
+          ]
+        }
+      },
+      "finalAccessFrames": [
+        {
+          "rowId": 34,
+          "side": "control",
+          "direction": "transport-send",
+          "type": "event",
+          "event": "session.access.changed",
+          "seq": 5,
+          "recipientProfileId": "synthetic-recipientProfileId-2",
+          "payload": {
+            "agentId": "main",
+            "sessionKey": "synthetic-sessionKey-1",
+            "sessionId": "synthetic-sessionId-1",
+            "access": "read-only"
+          }
+        },
+        {
+          "rowId": 39,
+          "side": "control",
+          "direction": "received",
+          "type": "event",
+          "event": "session.access.changed",
+          "seq": 5,
+          "recipientProfileId": "synthetic-recipientProfileId-2",
+          "payload": {
+            "agentId": "main",
+            "sessionKey": "synthetic-sessionKey-1",
+            "sessionId": "synthetic-sessionId-1",
+            "access": "read-only"
+          }
+        }
+      ],
+      "viewerBarrierRows": [
+        43,
+        45
+      ],
+      "lateTargetSetInjectionRows": []
+    },
+    {
+      "phase": "before-publication",
+      "drift": "scopes",
+      "authorityMutationIsFixtureOnly": true,
+      "recipientAccessFrames": 0,
+      "recipientAccessTransportSendCalls": 0,
+      "unaffectedControlFrames": 1,
+      "sameSocketStillOpen": true,
+      "prepared": 1,
+      "published": 1,
+      "targetSetInjections": 0,
+      "targetSetLine": 328,
+      "scopeDriftMeaning": "write scope withdrawn; read/session-event scope remains allowed",
+      "rawSeqWindow": [
+        64,
+        77
+      ],
+      "finalAccessFrameRows": {
+        "viewer": {
+          "transport-send": [],
+          "received": []
+        },
+        "control": {
+          "transport-send": [
+            64
+          ],
+          "received": [
+            69
+          ]
+        }
+      },
+      "finalAccessFrames": [
+        {
+          "rowId": 64,
+          "side": "control",
+          "direction": "transport-send",
+          "type": "event",
+          "event": "session.access.changed",
+          "seq": 9,
+          "recipientProfileId": "synthetic-recipientProfileId-2",
+          "payload": {
+            "agentId": "main",
+            "sessionKey": "synthetic-sessionKey-1",
+            "sessionId": "synthetic-sessionId-1",
+            "access": "read-only"
+          }
+        },
+        {
+          "rowId": 69,
+          "side": "control",
+          "direction": "received",
+          "type": "event",
+          "event": "session.access.changed",
+          "seq": 9,
+          "recipientProfileId": "synthetic-recipientProfileId-2",
+          "payload": {
+            "agentId": "main",
+            "sessionKey": "synthetic-sessionKey-1",
+            "sessionId": "synthetic-sessionId-1",
+            "access": "read-only"
+          }
+        }
+      ],
+      "viewerBarrierRows": [
+        73,
+        75
+      ],
+      "lateTargetSetInjectionRows": []
+    },
+    {
+      "phase": "owner-minted-target-set",
+      "drift": "identity",
+      "authorityMutationIsFixtureOnly": true,
+      "recipientAccessFrames": 0,
+      "recipientAccessTransportSendCalls": 0,
+      "unaffectedControlFrames": 1,
+      "sameSocketStillOpen": true,
+      "prepared": 1,
+      "published": 1,
+      "targetSetInjections": 1,
+      "targetSetLine": 328,
+      "rawSeqWindow": [
+        94,
+        108
+      ],
+      "finalAccessFrameRows": {
+        "viewer": {
+          "transport-send": [],
+          "received": []
+        },
+        "control": {
+          "transport-send": [
+            95
+          ],
+          "received": [
+            100
+          ]
+        }
+      },
+      "finalAccessFrames": [
+        {
+          "rowId": 95,
+          "side": "control",
+          "direction": "transport-send",
+          "type": "event",
+          "event": "session.access.changed",
+          "seq": 13,
+          "recipientProfileId": "synthetic-recipientProfileId-2",
+          "payload": {
+            "agentId": "main",
+            "sessionKey": "synthetic-sessionKey-1",
+            "sessionId": "synthetic-sessionId-1",
+            "access": "read-only"
+          }
+        },
+        {
+          "rowId": 100,
+          "side": "control",
+          "direction": "received",
+          "type": "event",
+          "event": "session.access.changed",
+          "seq": 13,
+          "recipientProfileId": "synthetic-recipientProfileId-2",
+          "payload": {
+            "agentId": "main",
+            "sessionKey": "synthetic-sessionKey-1",
+            "sessionId": "synthetic-sessionId-1",
+            "access": "read-only"
+          }
+        }
+      ],
+      "viewerBarrierRows": [
+        104,
+        106
+      ],
+      "lateTargetSetInjectionRows": [
+        94
+      ]
+    },
+    {
+      "phase": "owner-minted-target-set",
+      "drift": "scopes",
+      "authorityMutationIsFixtureOnly": true,
+      "recipientAccessFrames": 0,
+      "recipientAccessTransportSendCalls": 0,
+      "unaffectedControlFrames": 1,
+      "sameSocketStillOpen": true,
+      "prepared": 1,
+      "published": 1,
+      "targetSetInjections": 1,
+      "targetSetLine": 328,
+      "scopeDriftMeaning": "write scope withdrawn; read/session-event scope remains allowed",
+      "rawSeqWindow": [
+        125,
+        139
+      ],
+      "finalAccessFrameRows": {
+        "viewer": {
+          "transport-send": [],
+          "received": []
+        },
+        "control": {
+          "transport-send": [
+            126
+          ],
+          "received": [
+            131
+          ]
+        }
+      },
+      "finalAccessFrames": [
+        {
+          "rowId": 126,
+          "side": "control",
+          "direction": "transport-send",
+          "type": "event",
+          "event": "session.access.changed",
+          "seq": 17,
+          "recipientProfileId": "synthetic-recipientProfileId-2",
+          "payload": {
+            "agentId": "main",
+            "sessionKey": "synthetic-sessionKey-1",
+            "sessionId": "synthetic-sessionId-1",
+            "access": "read-only"
+          }
+        },
+        {
+          "rowId": 131,
+          "side": "control",
+          "direction": "received",
+          "type": "event",
+          "event": "session.access.changed",
+          "seq": 17,
+          "recipientProfileId": "synthetic-recipientProfileId-2",
+          "payload": {
+            "agentId": "main",
+            "sessionKey": "synthetic-sessionKey-1",
+            "sessionId": "synthetic-sessionId-1",
+            "access": "read-only"
+          }
+        }
+      ],
+      "viewerBarrierRows": [
+        135,
+        137
+      ],
+      "lateTargetSetInjectionRows": [
+        125
+      ]
+    }
+  ],
+  "positiveTransitions": [
+    {
+      "transitionOrdinal": 1,
+      "access": "read-only",
+      "viewer": {
+        "transport-send": [
+          2
+        ],
+        "received": [
+          8
+        ]
+      },
+      "control": {
+        "transport-send": [
+          3
+        ],
+        "received": [
+          10
+        ]
+      }
+    },
+    {
+      "transitionOrdinal": 2,
+      "access": "read-write",
+      "viewer": {
+        "transport-send": [
+          18
+        ],
+        "received": [
+          24
+        ]
+      },
+      "control": {
+        "transport-send": [
+          19
+        ],
+        "received": [
+          26
+        ]
+      }
+    },
+    {
+      "transitionOrdinal": 4,
+      "access": "read-write",
+      "viewer": {
+        "transport-send": [
+          48
+        ],
+        "received": [
+          54
+        ]
+      },
+      "control": {
+        "transport-send": [
+          49
+        ],
+        "received": [
+          56
+        ]
+      }
+    },
+    {
+      "transitionOrdinal": 6,
+      "access": "read-write",
+      "viewer": {
+        "transport-send": [
+          78
+        ],
+        "received": [
+          84
+        ]
+      },
+      "control": {
+        "transport-send": [
+          79
+        ],
+        "received": [
+          86
+        ]
+      }
+    },
+    {
+      "transitionOrdinal": 8,
+      "access": "read-write",
+      "viewer": {
+        "transport-send": [
+          109
+        ],
+        "received": [
+          115
+        ]
+      },
+      "control": {
+        "transport-send": [
+          110
+        ],
+        "received": [
+          117
+        ]
+      }
+    },
+    {
+      "transitionOrdinal": 10,
+      "access": "read-write",
+      "viewer": {
+        "transport-send": [
+          140
+        ],
+        "received": [
+          146
+        ]
+      },
+      "control": {
+        "transport-send": [
+          141
+        ],
+        "received": [
+          148
+        ]
+      }
+    }
+  ],
+  "scopeMeaning": "operator.write withdrawn; operator.read and session-event scope remain allowed",
+  "rawInnerWholeProofPass": false,
+  "outerQualificationStatus": "OWNER_REAL_TRANSPORT_QUALIFIED_AFTER_NATIVE_NATURAL_JOIN",
+  "outerQualificationOk": true,
+  "finalFrameOracleAfterAllJoin": {
+    "viewer": 6,
+    "control": 10,
+    "owner": 0,
+    "nativeProcessGroupsRemaining": []
+  },
+  "limitations": [
+    "Identity/scope changes are explicit owner-composition fixtures, not silent public authentication changes.",
+    "Per-case final-I/O rows are distinct from totals, which include priming and restoration."
+  ]
+}

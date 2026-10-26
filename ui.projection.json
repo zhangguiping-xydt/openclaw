@@ -1,0 +1,210 @@
+{
+  "kind": "public-field-allowlist-projection",
+  "notNativeReceipt": true,
+  "sourceHead": "a5c6206e9a5ebfe2161c707e5b84ec29c25e1f71",
+  "sourceTree": "fb16f54fe9f7e7eabffbbbe823d6014794a9ff1c",
+  "submittedDiffSha256": "794cd62f88184cc1eea6d216d83fe352af795f5a7b0a1eec2bd62934129076c4",
+  "qualificationStatus": "QUALIFIED_REAL_GATEWAY_AND_NATURAL_JOIN",
+  "allOwnedActorsJoined": true,
+  "originalInnerWholeProofPass": false,
+  "rootPublicExportApproved": true,
+  "scopeLimit": "Trusted loopback identity peer; no external identity-provider or model-inference claim. Owner-composition drift is a separate lane.",
+  "visualScope": "Actual functional captures and DOM observations; no pixel/layout/geometry/performance claim.",
+  "gatewayModes": [
+    {
+      "mode": "wire",
+      "qualificationStatus": "QUALIFIED_REAL_GATEWAY_AND_NATURAL_JOIN",
+      "allOwnedActorsJoined": true,
+      "featurePass": true,
+      "originalSourceLabel": "A-wire/qualified.json"
+    },
+    {
+      "mode": "role-revocation",
+      "qualificationStatus": "QUALIFIED_REAL_GATEWAY_AND_NATURAL_JOIN",
+      "allOwnedActorsJoined": true,
+      "featurePass": true,
+      "originalSourceLabel": "A-role/qualified.json"
+    },
+    {
+      "mode": "ui",
+      "qualificationStatus": "QUALIFIED_REAL_GATEWAY_AND_NATURAL_JOIN",
+      "allOwnedActorsJoined": true,
+      "featurePass": true,
+      "originalSourceLabel": "A-ui/qualified.json"
+    }
+  ],
+  "images": [
+    {
+      "path": "images/01-shared-before.png",
+      "sha256": "28c06f987531499636430c53839cf82bd9c22f7db50e89731f1f572e13360b56",
+      "bytes": 148940,
+      "label": "shared-before",
+      "enabled": true,
+      "suggest": false,
+      "accessEventsObserved": 0,
+      "selectedSession": {
+        "sessionKey": "synthetic-sessionKey-2",
+        "sessionId": "synthetic-sessionId-2"
+      },
+      "rootActuallyViewedPixels": true,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "path": "images/02-read-only-disabled.png",
+      "sha256": "d019a5309a122e7b7115e03c40208bdd05ae5b37d82b2ac7289e16cb8157b34f",
+      "bytes": 154275,
+      "label": "read-only-disabled",
+      "enabled": false,
+      "suggest": false,
+      "accessEventsObserved": 1,
+      "selectedSession": {
+        "sessionKey": "synthetic-sessionKey-2",
+        "sessionId": "synthetic-sessionId-2"
+      },
+      "rootActuallyViewedPixels": true,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "path": "images/03-shared-restored.png",
+      "sha256": "04e333302ba0f42674874d3cb66821b316036acc3f8d415bf110a5a2e6d3e90d",
+      "bytes": 151311,
+      "label": "shared-restored",
+      "enabled": true,
+      "suggest": false,
+      "accessEventsObserved": 2,
+      "selectedSession": {
+        "sessionKey": "synthetic-sessionKey-2",
+        "sessionId": "synthetic-sessionId-2"
+      },
+      "rootActuallyViewedPixels": true,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "path": "images/04-draft-revoked-disabled.png",
+      "sha256": "1072207a6cc87889d42a2ed8c31bf144ba68d027902a3d1d5686835468840a04",
+      "bytes": 155493,
+      "label": "draft-revoked-disabled",
+      "enabled": false,
+      "suggest": false,
+      "accessEventsObserved": 3,
+      "selectedSession": {
+        "sessionKey": "synthetic-sessionKey-2",
+        "sessionId": "synthetic-sessionId-2"
+      },
+      "rootActuallyViewedPixels": true,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "path": "images/05-shared-recovered.png",
+      "sha256": "04e333302ba0f42674874d3cb66821b316036acc3f8d415bf110a5a2e6d3e90d",
+      "bytes": 151311,
+      "label": "shared-recovered",
+      "enabled": true,
+      "suggest": false,
+      "accessEventsObserved": 4,
+      "selectedSession": {
+        "sessionKey": "synthetic-sessionKey-2",
+        "sessionId": "synthetic-sessionId-2"
+      },
+      "rootActuallyViewedPixels": true,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "path": "images/06-suggest-composer-enabled.png",
+      "sha256": "f7339443b2932acc912b85abd871908b5f1aeb784e1001af66fa03eafc85164d",
+      "bytes": 152149,
+      "label": "suggest-composer-enabled",
+      "enabled": true,
+      "suggest": true,
+      "accessEventsObserved": 5,
+      "selectedSession": {
+        "sessionKey": "synthetic-sessionKey-2",
+        "sessionId": "synthetic-sessionId-2"
+      },
+      "rootActuallyViewedPixels": true,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "path": "images/07-suggest-withdrawn-disabled.png",
+      "sha256": "98b74dc4e2006d674ec2ddc27a658f5be7ebd15d6b68ae4c598ab6001afcbf24",
+      "bytes": 154971,
+      "label": "suggest-withdrawn-disabled",
+      "enabled": false,
+      "suggest": false,
+      "accessEventsObserved": 6,
+      "selectedSession": {
+        "sessionKey": "synthetic-sessionKey-2",
+        "sessionId": "synthetic-sessionId-2"
+      },
+      "rootActuallyViewedPixels": true,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "path": "images/08-shared-final-restored.png",
+      "sha256": "6697b143774b5f2185b292e37fafcbdce0afea10a8ab86f455349e1bedfb7cc5",
+      "bytes": 152346,
+      "label": "shared-final-restored",
+      "enabled": true,
+      "suggest": false,
+      "accessEventsObserved": 7,
+      "selectedSession": {
+        "sessionKey": "synthetic-sessionKey-2",
+        "sessionId": "synthetic-sessionId-2"
+      },
+      "rootActuallyViewedPixels": true,
+      "width": 1280,
+      "height": 960
+    }
+  ],
+  "accessEvents": [
+    {
+      "agentId": "main",
+      "sessionKey": "synthetic-sessionKey-2",
+      "sessionId": "synthetic-sessionId-2",
+      "access": "read-only"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "synthetic-sessionKey-2",
+      "sessionId": "synthetic-sessionId-2",
+      "access": "read-write"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "synthetic-sessionKey-2",
+      "sessionId": "synthetic-sessionId-2",
+      "access": "revoked"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "synthetic-sessionKey-2",
+      "sessionId": "synthetic-sessionId-2",
+      "access": "read-write"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "synthetic-sessionKey-2",
+      "sessionId": "synthetic-sessionId-2",
+      "access": "read-only"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "synthetic-sessionKey-2",
+      "sessionId": "synthetic-sessionId-2",
+      "access": "revoked"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "synthetic-sessionKey-2",
+      "sessionId": "synthetic-sessionId-2",
+      "access": "read-write"
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "status": "IMMUTABLE_EXPORT_SNAPSHOT",
+  "operation": "Read ended actual evidence and derive field projections only; no proof rerun or original mutation",
+  "literalPublicPaths": [
+    "EXPORT-ALLOWLIST.json",
+    "MANIFEST.sha256",
+    "README.md",
+    "SOURCE-ARTIFACTS.json",
+    "images/01-shared-before.png",
+    "images/02-read-only-disabled.png",
+    "images/03-shared-restored.png",
+    "images/04-draft-revoked-disabled.png",
+    "images/05-shared-recovered.png",
+    "images/06-suggest-composer-enabled.png",
+    "images/07-suggest-withdrawn-disabled.png",
+    "images/08-shared-final-restored.png",
+    "owner-transport.cases.projection.json",
+    "owner-transport.redacted.ndjson",
+    "ui.projection.json"
+  ],
+  "traceRows": 155,
+  "topLevelAllowed": [
+    "agentId",
+    "at",
+    "direction",
+    "frame",
+    "peer",
+    "seq"
+  ],
+  "frameAllowed": [
+    "event",
+    "payload",
+    "recipientProfileId",
+    "seq",
+    "type"
+  ],
+  "sessionAccessPayloadAllowed": [
+    "access",
+    "agentId",
+    "sessionId",
+    "sessionKey"
+  ],
+  "actualTraceDirectionsAllowed": [
+    "canonical-physical-sqlite-source",
+    "fixture-only-authority-drift-at-target-set",
+    "transport-send",
+    "received"
+  ],
+  "actualFrameEventsAllowed": [
+    "proof.owner.barrier",
+    "session.access.changed",
+    "session.sharing"
+  ],
+  "otherEventPayloads": "Omitted entirely; allowed event envelope remains",
+  "identifierAliasing": "One-to-one category-stable synthetic aliases; the original-to-alias map is not exported",
+  "barrierPayload": "One-to-one nonce aliases retaining actual send/receive equality",
+  "redacted": [
+    "absolute local paths",
+    "configuration and SQLite contents/physical identities",
+    "fixture stack text",
+    "raw session keys/IDs and recipient profile UUIDs",
+    "raw nonce UUIDs",
+    "all non-allowlisted frame payload fields"
+  ],
+  "pngPolicy": "Exact same-run sealed PNG bytes; all eight personally viewed and approved for public export by root",
+  "qualificationPolicy": "Projections are not native receipts. Original inner status remains unchanged; separate ended outer qualifications remain distinct."
+}
