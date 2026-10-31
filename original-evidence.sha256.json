@@ -1,0 +1,57 @@
+{
+  "representation": "SHA references only; raw local logs/configs/tokens are intentionally not published.",
+  "artifacts": [
+    {
+      "artifact": "native-runtime-validation",
+      "sha256": "b501b24a3037ee00c37ea7ee9713ee295acf3ae6d52043c0725d26cabd1195ee"
+    },
+    {
+      "artifact": "outer-runtime-alljoin",
+      "sha256": "9e18e096e24ca6188ad5c466cfbe1815f2dff24e3f6fc35778a534f6659f3b5f"
+    },
+    {
+      "artifact": "ui-feature-report",
+      "sha256": "6c6aa3196876c86c8ef0bd414ca9c482797ad02b6e68e5c147a71fbf083ccad1"
+    },
+    {
+      "artifact": "ui-original-child-result",
+      "sha256": "afaf39e3b72c840e009bd7a6b173096fb048ed5aa8b11a2bc2cd564f82839ea4"
+    },
+    {
+      "artifact": "native-runtime-bounded-status",
+      "sha256": "56e895cee3f9d4443ca8344ed2f379fa70509e3fbfaa6e9e7f6cdabb325bc3a9"
+    },
+    {
+      "artifact": "native-runtime-import-provenance",
+      "sha256": "7b0d7caf859099e9143620358683e59fa04afd6d843153d360356e83ccbec3c4"
+    },
+    {
+      "artifact": "sealed-runtime-binding",
+      "sha256": "06c215d9596e7aea9fd7561435f25965945b46f2fe38df7ade95a8f13da055e4"
+    },
+    {
+      "artifact": "normal128-install",
+      "sha256": "92645587cb847003758f0420e8e39242acec58fcc37cf975b8603088642f25fd"
+    },
+    {
+      "artifact": "normal-cli-build",
+      "sha256": "cb3b38490060d8d6de282f491c21b675870f2ece27035ccbed86438b4aa51b93"
+    },
+    {
+      "artifact": "normal-ui-build",
+      "sha256": "38567be6f972bfe766c85d99142a973c03590e19e0e887e3a344aa73a40ce1dd"
+    },
+    {
+      "artifact": "normal128-install-supervision",
+      "sha256": "496bf7759d830f5c43ee4c1b3bcd343826dcc8a621ef207c834301c98cd2cb40"
+    },
+    {
+      "artifact": "normal-cli-build-alljoin",
+      "sha256": "c1569fc7399d4e0c5bdff19acc83ebbdde820e40e34fe7e213b0a688611e19c6"
+    },
+    {
+      "artifact": "normal-ui-build-alljoin",
+      "sha256": "cbf5385ddc8cc813131f745e1f195d0d710dece25241da8e8366348a90b0a2fc"
+    }
+  ]
+}

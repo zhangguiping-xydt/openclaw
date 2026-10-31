@@ -1,0 +1,292 @@
+{
+  "kind": "pr179661.public-production-ui-projection.v1",
+  "candidate": {
+    "head": "18c1c978701d533b4600a7d618784204882b4afb",
+    "workingTreeIncludesTwoUncommittedEdits": true,
+    "candidateTree": "5642f750a7ef18405f663dbf09cf6121b02ff880",
+    "effectiveDiffSha256": "026c045b5b520f52f0ec39d657c775daaf9ecfb72078314405791249916a0fb6",
+    "workingDiffSha256": "70f2669961b1296dce6184ad6ebb127b504958fc52c6fa8f01d72095ba41d70c",
+    "workingStatusSha256": "b95736c9649b5e00878dd549c690196449f07b31b02b9fe53503e04580b67c9d"
+  },
+  "proofBoundary": "real Gateway / production browser UI / trusted-proxy synthetic viewer / metadata-only / no inference / no external IdP",
+  "scope": "Optional explicit session.access.changed proposal; not a new claim that closed112760 remains broken.",
+  "stateCount": 8,
+  "eventCount": 7,
+  "observations": [
+    {
+      "label": "shared-before",
+      "enabled": true,
+      "suggest": false,
+      "draftRetained": null,
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "accessEvents": 0,
+      "image": "01-shared-before.png",
+      "sha256": "3303744b9687450a6a80a054808100b5cfb3319844fd522b48566d15874220cb"
+    },
+    {
+      "label": "read-only-disabled",
+      "enabled": false,
+      "suggest": false,
+      "draftRetained": null,
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "accessEvents": 1,
+      "image": "02-read-only-disabled.png",
+      "sha256": "8ca2f1565a4c50672717fefcb9a4fa3f3c351e5c0d65182caeb3f0d6181907b3"
+    },
+    {
+      "label": "shared-restored",
+      "enabled": true,
+      "suggest": false,
+      "draftRetained": null,
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "accessEvents": 2,
+      "image": "03-shared-restored.png",
+      "sha256": "8a1b11c595f12f812720ae8a9277f4b48a90da4289061eafcc9787a2d6e3d2b5"
+    },
+    {
+      "label": "draft-revoked-disabled",
+      "enabled": false,
+      "suggest": false,
+      "draftRetained": null,
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "accessEvents": 3,
+      "image": "04-draft-revoked-disabled.png",
+      "sha256": "ccbeb5c6475ab603b8ffe7731c21a22e8ef7d1f3c48668280d25de6e4d98db7b"
+    },
+    {
+      "label": "shared-recovered",
+      "enabled": true,
+      "suggest": false,
+      "draftRetained": null,
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "accessEvents": 4,
+      "image": "05-shared-recovered.png",
+      "sha256": "8a1b11c595f12f812720ae8a9277f4b48a90da4289061eafcc9787a2d6e3d2b5"
+    },
+    {
+      "label": "suggest-composer-enabled",
+      "enabled": true,
+      "suggest": true,
+      "draftRetained": true,
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "accessEvents": 5,
+      "image": "06-suggest-composer-enabled.png",
+      "sha256": "8fe52cba94cd20209a0363f57a489281489648bc60ff6d230e4e1ab9254daff2"
+    },
+    {
+      "label": "suggest-withdrawn-disabled",
+      "enabled": false,
+      "suggest": false,
+      "draftRetained": true,
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "accessEvents": 6,
+      "image": "07-suggest-withdrawn-disabled.png",
+      "sha256": "9c39ffd01d7ee0a29e9b212137f91ffd9b0d433a1211afe633447f02f8640ecc"
+    },
+    {
+      "label": "shared-final-restored",
+      "enabled": true,
+      "suggest": false,
+      "draftRetained": true,
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "accessEvents": 7,
+      "image": "08-shared-final-restored.png",
+      "sha256": "a1932a67b696edc05a1ef5b5b7334bf03c11bc9d678aba6e0a4efbe81b8cfb0f"
+    }
+  ],
+  "accessEvents": [
+    {
+      "agentId": "main",
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "access": "read-only"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "access": "read-write"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "access": "revoked"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "access": "read-write"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "access": "read-only"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "access": "revoked"
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "agent:main:proof112760-ui-f24d20b6-53e2-4b2a-9c56-9027e0fd1db9",
+      "sessionId": "93906d4a-f423-401b-a668-75004d8634fb",
+      "access": "read-write"
+    }
+  ],
+  "syntheticIdentityOnly": true,
+  "qualification": {
+    "nativeRuntimeId": "1793439058311",
+    "nativeExit": 0,
+    "nativeRuntimeMs": 26530,
+    "outerWallSeconds": 47.566505625029095,
+    "featurePass": true,
+    "allOwnedActorsJoined": true,
+    "sourceUnchangedDuringProof": true,
+    "importProvenanceVerified": true,
+    "forcedCleanup": false,
+    "remainingActors": [],
+    "remainingProxySockets": 0,
+    "remainingProxyHandlers": 0,
+    "remainingPortClaims": 0,
+    "modelRequests": 0,
+    "modelTurnProved": false,
+    "externalIdpProved": false,
+    "originalChildWholeProofPass": false,
+    "originalChildNativeLifecyclePending": true,
+    "outerFinalizationExplanation": "Original UI child pending/false is preserved. Parent report observed feature/lifecycle; separate native exit0 plus outer natural alljoin closes whole lifecycle. No original field was rewritten.",
+    "normalGatewayShutdown": "Authenticated Gateway status identified task-owned PID/start; normal SIGTERM led to clean shutdown and CLI exit0; no SIGKILL or forced cleanup."
+  },
+  "images": [
+    {
+      "file": "01-shared-before.png",
+      "sha256": "3303744b9687450a6a80a054808100b5cfb3319844fd522b48566d15874220cb",
+      "bytes": 129293,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "file": "02-read-only-disabled.png",
+      "sha256": "8ca2f1565a4c50672717fefcb9a4fa3f3c351e5c0d65182caeb3f0d6181907b3",
+      "bytes": 129589,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "file": "03-shared-restored.png",
+      "sha256": "8a1b11c595f12f812720ae8a9277f4b48a90da4289061eafcc9787a2d6e3d2b5",
+      "bytes": 129806,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "file": "04-draft-revoked-disabled.png",
+      "sha256": "ccbeb5c6475ab603b8ffe7731c21a22e8ef7d1f3c48668280d25de6e4d98db7b",
+      "bytes": 130793,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "file": "05-shared-recovered.png",
+      "sha256": "8a1b11c595f12f812720ae8a9277f4b48a90da4289061eafcc9787a2d6e3d2b5",
+      "bytes": 129806,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "file": "06-suggest-composer-enabled.png",
+      "sha256": "8fe52cba94cd20209a0363f57a489281489648bc60ff6d230e4e1ab9254daff2",
+      "bytes": 130552,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "file": "07-suggest-withdrawn-disabled.png",
+      "sha256": "9c39ffd01d7ee0a29e9b212137f91ffd9b0d433a1211afe633447f02f8640ecc",
+      "bytes": 130125,
+      "width": 1280,
+      "height": 960
+    },
+    {
+      "file": "08-shared-final-restored.png",
+      "sha256": "a1932a67b696edc05a1ef5b5b7334bf03c11bc9d678aba6e0a4efbe81b8cfb0f",
+      "bytes": 130708,
+      "width": 1280,
+      "height": 960
+    }
+  ],
+  "originalEvidenceSha256": [
+    {
+      "artifact": "native-runtime-validation",
+      "sha256": "b501b24a3037ee00c37ea7ee9713ee295acf3ae6d52043c0725d26cabd1195ee"
+    },
+    {
+      "artifact": "outer-runtime-alljoin",
+      "sha256": "9e18e096e24ca6188ad5c466cfbe1815f2dff24e3f6fc35778a534f6659f3b5f"
+    },
+    {
+      "artifact": "ui-feature-report",
+      "sha256": "6c6aa3196876c86c8ef0bd414ca9c482797ad02b6e68e5c147a71fbf083ccad1"
+    },
+    {
+      "artifact": "ui-original-child-result",
+      "sha256": "afaf39e3b72c840e009bd7a6b173096fb048ed5aa8b11a2bc2cd564f82839ea4"
+    },
+    {
+      "artifact": "native-runtime-bounded-status",
+      "sha256": "56e895cee3f9d4443ca8344ed2f379fa70509e3fbfaa6e9e7f6cdabb325bc3a9"
+    },
+    {
+      "artifact": "native-runtime-import-provenance",
+      "sha256": "7b0d7caf859099e9143620358683e59fa04afd6d843153d360356e83ccbec3c4"
+    },
+    {
+      "artifact": "sealed-runtime-binding",
+      "sha256": "06c215d9596e7aea9fd7561435f25965945b46f2fe38df7ade95a8f13da055e4"
+    },
+    {
+      "artifact": "normal128-install",
+      "sha256": "92645587cb847003758f0420e8e39242acec58fcc37cf975b8603088642f25fd"
+    },
+    {
+      "artifact": "normal-cli-build",
+      "sha256": "cb3b38490060d8d6de282f491c21b675870f2ece27035ccbed86438b4aa51b93"
+    },
+    {
+      "artifact": "normal-ui-build",
+      "sha256": "38567be6f972bfe766c85d99142a973c03590e19e0e887e3a344aa73a40ce1dd"
+    },
+    {
+      "artifact": "normal128-install-supervision",
+      "sha256": "496bf7759d830f5c43ee4c1b3bcd343826dcc8a621ef207c834301c98cd2cb40"
+    },
+    {
+      "artifact": "normal-cli-build-alljoin",
+      "sha256": "c1569fc7399d4e0c5bdff19acc83ebbdde820e40e34fe7e213b0a688611e19c6"
+    },
+    {
+      "artifact": "normal-ui-build-alljoin",
+      "sha256": "cbf5385ddc8cc813131f745e1f195d0d710dece25241da8e8366348a90b0a2fc"
+    }
+  ],
+  "notClaimed": [
+    "Paid/live model inference",
+    "External identity provider",
+    "New role-change lane proof",
+    "Historical four-case final-authority lane as current proof",
+    "Apple/native platform/live tenant proof",
+    "Maintainer acceptance of optional proposal"
+  ]
+}
