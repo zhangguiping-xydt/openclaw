@@ -33,6 +33,8 @@ try:
         expected = '3 passed' if mode == 'green' else '3 failed'
         assert (result.returncode == 0) == (mode == 'green'), (mode, result.returncode)
         assert re.search(r'Tests\s+.*' + expected, text), (mode, 'assertions not reached')
+        if mode == 'red':
+            assert re.search(r'promise resolved.*instead of rejecting', text, re.I), 'RED must be the expected acceptance defect'
         for option in ['script', 'trigger-script', 'file']:
             assert f'rejects FIFO --{option} inputs without a Gateway mutation' in text
         results.append({'mode': mode, 'exitCode': result.returncode, 'testSha256': test_hash,
