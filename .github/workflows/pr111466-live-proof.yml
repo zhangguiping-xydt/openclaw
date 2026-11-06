@@ -1,7 +1,6 @@
 name: PR 194059 real cron FIFO proof
 on:
-  push:
-    branches: [proof/pr194059-cron-fifo]
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
