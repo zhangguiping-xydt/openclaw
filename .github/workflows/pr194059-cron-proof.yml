@@ -1,0 +1,83 @@
+name: PR 194059 real cron FIFO proof
+on:
+  push:
+    branches: [proof/pr194059-cron-fifo]
+permissions:
+  contents: read
+concurrency:
+  group: pr194059-cron-fifo-proof
+  cancel-in-progress: false
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout proof collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: proof-control
+          persist-credentials: false
+      - name: Checkout exact PR source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: openclaw/openclaw
+          ref: 4aedd1ddf20b4d1806c7f9b864737bda7d646cab
+          path: product
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '24.22.2'
+          package-manager-cache: false
+      - name: Setup pinned pnpm
+        run: npm install --global pnpm@12.15.0
+      - name: Prepare isolated evidence environment
+        run: |
+          mkdir -p "$RUNNER_TEMP/proof-home" "$RUNNER_TEMP/cron-proof" "$RUNNER_TEMP/proof-public"
+          cp proof-control/proof/cron-proof.mjs "$RUNNER_TEMP/cron-proof/cron-proof.mjs"
+          cp proof-control/proof/red-green.py "$RUNNER_TEMP/cron-proof/red-green.py"
+          cp proof-control/proof/sanitize.py "$RUNNER_TEMP/cron-proof/sanitize.py"
+          free -h
+          df -h .
+      - name: Frozen dependency install
+        working-directory: product
+        run: |
+          set -o pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/proof-home" CI=1 \
+            pnpm install --frozen-lockfile 2>&1 | tee "$RUNNER_TEMP/cron-proof/install.log"
+          test "$(git rev-parse HEAD)" = 4aedd1ddf20b4d1806c7f9b864737bda7d646cab
+          test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Build current-head shipped CLI
+        working-directory: product
+        run: |
+          set -o pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/proof-home" CI=1 NODE_OPTIONS=--max-old-space-size=4096 \
+            OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 \
+            pnpm exec node --import ./scripts/tsx.mjs scripts/build-all.mts cliStartup \
+            2>&1 | tee "$RUNNER_TEMP/cron-proof/build.log"
+      - name: Real CLI and real isolated Gateway proof
+        working-directory: product
+        run: |
+          set -o pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/proof-home" CI=1 NO_COLOR=1 NODE_OPTIONS=--max-old-space-size=2048 \
+            OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 CRON_PROOF_OUTPUT="$RUNNER_TEMP/cron-proof" \
+            node "$RUNNER_TEMP/cron-proof/cron-proof.mjs" green \
+            2>&1 | tee "$RUNNER_TEMP/cron-proof/green-cli.log"
+      - name: Added FIFO regressions fail on base and pass on fixed head
+        working-directory: product
+        run: |
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/proof-home" CI=1 NO_COLOR=1 NODE_OPTIONS=--max-old-space-size=4096 \
+            OPENCLAW_VITEST_RUNTIME=node OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 \
+            python3 "$RUNNER_TEMP/cron-proof/red-green.py"
+      - name: Export redacted evidence only
+        if: always()
+        run: python3 "$RUNNER_TEMP/cron-proof/sanitize.py" "$RUNNER_TEMP/cron-proof" "$RUNNER_TEMP/proof-public"
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pr194059-exact-head-cron-proof
+          path: ${{ runner.temp }}/proof-public/
+          if-no-files-found: error
+          retention-days: 30
