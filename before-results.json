@@ -1,0 +1,118 @@
+[
+  {
+    "id": "two-buttons",
+    "stdout": "/proof/before-two-buttons.svg (87440 bytes)",
+    "centres": [
+      {
+        "expected": {
+          "x": 138,
+          "y": 127.12000000000002
+        },
+        "observed": {
+          "x": 111.57026529219993,
+          "y": 129.8778755288591
+        },
+        "error": 26.573233791869804
+      },
+      {
+        "expected": {
+          "x": 426.00000000000006,
+          "y": 118.04
+        },
+        "observed": {
+          "x": 450.54189617447713,
+          "y": 120.57946485878256
+        },
+        "error": 24.672931516295424
+      }
+    ],
+    "pass": false
+  },
+  {
+    "id": "left-exit-12",
+    "stdout": "/proof/before-left-exit-12.svg (86924 bytes)",
+    "centres": [
+      {
+        "expected": {
+          "x": 257.28000000000003,
+          "y": 134.225
+        },
+        "observed": {
+          "x": 238.61929502368505,
+          "y": 135.5034665901066
+        },
+        "error": 18.704448322126087
+      },
+      {
+        "expected": {
+          "x": 530.64,
+          "y": 126.555
+        },
+        "observed": {
+          "x": 550.3980564176293,
+          "y": 128.15184086373856
+        },
+        "error": 19.822479515598626
+      }
+    ],
+    "pass": false
+  },
+  {
+    "id": "change-my-mind",
+    "stdout": "/proof/before-change-my-mind.svg (108011 bytes)",
+    "centres": [
+      {
+        "expected": {
+          "x": 226.54,
+          "y": 187.72
+        },
+        "observed": {
+          "x": 206.8781358352039,
+          "y": 188.73251193434848
+        },
+        "error": 19.687917179125147
+      },
+      {
+        "expected": {
+          "x": 241,
+          "y": 43.32
+        },
+        "observed": {
+          "x": 241,
+          "y": 43.29999923706055
+        },
+        "error": 0.02000076293945341
+      }
+    ],
+    "pass": false
+  },
+  {
+    "id": "drake",
+    "stdout": "/proof/before-drake.svg (124477 bytes)",
+    "centres": [
+      {
+        "expected": {
+          "x": 882,
+          "y": 288
+        },
+        "observed": {
+          "x": 882,
+          "y": 288
+        },
+        "error": 0
+      },
+      {
+        "expected": {
+          "x": 882,
+          "y": 888
+        },
+        "observed": {
+          "x": 882,
+          "y": 888
+        },
+        "error": 0
+      }
+    ],
+    "pass": true
+  }
+]
