@@ -1,0 +1,23 @@
+{
+  "phase": "verified",
+  "source_sha256": "4e0b68ffdd820d45cf70e64fee0e871f804625f90bf548c1d7b03a057b777402",
+  "command": "bash scripts/changelog-to-html.sh 2026.10.10 CHANGELOG/2026.10.10.md",
+  "browser": "138.0.7204.157",
+  "observed": [
+    {
+      "expected": "openclaw cron enable <job-id>",
+      "observed": "openclaw cron enable <job-id>",
+      "pass": true
+    },
+    {
+      "expected": "openclaw plugins enable <plugin-id>",
+      "observed": "openclaw plugins enable <plugin-id>",
+      "pass": true
+    },
+    {
+      "expected": "/learn undo <id>",
+      "observed": "/learn undo <id>",
+      "pass": true
+    }
+  ]
+}
