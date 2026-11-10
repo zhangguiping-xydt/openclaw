@@ -1,0 +1,24 @@
+{
+  "source_sha256": "212f5c7e6e36329218329bf49b4d340086729016c17560a3eff1ba2a3e26cb5e",
+  "valid_control": "Real CLI succeeds with whole seconds, nine-digit fractions, and Unicode; generated five files",
+  "records": [
+    {
+      "timestamp": "2026-13-10T12:00:00Z",
+      "exit": 1,
+      "unchanged_files": true,
+      "files_added": [],
+      "files_changed": [],
+      "stderr": "file:///src/extensions/knowledge/skills/knowledge-source-ingest/scripts/chat-transcript.mjs:247\n      throw new Error(\"Row \" + row.id + \" needs a valid UTC occurred_at\");\n            ^\n\nError: Row bad needs a valid UTC occurred_at\n    at run (file:///src/extensions/knowledge/skills/knowledge-source-ingest/scripts/chat-transcript.mjs:247:13)\n    at async file:///src/extensions/knowledge/skills/knowledge-source-ingest/scripts/chat-transcript.mjs:274:1\n\nNode.js v24.22.2\n",
+      "pass": true
+    },
+    {
+      "timestamp": "2026-10-02T25:00:00Z",
+      "exit": 1,
+      "unchanged_files": true,
+      "files_added": [],
+      "files_changed": [],
+      "stderr": "file:///src/extensions/knowledge/skills/knowledge-source-ingest/scripts/chat-transcript.mjs:247\n      throw new Error(\"Row \" + row.id + \" needs a valid UTC occurred_at\");\n            ^\n\nError: Row bad needs a valid UTC occurred_at\n    at run (file:///src/extensions/knowledge/skills/knowledge-source-ingest/scripts/chat-transcript.mjs:247:13)\n    at async file:///src/extensions/knowledge/skills/knowledge-source-ingest/scripts/chat-transcript.mjs:274:1\n\nNode.js v24.22.2\n",
+      "pass": true
+    }
+  ]
+}

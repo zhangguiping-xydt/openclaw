@@ -1,0 +1,36 @@
+{
+  "source_sha256": "7da78d7c2d37df977a931224a3005c2b691fd4df117d35c42a5b0ae0a7359aa2",
+  "valid_control": "Real CLI succeeds with whole seconds, nine-digit fractions, and Unicode; generated five files",
+  "records": [
+    {
+      "timestamp": "2026-13-10T12:00:00Z",
+      "exit": 1,
+      "unchanged_files": false,
+      "files_added": [
+        "2026-13-10.jsonl",
+        "2026-13-10.txt"
+      ],
+      "files_changed": [
+        "2026-10-01.jsonl",
+        "2026-10-01.txt"
+      ],
+      "stderr": "file:///src/extensions/knowledge/skills/knowledge-source-ingest/scripts/chat-transcript.mjs:231\n        coverage_end: new Date(Date.parse(day) + 86400000).toISOString(),\n                                                           ^\n\nRangeError: Invalid time value\n    at Date.toISOString (<anonymous>)\n    at writeDay (file:///src/extensions/knowledge/skills/knowledge-source-ingest/scripts/chat-transcript.mjs:231:60)\n    at async run (file:///src/extensions/knowledge/skills/knowledge-source-ingest/scripts/chat-transcript.mjs:259:21)\n    at async file:///src/extensions/knowledge/skills/knowledge-source-ingest/scripts/chat-transcript.mjs:274:1\n\nNode.js v24.22.2\n",
+      "pass": false
+    },
+    {
+      "timestamp": "2026-10-02T25:00:00Z",
+      "exit": 0,
+      "unchanged_files": false,
+      "files_added": [],
+      "files_changed": [
+        "2026-10-01.jsonl",
+        "2026-10-01.txt",
+        "2026-10-02.jsonl",
+        "2026-10-02.txt",
+        "chunks.json"
+      ],
+      "stderr": "",
+      "pass": false
+    }
+  ]
+}
