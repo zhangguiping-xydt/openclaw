@@ -1,0 +1,72 @@
+{
+  "mode": "verified",
+  "runtime": "v24.22.2",
+  "git_paths": {
+    "argv": [
+      "git",
+      "ls-files"
+    ],
+    "exit": 0,
+    "stdout": "README.md\n\"docs/guide/line\\nbreak.md\"\n\"docs/guide/quote\\\"name.md\"\n\"docs/guide/\\346\\214\\207\\345\\215\\227.md\"\ndocs/root.md\ndocs/root.mdx\n",
+    "stderr": ""
+  },
+  "raw_paths": {
+    "argv": [
+      "git",
+      "ls-files",
+      "-z",
+      "docs/**/*.md",
+      "docs/**/*.mdx",
+      "README.md"
+    ],
+    "exit": 0,
+    "stdout": "README.md\u0000docs/guide/line\nbreak.md\u0000docs/guide/quote\"name.md\u0000docs/guide/指南.md\u0000",
+    "stderr": ""
+  },
+  "source_line": [
+    "  const result = spawnSync(\"git\", args, {"
+  ],
+  "check": {
+    "argv": [
+      "node",
+      "--import",
+      "./scripts/tsx.mjs",
+      "scripts/format-docs.mts",
+      "--check"
+    ],
+    "exit": 1,
+    "stdout": "",
+    "stderr": "Format issues found in 5 docs file(s):\n- docs/guide/line\nbreak.md\n- docs/guide/quote\"name.md\n- docs/guide/指南.md\n- docs/root.md\n- docs/root.mdx\n"
+  },
+  "write": {
+    "argv": [
+      "node",
+      "--import",
+      "./scripts/tsx.mjs",
+      "scripts/format-docs.mts"
+    ],
+    "exit": 0,
+    "stdout": "Docs formatting clean (6 files).\n",
+    "stderr": ""
+  },
+  "original": "# Guide\n\n-   first\n-   second\n",
+  "files": {
+    "docs/root.md": "# Guide\n\n- first\n- second\n",
+    "docs/root.mdx": "# Guide\n\n- first\n- second\n",
+    "docs/guide/指南.md": "# Guide\n\n- first\n- second\n",
+    "docs/guide/quote\"name.md": "# Guide\n\n- first\n- second\n",
+    "docs/guide/line\nbreak.md": "# Guide\n\n- first\n- second\n"
+  },
+  "check_after": {
+    "argv": [
+      "node",
+      "--import",
+      "./scripts/tsx.mjs",
+      "scripts/format-docs.mts",
+      "--check"
+    ],
+    "exit": 0,
+    "stdout": "Docs formatting clean (6 files).\n",
+    "stderr": ""
+  }
+}
