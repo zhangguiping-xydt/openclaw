@@ -1,0 +1,74 @@
+[
+  {
+    "stage": "before",
+    "sourceSha256": "ea06b2d3e08abff82911ec8f55e14a3613e48a095ee55ea84c8070ac4efaf3d7"
+  },
+  {
+    "event": "IME Enter keyCode=229",
+    "selected": "true",
+    "draft": "open",
+    "queryRequests": [
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      }
+    ],
+    "chips": [
+      "Providerisopenai"
+    ]
+  },
+  {
+    "stage": "before",
+    "result": "PASS",
+    "url": "http://127.0.0.1:38917/usage",
+    "requests": [
+      {
+        "id": "12:32b89eb8-084b-4fa2-9b86-5ba7ed13459d",
+        "method": "sessions.usage",
+        "params": {
+          "startDate": "2026-10-18",
+          "endDate": "2026-11-16",
+          "agentScope": "all",
+          "mode": "specific",
+          "timeZone": "UTC",
+          "utcOffset": "UTC+0",
+          "groupBy": "family",
+          "limit": 50,
+          "projection": "overview",
+          "sort": "cost",
+          "sortDirection": "desc",
+          "includeContextWeight": false
+        }
+      },
+      {
+        "id": "20:a3ff8e87-49ae-4677-bef0-37a87b7c5167",
+        "method": "sessions.usage",
+        "params": {
+          "startDate": "2026-10-18",
+          "endDate": "2026-11-16",
+          "agentScope": "all",
+          "mode": "specific",
+          "timeZone": "UTC",
+          "utcOffset": "UTC+0",
+          "groupBy": "family",
+          "limit": 50,
+          "projection": "overview",
+          "query": "provider:openai ",
+          "sort": "cost",
+          "sortDirection": "desc",
+          "includeContextWeight": false
+        }
+      }
+    ]
+  }
+]

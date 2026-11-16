@@ -1,0 +1,155 @@
+[
+  {
+    "stage": "after",
+    "sourceSha256": "a32b7abc154d871e833b52704518e7643d0dc635db51c8c199a9b1c098ba09cf"
+  },
+  {
+    "event": "IME Enter keyCode=229",
+    "selected": "false",
+    "draft": "open",
+    "queryRequests": [
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      }
+    ],
+    "chips": []
+  },
+  {
+    "event": "isComposing Enter",
+    "selected": "false",
+    "draft": "open",
+    "queryRequests": [
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      }
+    ],
+    "chips": []
+  },
+  {
+    "event": "compositionend + Enter",
+    "selected": "false",
+    "draft": "open",
+    "queryRequests": [
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      }
+    ],
+    "chips": []
+  },
+  {
+    "event": "keyup + normal Enter",
+    "selected": "true",
+    "draft": "open",
+    "queryRequests": [
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      },
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "query": "provider:openai ",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      }
+    ],
+    "chips": [
+      "Providerisopenai"
+    ]
+  },
+  {
+    "stage": "after",
+    "result": "PASS",
+    "url": "http://127.0.0.1:41293/usage",
+    "requests": [
+      {
+        "id": "12:687c2493-d728-439b-9bdc-2db730f3ea86",
+        "method": "sessions.usage",
+        "params": {
+          "startDate": "2026-10-18",
+          "endDate": "2026-11-16",
+          "agentScope": "all",
+          "mode": "specific",
+          "timeZone": "UTC",
+          "utcOffset": "UTC+0",
+          "groupBy": "family",
+          "limit": 50,
+          "projection": "overview",
+          "sort": "cost",
+          "sortDirection": "desc",
+          "includeContextWeight": false
+        }
+      },
+      {
+        "id": "20:428d8bac-775c-408a-a4bc-b9ebed219764",
+        "method": "sessions.usage",
+        "params": {
+          "startDate": "2026-10-18",
+          "endDate": "2026-11-16",
+          "agentScope": "all",
+          "mode": "specific",
+          "timeZone": "UTC",
+          "utcOffset": "UTC+0",
+          "groupBy": "family",
+          "limit": 50,
+          "projection": "overview",
+          "query": "provider:openai ",
+          "sort": "cost",
+          "sortDirection": "desc",
+          "includeContextWeight": false
+        }
+      }
+    ]
+  }
+]
