@@ -1,0 +1,170 @@
+[
+  {
+    "stage": "before",
+    "sourceSha256": "a32b7abc154d871e833b52704518e7643d0dc635db51c8c199a9b1c098ba09cf"
+  },
+  {
+    "kind": "keyCode229",
+    "defaultPrevented": true,
+    "focused": false
+  },
+  {
+    "event": "keyCode229",
+    "selected": "false",
+    "draft": "open",
+    "queryRequests": [
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      }
+    ],
+    "chips": []
+  },
+  {
+    "kind": "isComposing",
+    "defaultPrevented": false,
+    "focused": true
+  },
+  {
+    "event": "isComposing",
+    "selected": "false",
+    "draft": "open",
+    "queryRequests": [
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      }
+    ],
+    "chips": []
+  },
+  {
+    "kind": "compositionend",
+    "defaultPrevented": true,
+    "focused": false
+  },
+  {
+    "event": "compositionend",
+    "selected": "false",
+    "draft": "open",
+    "queryRequests": [
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      }
+    ],
+    "chips": []
+  },
+  {
+    "event": "keyup + normal Enter",
+    "selected": "true",
+    "draft": "open",
+    "queryRequests": [
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      },
+      {
+        "startDate": "2026-10-18",
+        "endDate": "2026-11-16",
+        "agentScope": "all",
+        "mode": "specific",
+        "timeZone": "UTC",
+        "utcOffset": "UTC+0",
+        "groupBy": "family",
+        "limit": 50,
+        "projection": "overview",
+        "query": "provider:openai ",
+        "sort": "cost",
+        "sortDirection": "desc",
+        "includeContextWeight": false
+      }
+    ],
+    "chips": [
+      "Providerisopenai"
+    ]
+  },
+  {
+    "stage": "before",
+    "result": "PASS",
+    "url": "http://127.0.0.1:42297/usage",
+    "requests": [
+      {
+        "id": "12:aa0a8405-8636-4723-8594-1ab20a86c968",
+        "method": "sessions.usage",
+        "params": {
+          "startDate": "2026-10-18",
+          "endDate": "2026-11-16",
+          "agentScope": "all",
+          "mode": "specific",
+          "timeZone": "UTC",
+          "utcOffset": "UTC+0",
+          "groupBy": "family",
+          "limit": 50,
+          "projection": "overview",
+          "sort": "cost",
+          "sortDirection": "desc",
+          "includeContextWeight": false
+        }
+      },
+      {
+        "id": "20:9a5d5361-bd30-4141-a147-5a82bbd1de11",
+        "method": "sessions.usage",
+        "params": {
+          "startDate": "2026-10-18",
+          "endDate": "2026-11-16",
+          "agentScope": "all",
+          "mode": "specific",
+          "timeZone": "UTC",
+          "utcOffset": "UTC+0",
+          "groupBy": "family",
+          "limit": 50,
+          "projection": "overview",
+          "query": "provider:openai ",
+          "sort": "cost",
+          "sortDirection": "desc",
+          "includeContextWeight": false
+        }
+      }
+    ]
+  }
+]
